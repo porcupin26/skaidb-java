@@ -333,6 +333,52 @@ public final class Skaidb {
         }
 
         /**
+         * Stream a result set: rows arrive a chunk at a time instead of the
+         * whole set being materialised. For exports and large scans.
+         *
+         * <pre>try (Skaidb.RowStream s = conn.stream("SELECT ...")) {
+         *     while (s.next()) System.out.println(s.getObject(0));
+         * }</pre>
+         *
+         * The connection is busy until the stream ends; closing it early
+         * drains the remaining frames so the connection stays usable. Takes
+         * no parameters — the opcode carries SQL text.
+         */
+        public synchronized RowStream stream(String sql) {
+            if (closed) throw new SkaidbException("connection is closed");
+            byte[] body = sql.getBytes(StandardCharsets.UTF_8);
+            Buf req = new Buf();
+            req.u8(5).u8(consistency).u32(body.length).raw(body);
+            try {
+                writeFrame(req.toBytes());
+                Reader r = new Reader(readFrame());
+                int tag = r.u8();
+                if (tag == 3) {
+                    String msg = r.text();
+                    throw new SkaidbException(msg.contains("unknown opcode")
+                        ? "server does not support streaming: " + msg : msg);
+                }
+                if (tag == 1 || tag == 2) return new RowStream(this, new String[0], false);
+                if (tag != 5) throw new SkaidbException("unexpected response tag " + tag + " to stream request");
+                int ncols = r.u32();
+                String[] cols = new String[ncols];
+                for (int i = 0; i < ncols; i++) cols[i] = r.text();
+                return new RowStream(this, cols, true);
+            } catch (IOException e) {
+                throw new SkaidbException("stream failed: " + e.getMessage(), e);
+            }
+        }
+
+        /** Read one frame; RowStream uses this to pull chunks. */
+        Reader nextFrame() {
+            try {
+                return new Reader(readFrame());
+            } catch (IOException e) {
+                throw new SkaidbException("stream read failed: " + e.getMessage(), e);
+            }
+        }
+
+        /**
          * Prepare `sql` on the SERVER and return {statementId, paramCount}.
          * Cached per connection, because a prepared id is only meaningful on
          * the connection that created it.
@@ -417,6 +463,80 @@ public final class Skaidb {
                 throw new SkaidbException("unknown response tag " + tag);
             } catch (IOException e) {
                 throw new SkaidbException("query failed: " + e.getMessage(), e);
+            }
+        }
+    }
+
+    /**
+     * A streamed result set: holds one chunk, not the whole result. Obtained
+     * from {@link Connection#stream(String)}.
+     */
+    public static final class RowStream implements AutoCloseable {
+        private final Connection conn;
+        private final String[] columns;
+        private java.util.List<Object[]> chunk = new ArrayList<>();
+        private int pos = 0;
+        private boolean live;            // more frames are still coming
+        private Object[] current;
+
+        RowStream(Connection conn, String[] columns, boolean live) {
+            this.conn = conn;
+            this.columns = columns;
+            this.live = live;
+        }
+
+        public String[] getColumnNames() { return columns.clone(); }
+
+        /** Advance to the next row; false once the stream is exhausted. */
+        public boolean next() {
+            while (pos >= chunk.size()) {
+                if (!live) return false;
+                Reader r = conn.nextFrame();
+                int tag = r.u8();
+                if (tag == 6) {                    // RowsChunk
+                    int n = r.u32();
+                    java.util.List<Object[]> rows = new ArrayList<>(n);
+                    for (int i = 0; i < n; i++) {
+                        int ncells = r.u32();
+                        Object[] row = new Object[ncells];
+                        for (int j = 0; j < ncells; j++) row[j] = decodeValue(new Reader(r.blob()));
+                        rows.add(row);
+                    }
+                    chunk = rows;
+                    pos = 0;
+                } else if (tag == 7) {             // RowsEnd
+                    live = false;
+                    return false;
+                } else if (tag == 3) {             // failed partway; rows so far are valid
+                    live = false;
+                    throw new SkaidbException(r.text());
+                } else {
+                    live = false;
+                    throw new SkaidbException("unexpected frame tag " + tag + " in stream");
+                }
+            }
+            current = chunk.get(pos++);
+            return true;
+        }
+
+        public Object getObject(int i) { return current[i]; }
+
+        public Object getObject(String name) {
+            for (int i = 0; i < columns.length; i++) {
+                if (columns[i].equals(name)) return current[i];
+            }
+            throw new SkaidbException("no such column: " + name);
+        }
+
+        /**
+         * Drain any frames the server is still sending, so the connection can
+         * be reused. Safe to call repeatedly.
+         */
+        @Override public void close() {
+            while (live) {
+                Reader r = conn.nextFrame();
+                int tag = r.u8();
+                if (tag == 7 || tag == 3) live = false;
             }
         }
     }
