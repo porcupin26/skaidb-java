@@ -118,6 +118,7 @@ public final class Skaidb {
         private final OutputStream out;
         private int consistency;
         private boolean closed = false;
+        private final java.util.Map<String, long[]> prepared = new java.util.HashMap<>();
 
         Connection(String host, int port, String user, String password, int consistency,
                    String database, boolean tls, String tlsCa, boolean tlsInsecure,
@@ -282,12 +283,71 @@ public final class Skaidb {
 
         // -- query: returns the raw response Reader positioned after the tag --
         synchronized Object run(String sql, boolean wantRows) {
+            byte[] body = sql.getBytes(StandardCharsets.UTF_8);
+            Buf req = new Buf();
+            req.u8(1).u8(consistency).u32(body.length).raw(body);
+            return roundtrip(req.toBytes());
+        }
+
+        /**
+         * Prepare `sql` on the SERVER and return {statementId, paramCount}.
+         * Cached per connection, because a prepared id is only meaningful on
+         * the connection that created it.
+         */
+        synchronized long[] prepareServer(String sql) {
+            long[] hit = prepared.get(sql);
+            if (hit != null) return hit;
+            byte[] body = sql.getBytes(StandardCharsets.UTF_8);
+            Buf req = new Buf();
+            req.u8(2).u32(body.length).raw(body);
             if (closed) throw new SkaidbException("connection is closed");
             try {
-                byte[] body = sql.getBytes(StandardCharsets.UTF_8);
-                Buf req = new Buf();
-                req.u8(1).u8(consistency).u32(body.length).raw(body);
                 writeFrame(req.toBytes());
+                Reader r = new Reader(readFrame());
+                int tag = r.u8();
+                if (tag == 4) {                      // Prepared
+                    long id = r.u32() & 0xffffffffL;
+                    int nparams = r.u16();
+                    long[] v = new long[] { id, nparams };
+                    if (prepared.size() < 240) prepared.put(sql, v);
+                    return v;
+                }
+                if (tag == 3) throw new Unpreparable(r.text());
+                throw new SkaidbException("unexpected prepare response tag " + tag);
+            } catch (IOException e) {
+                throw new SkaidbException("prepare failed: " + e.getMessage(), e);
+            }
+        }
+
+        /** Execute a prepared statement with TYPED parameters. */
+        synchronized Object execPrepared(long stmtId, Object[] params) {
+            Buf req = new Buf();
+            req.u8(3).u8(consistency).u32((int) stmtId).u16(params.length);
+            for (Object p : params) {
+                byte[] v = encodeValue(p);
+                req.u32(v.length).raw(v);
+            }
+            return roundtrip(req.toBytes());
+        }
+
+        /** Execute a prepared statement once per row, in ONE round-trip. */
+        synchronized Object execBatch(long stmtId, java.util.List<Object[]> rows) {
+            Buf req = new Buf();
+            req.u8(7).u8(consistency).u32((int) stmtId).u32(rows.size());
+            for (Object[] params : rows) {
+                req.u16(params.length);
+                for (Object p : params) {
+                    byte[] v = encodeValue(p);
+                    req.u32(v.length).raw(v);
+                }
+            }
+            return roundtrip(req.toBytes());
+        }
+
+        private Object roundtrip(byte[] request) {
+            if (closed) throw new SkaidbException("connection is closed");
+            try {
+                writeFrame(request);
 
                 Reader r = new Reader(readFrame());
                 int tag = r.u8();
@@ -347,13 +407,51 @@ public final class Skaidb {
         }
 
         public ResultSet executeQuery() {
-            Object res = conn.run(bind(sql, params), true);
+            Object res = exec();
             if (res instanceof ResultSet) return (ResultSet) res;
             return new ResultSet(new String[0], new ArrayList<>()); // mutation/ddl: empty set
         }
 
+        /**
+         * Run via a SERVER-side prepared statement, so parameters travel as
+         * typed values — the only way to send an array or a document, which
+         * have no SQL literal form. Statement kinds the server refuses to
+         * prepare (DDL, session statements) fall back to client-side text
+         * binding, which is why `bind` still exists.
+         */
+        private Object exec() {
+            if (params.length == 0) return conn.run(sql, true);
+            try {
+                long[] p = conn.prepareServer(sql);
+                if (p[1] != params.length)
+                    throw new SkaidbException(
+                        "statement expects " + p[1] + " parameters, got " + params.length);
+                return conn.execPrepared(p[0], params);
+            } catch (Unpreparable e) {
+                return conn.run(bind(sql, params), true);
+            }
+        }
+
+        /**
+         * Execute this statement once per row in ONE round-trip. Each row
+         * autocommits on its own: if one fails the server names it and
+         * earlier rows stay applied, so make the statement idempotent.
+         * Returns the total affected row count.
+         */
+        public long executeBatch(java.util.List<Object[]> rows) {
+            if (rows.isEmpty()) return 0L;
+            long[] p = conn.prepareServer(sql);
+            for (Object[] r : rows) {
+                if (r.length != p[1])
+                    throw new SkaidbException(
+                        "batch row expects " + p[1] + " parameters, got " + r.length);
+            }
+            Object res = conn.execBatch(p[0], rows);
+            return res instanceof Long ? (Long) res : 0L;
+        }
+
         public long executeUpdate() {
-            Object res = conn.run(bind(sql, params), false);
+            Object res = exec();
             return (res instanceof Long) ? (Long) res : 0L;
         }
 
@@ -514,12 +612,15 @@ public final class Skaidb {
         // failure. Build the value in SQL, or use the REST /insert endpoint,
         // which accepts arbitrary JSON rows.
         if (v instanceof java.util.Collection || v instanceof java.util.Map || v.getClass().isArray()) {
+            // Reached only on the client-side fallback path (a statement the
+            // server refuses to prepare). Typed binding carries these fine;
+            // an interpolated literal cannot represent them, and stringifying
+            // would silently store the wrong value.
             String kind = v instanceof java.util.Map ? "a map"
                         : v instanceof java.util.Collection ? "a collection" : "an array";
             throw new SkaidbException(
-                "cannot bind " + kind + " as a parameter: skaidb has no literal form for "
-                    + "arrays/documents. Write them via SQL, or use the REST /insert endpoint, "
-                    + "which accepts arbitrary JSON rows.");
+                "cannot bind " + kind + " into a statement the server will not prepare: "
+                    + "skaidb has no literal form for arrays/documents.");
         }
         // strings, UUID, anything else -> quoted string with '' escaping
         return "'" + v.toString().replace("'", "''") + "'";
@@ -578,10 +679,104 @@ public final class Skaidb {
 
     // ---- little binary helpers --------------------------------------------
 
+    /**
+     * The server refuses to prepare some statement kinds (DDL, session
+     * statements). That is not an error — the caller falls back to
+     * client-side text binding, exactly as the Python driver does.
+     */
+    static final class Unpreparable extends RuntimeException {
+        Unpreparable(String m) { super(m); }
+    }
+
+    /**
+     * Encode a Java value as a TYPED skaidb value (tag + payload) — the
+     * inverse of decodeValue. This is what prepared binding buys: arrays and
+     * nested documents have no SQL literal form, so they can only travel as
+     * typed values, never as interpolated text.
+     */
+    static byte[] encodeValue(Object v) {
+        Buf o = new Buf();
+        encodeInto(v, o);
+        return o.toBytes();
+    }
+
+    private static void encodeInto(Object v, Buf o) {
+        if (v == null) { o.u8(0); return; }
+        if (v instanceof Boolean) { o.u8(1).u8(((Boolean) v) ? 1 : 0); return; }
+        if (v instanceof Byte || v instanceof Short || v instanceof Integer || v instanceof Long) {
+            o.u8(2).i64(((Number) v).longValue()); return;
+        }
+        if (v instanceof Float || v instanceof Double) {
+            double d = ((Number) v).doubleValue();
+            if (Double.isNaN(d) || Double.isInfinite(d))
+                throw new SkaidbException("cannot bind NaN/Infinity");
+            o.u8(3).i64(Double.doubleToLongBits(d)); return;
+        }
+        if (v instanceof java.math.BigDecimal) {
+            java.math.BigDecimal bd = (java.math.BigDecimal) v;
+            int scale = bd.scale();
+            if (scale < 0) { bd = bd.setScale(0); scale = 0; }
+            java.math.BigInteger mant = bd.unscaledValue();
+            byte[] be = mant.toByteArray();               // big-endian, signed
+            if (be.length > 16) throw new SkaidbException("decimal mantissa exceeds 128 bits");
+            byte[] le = new byte[16];
+            byte fill = (byte) (mant.signum() < 0 ? 0xff : 0x00);
+            java.util.Arrays.fill(le, fill);
+            for (int i = 0; i < be.length; i++) le[i] = be[be.length - 1 - i];
+            o.u8(4).raw(le).u32(scale); return;
+        }
+        if (v instanceof CharSequence) {
+            byte[] b = v.toString().getBytes(StandardCharsets.UTF_8);
+            o.u8(5).u32(b.length).raw(b); return;
+        }
+        if (v instanceof byte[]) {
+            byte[] b = (byte[]) v;
+            o.u8(6).u32(b.length).raw(b); return;
+        }
+        if (v instanceof java.util.UUID) {
+            java.util.UUID u = (java.util.UUID) v;
+            Buf t = new Buf();
+            long hi = u.getMostSignificantBits(), lo = u.getLeastSignificantBits();
+            for (int i = 7; i >= 0; i--) t.u8((int) ((hi >>> (8 * i)) & 0xff));
+            for (int i = 7; i >= 0; i--) t.u8((int) ((lo >>> (8 * i)) & 0xff));
+            o.u8(7).raw(t.toBytes()); return;
+        }
+        if (v instanceof java.time.Instant) {
+            o.u8(8).i64(((java.time.Instant) v).toEpochMilli()); return;
+        }
+        if (v instanceof java.util.Collection) {
+            java.util.Collection<?> c = (java.util.Collection<?>) v;
+            o.u8(9).u32(c.size());
+            for (Object item : c) encodeInto(item, o);
+            return;
+        }
+        if (v.getClass().isArray()) {
+            int n = java.lang.reflect.Array.getLength(v);
+            o.u8(9).u32(n);
+            for (int i = 0; i < n; i++) encodeInto(java.lang.reflect.Array.get(v, i), o);
+            return;
+        }
+        if (v instanceof java.util.Map) {
+            java.util.Map<?, ?> m = (java.util.Map<?, ?>) v;
+            o.u8(10).u32(m.size());
+            for (java.util.Map.Entry<?, ?> e : m.entrySet()) {
+                if (!(e.getKey() instanceof CharSequence))
+                    throw new SkaidbException("document keys must be strings");
+                byte[] k = e.getKey().toString().getBytes(StandardCharsets.UTF_8);
+                o.u32(k.length).raw(k);
+                encodeInto(e.getValue(), o);
+            }
+            return;
+        }
+        throw new SkaidbException("cannot bind value of type " + v.getClass().getName());
+    }
+
     static final class Buf {
         private final java.io.ByteArrayOutputStream b = new java.io.ByteArrayOutputStream();
         Buf u8(int v) { b.write(v & 0xff); return this; }
         Buf u32(int v) { b.write(v & 0xff); b.write((v >>> 8) & 0xff); b.write((v >>> 16) & 0xff); b.write((v >>> 24) & 0xff); return this; }
+        Buf u16(int v) { b.write(v & 0xff); b.write((v >>> 8) & 0xff); return this; }
+        Buf i64(long v) { for (int i = 0; i < 8; i++) b.write((int) ((v >>> (8 * i)) & 0xff)); return this; }
         Buf raw(byte[] x) { b.write(x, 0, x.length); return this; }
         Buf str(String s) { byte[] x = s.getBytes(StandardCharsets.UTF_8); u32(x.length); return raw(x); }
         byte[] toBytes() { return b.toByteArray(); }
@@ -599,6 +794,7 @@ public final class Skaidb {
             return s;
         }
         int u8() { return take(1)[0] & 0xff; }
+        int u16() { byte[] b = take(2); return (b[0] & 0xff) | ((b[1] & 0xff) << 8); }
         int u32() {
             byte[] b = take(4);
             return (b[0] & 0xff) | ((b[1] & 0xff) << 8) | ((b[2] & 0xff) << 16) | ((b[3] & 0xff) << 24);
