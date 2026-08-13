@@ -60,22 +60,37 @@ public final class Skaidb {
             }
             int port = u.getPort() == -1 ? 7000 : u.getPort();
             int consistency = CONSISTENCY_QUORUM;
+            // Session database from the URL path: skaidb://host:7000/app
+            String database = u.getPath() == null ? "" : u.getPath().replaceFirst("^/", "");
+            String tlsCa = "", tlsName = "skaidb";
+            boolean tls = false, tlsInsecure = false;
             String q = u.getQuery();
             if (q != null) {
                 for (String part : q.split("&")) {
                     if (part.startsWith("consistency=")) {
                         consistency = parseConsistency(part.substring("consistency=".length()));
+                    } else if (part.startsWith("tls_ca=")) {
+                        tlsCa = part.substring("tls_ca=".length());
+                    } else if (part.startsWith("tls_server_name=")) {
+                        tlsName = part.substring("tls_server_name=".length());
+                    } else if (part.equals("tls_insecure=true") || part.equals("tls_insecure=1")) {
+                        tlsInsecure = true;
+                    } else if (part.equals("tls=true") || part.equals("tls=1")) {
+                        tls = true;
                     }
                 }
             }
-            return new Connection(u.getHost(), port, user, pass, consistency);
+            tls = tls || !tlsCa.isEmpty() || tlsInsecure;
+            return new Connection(u.getHost(), port, user, pass, consistency, database,
+                                  tls, tlsCa, tlsInsecure, tlsName);
         } catch (IllegalArgumentException e) {
             throw new SkaidbException("bad DSN: " + e.getMessage());
         }
     }
 
     public static Connection connect(String host, int port, String user, String password) {
-        return new Connection(host, port, user, password, CONSISTENCY_QUORUM);
+        return new Connection(host, port, user, password, CONSISTENCY_QUORUM, "",
+                              false, "", false, "skaidb");
     }
 
     private static int parseConsistency(String s) {
@@ -104,17 +119,82 @@ public final class Skaidb {
         private int consistency;
         private boolean closed = false;
 
-        Connection(String host, int port, String user, String password, int consistency) {
+        Connection(String host, int port, String user, String password, int consistency,
+                   String database, boolean tls, String tlsCa, boolean tlsInsecure,
+                   String tlsServerName) {
             this.consistency = consistency;
             try {
-                socket = new Socket();
-                socket.connect(new InetSocketAddress(host, port), 10_000);
-                socket.setTcpNoDelay(true);
+                Socket s = new Socket();
+                s.connect(new InetSocketAddress(host, port), 10_000);
+                s.setTcpNoDelay(true);
+                if (tls) s = tlsWrap(s, host, port, tlsCa, tlsInsecure, tlsServerName);
+                socket = s;
                 in = new DataInputStream(socket.getInputStream());
                 out = socket.getOutputStream();
                 handshake(user, password);
             } catch (IOException e) {
                 throw new SkaidbException("connect failed: " + e.getMessage(), e);
+            }
+            // USE is per-connection session state, so it runs on every dial.
+            if (database != null && !database.isEmpty()) {
+                execute("USE \"" + database.replace("\"", "\"\"") + "\"");
+            }
+        }
+
+        /**
+         * Upgrade a connected socket to TLS. A server with client_tls =
+         * required refuses plaintext outright, so without this such a cluster
+         * is simply unreachable. The SNI name must match a SAN on the server
+         * certificate — skaidb's own certs carry DNS:skaidb, which is usually
+         * NOT the address you dialled, hence the separate knob.
+         */
+        private static Socket tlsWrap(Socket raw, String host, int port, String caFile,
+                                      boolean insecure, String serverName) throws IOException {
+            try {
+                javax.net.ssl.SSLContext ctx = javax.net.ssl.SSLContext.getInstance("TLS");
+                javax.net.ssl.TrustManager[] tm = null;
+                if (insecure) {
+                    // Encrypts, but authenticates nothing: a man in the middle
+                    // can present any certificate. Development only.
+                    tm = new javax.net.ssl.TrustManager[] { new javax.net.ssl.X509TrustManager() {
+                        public void checkClientTrusted(java.security.cert.X509Certificate[] c, String t) {}
+                        public void checkServerTrusted(java.security.cert.X509Certificate[] c, String t) {}
+                        public java.security.cert.X509Certificate[] getAcceptedIssuers() {
+                            return new java.security.cert.X509Certificate[0];
+                        }
+                    } };
+                } else if (caFile != null && !caFile.isEmpty()) {
+                    java.security.KeyStore ks = java.security.KeyStore.getInstance(
+                            java.security.KeyStore.getDefaultType());
+                    ks.load(null, null);
+                    java.security.cert.CertificateFactory cf =
+                            java.security.cert.CertificateFactory.getInstance("X.509");
+                    int i = 0;
+                    try (java.io.InputStream fin = java.nio.file.Files.newInputStream(
+                            java.nio.file.Paths.get(caFile))) {
+                        for (java.security.cert.Certificate c : cf.generateCertificates(fin)) {
+                            ks.setCertificateEntry("ca" + (i++), c);
+                        }
+                    }
+                    if (i == 0) throw new SkaidbException("no certificates found in tls_ca " + caFile);
+                    javax.net.ssl.TrustManagerFactory tmf = javax.net.ssl.TrustManagerFactory
+                            .getInstance(javax.net.ssl.TrustManagerFactory.getDefaultAlgorithm());
+                    tmf.init(ks);
+                    tm = tmf.getTrustManagers();
+                }
+                ctx.init(null, tm, null);
+                javax.net.ssl.SSLSocket ss = (javax.net.ssl.SSLSocket) ctx.getSocketFactory()
+                        .createSocket(raw, serverName, port, true);
+                ss.setUseClientMode(true);
+                javax.net.ssl.SSLParameters params = ss.getSSLParameters();
+                params.setServerNames(java.util.Collections.singletonList(
+                        new javax.net.ssl.SNIHostName(serverName)));
+                if (!insecure) params.setEndpointIdentificationAlgorithm("HTTPS");
+                ss.setSSLParameters(params);
+                ss.startHandshake();
+                return ss;
+            } catch (java.security.GeneralSecurityException e) {
+                throw new SkaidbException("TLS setup failed: " + e.getMessage(), e);
             }
         }
 
