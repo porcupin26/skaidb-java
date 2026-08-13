@@ -427,6 +427,20 @@ public final class Skaidb {
         if (v instanceof Number) return v.toString();
         if (v instanceof byte[]) return "'" + hex((byte[]) v) + "'";
         if (v instanceof Instant) return Long.toString(((Instant) v).toEpochMilli());
+        // Collections and maps are REFUSED rather than stringified. The wire
+        // has no client-side literal for an Array or a Document, so the old
+        // catch-all turned setObject(i, List.of(1, 2)) into the string
+        // '[1, 2]' and stored that — a silent wrong write, the worst kind of
+        // failure. Build the value in SQL, or use the REST /insert endpoint,
+        // which accepts arbitrary JSON rows.
+        if (v instanceof java.util.Collection || v instanceof java.util.Map || v.getClass().isArray()) {
+            String kind = v instanceof java.util.Map ? "a map"
+                        : v instanceof java.util.Collection ? "a collection" : "an array";
+            throw new SkaidbException(
+                "cannot bind " + kind + " as a parameter: skaidb has no literal form for "
+                    + "arrays/documents. Write them via SQL, or use the REST /insert endpoint, "
+                    + "which accepts arbitrary JSON rows.");
+        }
         // strings, UUID, anything else -> quoted string with '' escaping
         return "'" + v.toString().replace("'", "''") + "'";
     }
