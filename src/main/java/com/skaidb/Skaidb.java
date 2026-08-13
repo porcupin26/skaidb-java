@@ -52,13 +52,24 @@ public final class Skaidb {
             URI u = URI.create(dsn);
             if (!"skaidb".equals(u.getScheme()))
                 throw new SkaidbException("DSN scheme must be skaidb://");
+            // A comma-separated seed list is not a legal URI host, so
+            // java.net.URI cannot decompose the authority — getUserInfo() and
+            // getHost() both come back null and credentials would silently
+            // degrade to anonymous. Parse the authority ourselves.
+            String authority = u.getAuthority() != null ? u.getAuthority() : u.getSchemeSpecificPart();
+            authority = authority.replaceFirst("^//", "");
+            int slash = authority.indexOf('/');
+            if (slash >= 0) authority = authority.substring(0, slash);
             String user = "anonymous", pass = "";
-            if (u.getUserInfo() != null) {
-                String[] up = u.getUserInfo().split(":", 2);
+            int at = authority.lastIndexOf('@');
+            if (at >= 0) {
+                String ui = authority.substring(0, at);
+                authority = authority.substring(at + 1);
+                String[] up = ui.split(":", 2);
                 user = up[0];
                 if (up.length > 1) pass = up[1];
             }
-            int port = u.getPort() == -1 ? 7000 : u.getPort();
+            int port = 7000;
             int consistency = CONSISTENCY_QUORUM;
             // Session database from the URL path: skaidb://host:7000/app
             String database = u.getPath() == null ? "" : u.getPath().replaceFirst("^/", "");
@@ -81,7 +92,15 @@ public final class Skaidb {
                 }
             }
             tls = tls || !tlsCa.isEmpty() || tlsInsecure;
-            return new Connection(u.getHost(), port, user, pass, consistency, database,
+            // Seeds: skaidb://user:pass@h1:7000,h2:7000,h3/db
+            java.util.List<String> seeds = new java.util.ArrayList<>();
+            for (String h : authority.split(",")) {
+                h = h.trim();
+                if (h.isEmpty()) continue;
+                seeds.add(h.contains(":") ? h : h + ":" + port);
+            }
+            if (seeds.isEmpty()) throw new SkaidbException("DSN has no host");
+            return new Connection(seeds, user, pass, consistency, database,
                                   tls, tlsCa, tlsInsecure, tlsName);
         } catch (IllegalArgumentException e) {
             throw new SkaidbException("bad DSN: " + e.getMessage());
@@ -89,7 +108,8 @@ public final class Skaidb {
     }
 
     public static Connection connect(String host, int port, String user, String password) {
-        return new Connection(host, port, user, password, CONSISTENCY_QUORUM, "",
+        return new Connection(java.util.Collections.singletonList(host + ":" + port),
+                              user, password, CONSISTENCY_QUORUM, "",
                               false, "", false, "skaidb");
     }
 
@@ -120,16 +140,39 @@ public final class Skaidb {
         private boolean closed = false;
         private final java.util.Map<String, long[]> prepared = new java.util.HashMap<>();
 
-        Connection(String host, int port, String user, String password, int consistency,
+        Connection(java.util.List<String> seeds, String user, String password, int consistency,
                    String database, boolean tls, String tlsCa, boolean tlsInsecure,
                    String tlsServerName) {
             this.consistency = consistency;
+            // Try each seed until one connects AND authenticates — a node that
+            // accepts TCP while unhealthy must not swallow the attempt. skaidb
+            // is leaderless, so any node serves; shuffled so many clients
+            // spread instead of stampeding the first entry.
+            java.util.List<String> order = new java.util.ArrayList<>(seeds);
+            java.util.Collections.shuffle(order);
+            Socket connected = null;
+            Exception last = null;
+            for (String ep : order) {
+                int c = ep.lastIndexOf(':');
+                String h = c > 0 ? ep.substring(0, c) : ep;
+                int p = c > 0 ? Integer.parseInt(ep.substring(c + 1)) : 7000;
+                try {
+                    Socket s = new Socket();
+                    s.connect(new InetSocketAddress(h, p), 10_000);
+                    s.setTcpNoDelay(true);
+                    if (tls) s = tlsWrap(s, h, p, tlsCa, tlsInsecure, tlsServerName);
+                    connected = s;
+                    break;
+                } catch (Exception e) {
+                    last = e;
+                }
+            }
+            if (connected == null) {
+                throw new SkaidbException("no reachable endpoint in " + String.join(", ", order)
+                        + (last == null ? "" : ": " + last.getMessage()), last);
+            }
             try {
-                Socket s = new Socket();
-                s.connect(new InetSocketAddress(host, port), 10_000);
-                s.setTcpNoDelay(true);
-                if (tls) s = tlsWrap(s, host, port, tlsCa, tlsInsecure, tlsServerName);
-                socket = s;
+                socket = connected;
                 in = new DataInputStream(socket.getInputStream());
                 out = socket.getOutputStream();
                 handshake(user, password);
