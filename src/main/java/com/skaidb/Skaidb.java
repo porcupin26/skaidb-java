@@ -133,17 +133,45 @@ public final class Skaidb {
 
     public static final class Connection implements AutoCloseable {
         private static int nonceCounter = 0;
-        private final Socket socket;
-        private final DataInputStream in;
-        private final OutputStream out;
+        private Socket socket;
+        private DataInputStream in;
+        private OutputStream out;
         private int consistency;
         private boolean closed = false;
+        /** Transport died; the next statement re-dials (see ensureLive). */
+        private boolean broken = false;
         private final java.util.Map<String, long[]> prepared = new java.util.HashMap<>();
+        // Retained so a reconnect can repeat the original connect exactly.
+        private final java.util.List<String> seeds;
+        private final String user;
+        private final String password;
+        private final String database;
+        private final boolean tls;
+        private final String tlsCa;
+        private final boolean tlsInsecure;
+        private final String tlsServerName;
 
         Connection(java.util.List<String> seeds, String user, String password, int consistency,
                    String database, boolean tls, String tlsCa, boolean tlsInsecure,
                    String tlsServerName) {
             this.consistency = consistency;
+            this.seeds = new java.util.ArrayList<>(seeds);
+            this.user = user;
+            this.password = password;
+            this.database = database;
+            this.tls = tls;
+            this.tlsCa = tlsCa;
+            this.tlsInsecure = tlsInsecure;
+            this.tlsServerName = tlsServerName;
+            dial();
+        }
+
+        /**
+         * Connect, authenticate and enter the session database. Used for the
+         * first connect and for every reconnect, so a recovered connection is
+         * indistinguishable from a fresh one.
+         */
+        private void dial() {
             // Try each seed until one connects AND authenticates — a node that
             // accepts TCP while unhealthy must not swallow the attempt. skaidb
             // is leaderless, so any node serves; shuffled so many clients
@@ -326,9 +354,15 @@ public final class Skaidb {
 
         // -- query: returns the raw response Reader positioned after the tag --
         synchronized Object run(String sql, boolean wantRows) {
+            return run(sql, wantRows, consistency);
+        }
+
+        /** {@link #run(String, boolean)} at an explicit consistency level. */
+        synchronized Object run(String sql, boolean wantRows, int level) {
+            ensureLive();
             byte[] body = sql.getBytes(StandardCharsets.UTF_8);
             Buf req = new Buf();
-            req.u8(1).u8(consistency).u32(body.length).raw(body);
+            req.u8(1).u8(level).u32(body.length).raw(body);
             return roundtrip(req.toBytes());
         }
 
@@ -346,6 +380,7 @@ public final class Skaidb {
          */
         public synchronized RowStream stream(String sql) {
             if (closed) throw new SkaidbException("connection is closed");
+            ensureLive();
             byte[] body = sql.getBytes(StandardCharsets.UTF_8);
             Buf req = new Buf();
             req.u8(5).u8(consistency).u32(body.length).raw(body);
@@ -384,6 +419,9 @@ public final class Skaidb {
          * the connection that created it.
          */
         synchronized long[] prepareServer(String sql) {
+            // Before the cache is consulted: a reconnect empties it, so a
+            // stale id from the dead socket can never be handed out.
+            ensureLive();
             long[] hit = prepared.get(sql);
             if (hit != null) return hit;
             byte[] body = sql.getBytes(StandardCharsets.UTF_8);
@@ -410,8 +448,13 @@ public final class Skaidb {
 
         /** Execute a prepared statement with TYPED parameters. */
         synchronized Object execPrepared(long stmtId, Object[] params) {
+            return execPrepared(stmtId, params, consistency);
+        }
+
+        /** {@link #execPrepared(long, Object[])} at an explicit level. */
+        synchronized Object execPrepared(long stmtId, Object[] params, int level) {
             Buf req = new Buf();
-            req.u8(3).u8(consistency).u32((int) stmtId).u16(params.length);
+            req.u8(3).u8(level).u32((int) stmtId).u16(params.length);
             for (Object p : params) {
                 byte[] v = encodeValue(p);
                 req.u32(v.length).raw(v);
@@ -421,8 +464,13 @@ public final class Skaidb {
 
         /** Execute a prepared statement once per row, in ONE round-trip. */
         synchronized Object execBatch(long stmtId, java.util.List<Object[]> rows) {
+            return execBatch(stmtId, rows, consistency);
+        }
+
+        /** {@link #execBatch(long, java.util.List)} at an explicit level. */
+        synchronized Object execBatch(long stmtId, java.util.List<Object[]> rows, int level) {
             Buf req = new Buf();
-            req.u8(7).u8(consistency).u32((int) stmtId).u32(rows.size());
+            req.u8(7).u8(level).u32((int) stmtId).u32(rows.size());
             for (Object[] params : rows) {
                 req.u16(params.length);
                 for (Object p : params) {
@@ -462,7 +510,40 @@ public final class Skaidb {
                 }
                 throw new SkaidbException("unknown response tag " + tag);
             } catch (IOException e) {
+                // The statement may already have executed, so it is NOT
+                // retried here — an ambiguous write must never be repeated
+                // silently. The connection is marked broken; the next
+                // statement re-dials through ensureLive.
+                broken = true;
                 throw new SkaidbException("query failed: " + e.getMessage(), e);
+            }
+        }
+
+        /**
+         * Re-dial if the transport died since the last statement, BEFORE
+         * anything is prepared on it.
+         *
+         * The prepared-statement cache MUST be cleared: an id is only valid on
+         * the connection that created it, so carrying one across a reconnect
+         * would execute a different statement (or fail obscurely).
+         */
+        private synchronized void ensureLive() {
+            if (closed) throw new SkaidbException("connection is closed");
+            if (!broken) return;
+            prepared.clear();
+            try {
+                if (socket != null) socket.close();
+            } catch (IOException ignored) {
+                // already gone
+            }
+            // Cleared BEFORE dialling: dial() issues USE, which runs a
+            // statement, which would otherwise re-enter this method forever.
+            broken = false;
+            try {
+                dial();      // seed failover + handshake + USE, as at connect
+            } catch (RuntimeException e) {
+                broken = true;   // still down; the next statement retries
+                throw e;
             }
         }
     }
@@ -548,10 +629,30 @@ public final class Skaidb {
         private final String sql;
         private final Object[] params;
 
+        /** -1 = inherit the connection's level (see {@link #setConsistency}). */
+        private int level = -1;
+
         Query(Connection conn, String sql) {
             this.conn = conn;
             this.sql = sql;
             this.params = new Object[countPlaceholders(sql)];
+        }
+
+        /**
+         * Run THIS statement at `level` ({@code CONSISTENCY_ONE|QUORUM|ALL}),
+         * leaving the connection's own level untouched — the per-statement
+         * control {@link Connection#setConsistency} cannot give you, since
+         * that field is shared by every thread using the connection.
+         */
+        public Query setConsistency(int level) {
+            if (level < 0 || level > 2) throw new SkaidbException("bad consistency " + level);
+            this.level = level;
+            return this;
+        }
+
+        /** The level this statement should run at. */
+        private int level() {
+            return level < 0 ? conn.consistency : level;
         }
 
         // JDBC-style 1-based parameter setters (all funnel through setObject).
@@ -583,15 +684,15 @@ public final class Skaidb {
          * binding, which is why `bind` still exists.
          */
         private Object exec() {
-            if (params.length == 0) return conn.run(sql, true);
+            if (params.length == 0) return conn.run(sql, true, level());
             try {
                 long[] p = conn.prepareServer(sql);
                 if (p[1] != params.length)
                     throw new SkaidbException(
                         "statement expects " + p[1] + " parameters, got " + params.length);
-                return conn.execPrepared(p[0], params);
+                return conn.execPrepared(p[0], params, level());
             } catch (Unpreparable e) {
-                return conn.run(bind(sql, params), true);
+                return conn.run(bind(sql, params), true, level());
             }
         }
 
@@ -609,7 +710,7 @@ public final class Skaidb {
                     throw new SkaidbException(
                         "batch row expects " + p[1] + " parameters, got " + r.length);
             }
-            Object res = conn.execBatch(p[0], rows);
+            Object res = conn.execBatch(p[0], rows, level());
             return res instanceof Long ? (Long) res : 0L;
         }
 
