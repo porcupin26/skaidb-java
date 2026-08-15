@@ -286,6 +286,9 @@ public final class Skaidb {
         /** Run a SELECT with no parameters. */
         public ResultSet query(String sql) { return new Query(this, sql).executeQuery(); }
 
+        /** False once closed, or once a transport error broke the socket. */
+        public boolean isUsable() { return !closed && !broken; }
+
         @Override public void close() {
             if (closed) return;
             closed = true;
@@ -1072,5 +1075,91 @@ public final class Skaidb {
         long u64() { return i64(); } // affected counts fit in a signed long
         byte[] blob() { return take(u32()); }
         String text() { return new String(blob(), StandardCharsets.UTF_8); }
+    }
+    // ---- Pool --------------------------------------------------------------
+
+    /**
+     * A thread-safe pool of connections opened from one DSN.
+     *
+     * <p>{@code maxsize} bounds the connections kept IDLE, not the number
+     * checked out: a burst creates extras and the surplus is closed on return.
+     * Pooled connections come from {@link Skaidb#connect(String)}, so they
+     * inherit seed failover, TLS and the session database.
+     *
+     * <p>This matters more in Java than elsewhere: a {@code Connection}
+     * serializes every statement through one socket, so threads sharing one
+     * connection queue behind each other. A pool gives each worker its own.
+     *
+     * <pre>{@code
+     * try (Skaidb.Pool pool = new Skaidb.Pool("skaidb://u:p@h1:7000,h2:7000/app", 8)) {
+     *     long n = pool.withConnection(c -> c.prepare("SELECT count(*) AS n FROM t")
+     *                                        .executeQuery().nextLong("n"));
+     * }
+     * }</pre>
+     */
+    public static final class Pool implements AutoCloseable {
+        /** Work handed a pooled connection. */
+        public interface Work<T> { T run(Connection conn); }
+
+        private final String dsn;
+        private final int maxsize;
+        private final java.util.ArrayDeque<Connection> idle = new java.util.ArrayDeque<>();
+        private boolean closed = false;
+
+        public Pool(String dsn) { this(dsn, 10); }
+
+        public Pool(String dsn, int maxsize) {
+            if (maxsize < 1) throw new SkaidbException("maxsize must be >= 1");
+            this.dsn = dsn;
+            this.maxsize = maxsize;
+        }
+
+        /** Check out a usable connection, reusing an idle one when possible. */
+        public Connection acquire() {
+            for (;;) {
+                Connection c;
+                synchronized (this) {
+                    if (closed) throw new SkaidbException("pool is closed");
+                    c = idle.pollLast();
+                }
+                if (c == null) return Skaidb.connect(dsn);
+                // A connection the server closed while it sat idle still looks
+                // fine locally, so check before handing it out.
+                if (c.isUsable()) return c;
+                c.close();
+            }
+        }
+
+        /** Return a connection, closing it if broken or the pool is full. */
+        public void release(Connection c) {
+            synchronized (this) {
+                if (!closed && c.isUsable() && idle.size() < maxsize) {
+                    idle.addLast(c);
+                    return;
+                }
+            }
+            c.close();
+        }
+
+        /** Run {@code work} with a checked-out connection, returning it after. */
+        public <T> T withConnection(Work<T> work) {
+            Connection c = acquire();
+            try {
+                return work.run(c);
+            } finally {
+                release(c);
+            }
+        }
+
+        /** Close the pool and every idle connection. */
+        @Override public void close() {
+            java.util.List<Connection> drained;
+            synchronized (this) {
+                closed = true;
+                drained = new java.util.ArrayList<>(idle);
+                idle.clear();
+            }
+            for (Connection c : drained) c.close();
+        }
     }
 }
