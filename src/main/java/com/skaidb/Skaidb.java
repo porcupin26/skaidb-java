@@ -286,6 +286,68 @@ public final class Skaidb {
         /** Run a SELECT with no parameters. */
         public ResultSet query(String sql) { return new Query(this, sql).executeQuery(); }
 
+        /** One change captured by a stream. */
+        public static final class Event {
+            /** Log position: keep the last one to resume. */
+            public final String id;
+            public final String op;
+            public final Object key;
+            public final Object ts;
+            public final Object doc;
+
+            Event(String id, String op, Object key, Object ts, Object doc) {
+                this.id = id; this.op = op; this.key = key; this.ts = ts; this.doc = doc;
+            }
+        }
+
+        /** What to do with each event; return false to stop subscribing. */
+        public interface EventHandler { boolean handle(Event ev); }
+
+        /**
+         * Deliver a stream's events to {@code handler} as they arrive,
+         * blocking until the handler returns false.
+         *
+         * <p>A dependency-free helper over the stream's log: it pages the log
+         * with the keyset cursor. {@code Event.id} is the position — keep the
+         * last one and pass it as {@code after} to resume exactly where you
+         * stopped, across restarts.
+         *
+         * <p>This polls; for push delivery subscribe to
+         * {@code $stream/<db>/<name>} with any MQTT client instead. The
+         * events are identical.
+         */
+        public void subscribe(String stream, String after, EventHandler handler) {
+            String log = "_stream_" + stream;
+            String cur = after;
+            while (true) {
+                ResultSet rs;
+                if (cur == null) {
+                    rs = prepare("SELECT id, op, k, ts, doc FROM " + log
+                            + " ORDER BY id LIMIT 500").executeQuery();
+                } else {
+                    rs = prepare("SELECT id, op, k, ts, doc FROM " + log
+                            + " WHERE id > ? ORDER BY id LIMIT 500").setString(1, cur).executeQuery();
+                }
+                int n = 0;
+                while (rs.next()) {
+                    cur = rs.getString("id");
+                    n++;
+                    if (!handler.handle(new Event(cur, rs.getString("op"),
+                            rs.getObject("k"), rs.getObject("ts"), rs.getObject("doc")))) {
+                        return;
+                    }
+                }
+                if (n == 0) {
+                    try {
+                        Thread.sleep(500);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
+                }
+            }
+        }
+
         /** False once closed, or once a transport error broke the socket. */
         public boolean isUsable() { return !closed && !broken; }
 
