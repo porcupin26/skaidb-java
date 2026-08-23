@@ -207,9 +207,29 @@ public final class Skaidb {
             } catch (IOException e) {
                 throw new SkaidbException("connect failed: " + e.getMessage(), e);
             }
+            sendHello();
             // USE is per-connection session state, so it runs on every dial.
             if (database != null && !database.isEmpty()) {
                 execute("USE \"" + database.replace("\"", "\"\"") + "\"");
+            }
+        }
+
+        /**
+         * Best-effort self-identification: fills the server's {@code drivers}
+         * table client_name/client_version. An old server answers the unknown
+         * opcode with an error frame, which is ignored — identity is
+         * telemetry, never load-bearing.
+         */
+        private void sendHello() {
+            try {
+                byte[] name = "java".getBytes(StandardCharsets.UTF_8);
+                byte[] ver = "0.1.0".getBytes(StandardCharsets.UTF_8);
+                Buf req = new Buf();
+                req.u8(8).u32(name.length).raw(name).u32(ver.length).raw(ver);
+                writeFrame(req.toBytes());
+                readFrame();
+            } catch (IOException | SkaidbException e) {
+                // telemetry only
             }
         }
 
