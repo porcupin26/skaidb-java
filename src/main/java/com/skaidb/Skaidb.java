@@ -586,6 +586,27 @@ public final class Skaidb {
                         data.add(row);
                     }
                     return new ResultSet(cols, data);
+                } else if (tag == 8) {     // ResultSets: a CALL whose body EMITted
+                    int nsets = r.u32();
+                    List<ResultSet> sets = new ArrayList<>(nsets);
+                    for (int s = 0; s < nsets; s++) {
+                        int ncols = r.u32();
+                        String[] cols = new String[ncols];
+                        for (int i = 0; i < ncols; i++) cols[i] = r.text();
+                        int nrows = r.u32();
+                        List<Object[]> data = new ArrayList<>(nrows);
+                        for (int i = 0; i < nrows; i++) {
+                            int ncells = r.u32();
+                            Object[] row = new Object[ncells];
+                            for (int j = 0; j < ncells; j++) row[j] = decodeValue(new Reader(r.blob()));
+                            data.add(row);
+                        }
+                        sets.add(new ResultSet(cols, data));
+                    }
+                    if (sets.isEmpty()) return new ResultSet(new String[0], new ArrayList<>());
+                    ResultSet first = sets.get(0);
+                    first.more = new ArrayList<>(sets.subList(1, sets.size()));
+                    return first;
                 } else if (tag == 1) {     // Mutation
                     return r.u64();
                 } else if (tag == 2) {     // Ddl
@@ -810,13 +831,25 @@ public final class Skaidb {
     // ---- ResultSet --------------------------------------------------------
 
     public static final class ResultSet {
-        private final String[] columns;
-        private final List<Object[]> rows;
+        private String[] columns;
+        private List<Object[]> rows;
         private int pos = -1;
+        /** Further result sets of a multi-set reply (a CALL whose body EMITted). */
+        List<ResultSet> more = new ArrayList<>();
 
         ResultSet(String[] columns, List<Object[]> rows) {
             this.columns = columns;
             this.rows = rows;
+        }
+
+        /** Advance to the next result set of a multi-set reply; false when there is none. */
+        public boolean nextResultSet() {
+            if (more.isEmpty()) return false;
+            ResultSet n = more.remove(0);
+            this.columns = n.columns;
+            this.rows = n.rows;
+            this.pos = -1;
+            return true;
         }
 
         public boolean next() { return ++pos < rows.size(); }
