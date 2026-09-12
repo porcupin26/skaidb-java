@@ -137,9 +137,19 @@ public final class Skaidb {
         private DataInputStream in;
         private OutputStream out;
         private int consistency;
-        private boolean closed = false;
-        /** Transport died; the next statement re-dials (see ensureLive). */
-        private boolean broken = false;
+        // isUsable() is a pool's health check and must answer while another
+        // thread holds this connection's monitor for a running statement, so
+        // the three state flags are volatile rather than monitor-guarded.
+        // Writes still happen under the monitor wherever check-then-set has
+        // to be atomic (see stream()).
+        private volatile boolean closed = false;
+        /**
+         * Transport died, or a stream left the wire at an unknown position;
+         * the next statement re-dials (see ensureLive).
+         */
+        private volatile boolean broken = false;
+        /** A RowStream owns the wire until it ends; see requireIdle(). */
+        private volatile boolean streaming = false;
         private final java.util.Map<String, long[]> prepared = new java.util.HashMap<>();
         // Retained so a reconnect can repeat the original connect exactly.
         private final java.util.List<String> seeds;
@@ -368,8 +378,13 @@ public final class Skaidb {
             }
         }
 
-        /** False once closed, or once a transport error broke the socket. */
-        public boolean isUsable() { return !closed && !broken; }
+        /**
+         * False once closed, once a transport error broke the socket, and
+         * while a {@link RowStream} still owns the wire: a {@link Pool} must
+         * never hand out a connection whose next frame belongs to somebody
+         * else's result set.
+         */
+        public boolean isUsable() { return !closed && !broken && !streaming; }
 
         @Override public void close() {
             if (closed) return;
@@ -437,6 +452,26 @@ public final class Skaidb {
             }
         }
 
+        /**
+         * Refuse a statement while a {@link RowStream} still owns the wire.
+         *
+         * <p>The protocol allows one exchange at a time, so a statement sent
+         * mid-stream would read that stream's chunks as its own answer and
+         * desync both. The obvious guard — holding the connection's monitor
+         * for the stream's lifetime — is not expressible in Java: {@code
+         * synchronized} cannot outlive the method that hands the stream back,
+         * and a stream is often closed on a different thread than opened it.
+         * So a flag marks the wire busy and the loser gets a clear error
+         * instead of corruption. It is also deliberately NOT enforced by
+         * blocking: the caller of stream() may sit on the stream for minutes,
+         * and a silent multi-minute stall reads as a hung database.
+         */
+        private void requireIdle() {
+            if (streaming) throw new SkaidbException(
+                "connection is busy streaming: finish or close() the RowStream from "
+                + "Connection.stream() before running another statement on this connection");
+        }
+
         // -- query: returns the raw response Reader positioned after the tag --
         synchronized Object run(String sql, boolean wantRows) {
             return run(sql, wantRows, consistency);
@@ -459,12 +494,16 @@ public final class Skaidb {
          *     while (s.next()) System.out.println(s.getObject(0));
          * }</pre>
          *
-         * The connection is busy until the stream ends; closing it early
-         * drains the remaining frames so the connection stays usable. Takes
-         * no parameters — the opcode carries SQL text.
+         * The connection is busy for the whole stream: any other statement on
+         * it throws until the stream ends or is closed, and {@link #isUsable}
+         * reports false so a {@link Pool} will not lend it out meanwhile.
+         * Always close the stream (try-with-resources above) — Java collects
+         * the object but cannot drain the socket for you. Takes no parameters
+         * — the opcode carries SQL text.
          */
         public synchronized RowStream stream(String sql) {
             if (closed) throw new SkaidbException("connection is closed");
+            requireIdle();
             ensureLive();
             byte[] body = sql.getBytes(StandardCharsets.UTF_8);
             Buf req = new Buf();
@@ -478,25 +517,57 @@ public final class Skaidb {
                     throw new SkaidbException(msg.contains("unknown opcode")
                         ? "server does not support streaming: " + msg : msg);
                 }
+                // Mutation/Ddl: one frame and the exchange is over, so the
+                // wire stays free and the stream owns nothing.
                 if (tag == 1 || tag == 2) return new RowStream(this, new String[0], false);
-                if (tag != 5) throw new SkaidbException("unexpected response tag " + tag + " to stream request");
+                if (tag != 5) {
+                    // The server answered a stream request with something a
+                    // stream cannot start with; whatever follows is not ours
+                    // to interpret, so do not reuse this socket.
+                    broken = true;
+                    throw new SkaidbException("unexpected response tag " + tag + " to stream request");
+                }
                 int ncols = r.u32();
                 String[] cols = new String[ncols];
                 for (int i = 0; i < ncols; i++) cols[i] = r.text();
+                streaming = true;      // released by RowStream: RowsEnd, Error or close()
                 return new RowStream(this, cols, true);
             } catch (IOException e) {
+                // Half a request may be on the wire, or half a header off it.
+                broken = true;
                 throw new SkaidbException("stream failed: " + e.getMessage(), e);
             }
         }
 
         /** Read one frame; RowStream uses this to pull chunks. */
-        Reader nextFrame() {
+        Reader nextFrame() { return new Reader(nextFramePayload()); }
+
+        /**
+         * Raw frame bytes, so a drain can budget by size without decoding.
+         * Not synchronized: the streaming thread blocks here for as long as
+         * the server takes, and holding the monitor across that would turn
+         * requireIdle()'s clear error into an invisible wait.
+         */
+        byte[] nextFramePayload() {
             try {
-                return new Reader(readFrame());
+                return readFrame();
             } catch (IOException e) {
+                broken = true;   // socket gone; the next statement re-dials
                 throw new SkaidbException("stream read failed: " + e.getMessage(), e);
             }
         }
+
+        /**
+         * Called by RowStream when it can no longer say where the next frame
+         * starts. The connection then fails isUsable() — so a Pool drops it
+         * rather than handing the desync to the next borrower — and ensureLive
+         * re-dials before the next statement instead of reading leftover
+         * stream frames as that statement's answer.
+         */
+        void markBroken() { broken = true; }
+
+        /** Give the wire back; the connection accepts statements again. */
+        void endStream() { streaming = false; }
 
         /**
          * Prepare `sql` on the SERVER and return {statementId, paramCount}.
@@ -504,6 +575,7 @@ public final class Skaidb {
          * the connection that created it.
          */
         synchronized long[] prepareServer(String sql) {
+            requireIdle();
             // Before the cache is consulted: a reconnect empties it, so a
             // stale id from the dead socket can never be handed out.
             ensureLive();
@@ -568,6 +640,9 @@ public final class Skaidb {
 
         private Object roundtrip(byte[] request) {
             if (closed) throw new SkaidbException("connection is closed");
+            // Every non-streaming statement funnels through here, so this is
+            // the one place the busy-wire check has to hold.
+            requireIdle();
             try {
                 writeFrame(request);
 
@@ -656,20 +731,35 @@ public final class Skaidb {
 
     /**
      * A streamed result set: holds one chunk, not the whole result. Obtained
-     * from {@link Connection#stream(String)}.
+     * from {@link Connection#stream(String)}, which it owns until the last
+     * frame is read or {@link #close} runs — no other statement may use that
+     * connection meanwhile. Not thread-safe: one stream, one reader.
      */
     public static final class RowStream implements AutoCloseable {
+        /**
+         * How much of an abandoned stream is worth pulling off the socket to
+         * keep the connection: about 32 of the server's ~256 KB chunks. Past
+         * that, re-dialling is cheaper than reading a result set the caller
+         * has already walked away from.
+         */
+        private static final long DRAIN_BYTE_BUDGET = 8L * 1024 * 1024;
+
         private final Connection conn;
         private final String[] columns;
         private java.util.List<Object[]> chunk = new ArrayList<>();
         private int pos = 0;
         private boolean live;            // more frames are still coming
+        /** True while this stream, and not the connection, owns the wire. */
+        private boolean owns;
         private Object[] current;
 
         RowStream(Connection conn, String[] columns, boolean live) {
             this.conn = conn;
             this.columns = columns;
             this.live = live;
+            // A non-row statement answered in one frame owns nothing: the
+            // connection was never marked busy for it.
+            this.owns = live;
         }
 
         public String[] getColumnNames() { return columns.clone(); }
@@ -678,7 +768,15 @@ public final class Skaidb {
         public boolean next() {
             while (pos >= chunk.size()) {
                 if (!live) return false;
-                Reader r = conn.nextFrame();
+                Reader r;
+                try {
+                    r = conn.nextFrame();
+                } catch (RuntimeException e) {
+                    // The transport died mid-stream: nothing more is coming
+                    // and the wire position is unknowable.
+                    release(true);
+                    throw e;
+                }
                 int tag = r.u8();
                 if (tag == 6) {                    // RowsChunk
                     int n = r.u32();
@@ -692,13 +790,17 @@ public final class Skaidb {
                     chunk = rows;
                     pos = 0;
                 } else if (tag == 7) {             // RowsEnd
-                    live = false;
+                    // The exchange is over and the wire sits at a request
+                    // boundary, so release it now rather than at close():
+                    // a caller that reads to the end and never closes still
+                    // gets a connection it can go on using.
+                    release(false);
                     return false;
                 } else if (tag == 3) {             // failed partway; rows so far are valid
-                    live = false;
+                    release(false);                // Error ends the stream too
                     throw new SkaidbException(r.text());
                 } else {
-                    live = false;
+                    release(true);
                     throw new SkaidbException("unexpected frame tag " + tag + " in stream");
                 }
             }
@@ -716,15 +818,60 @@ public final class Skaidb {
         }
 
         /**
-         * Drain any frames the server is still sending, so the connection can
-         * be reused. Safe to call repeatedly.
+         * Hand the connection back, draining whatever the server is still
+         * sending so the socket is left at a request boundary. Abandoning a
+         * stream early — breaking out of the loop, or throwing — is the usual
+         * way to get here, since this is what try-with-resources calls.
+         *
+         * <p>If the remainder exceeds {@link #DRAIN_BYTE_BUDGET}, or the
+         * drain itself fails, the connection is marked broken instead: it
+         * then fails {@link Connection#isUsable}, so a {@link Pool} discards
+         * it, and a directly held connection re-dials on its next statement
+         * rather than reading this stream's leftovers as that statement's
+         * answer. Either way no desynced connection is handed on. Idempotent.
          */
         @Override public void close() {
+            if (!owns) return;
+            release(!drain());
+        }
+
+        /**
+         * Read and discard the rest of the stream. False when it could not be
+         * finished, i.e. when the caller must not reuse the connection.
+         */
+        private boolean drain() {
+            long budget = DRAIN_BYTE_BUDGET;
             while (live) {
-                Reader r = conn.nextFrame();
-                int tag = r.u8();
-                if (tag == 7 || tag == 3) live = false;
+                byte[] frame;
+                try {
+                    frame = conn.nextFramePayload();
+                } catch (RuntimeException e) {
+                    // close() must not throw over a stream the caller has
+                    // already abandoned; the false answer poisons instead.
+                    return false;
+                }
+                // Only the tag is needed, so the chunk is never decoded.
+                int tag = frame.length == 0 ? -1 : frame[0] & 0xff;
+                if (tag == 7 || tag == 3) return true;   // RowsEnd / Error: done
+                if (tag != 6) return false;              // not a stream frame
+                budget -= frame.length;
+                if (budget <= 0) return false;
             }
+            return true;
+        }
+
+        /**
+         * Release the wire exactly once, whatever ended the stream. {@code
+         * poison} says the position is no longer trustworthy, which must
+         * outlive this stream — hence marking the connection, not just
+         * dropping it.
+         */
+        private void release(boolean poison) {
+            live = false;
+            if (!owns) return;
+            owns = false;
+            if (poison) conn.markBroken();
+            conn.endStream();
         }
     }
 
