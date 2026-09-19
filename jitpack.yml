@@ -2,5 +2,6 @@
 #   https://jitpack.io/#porcupin26/skaidb-java
 jdk:
   - openjdk17
+# ./mvnw pins Maven 3.9.9; JitPack's own Maven predates the plugins used here.
 install:
-  - mvn -B -ntp install -DskipTests
+  - ./mvnw -B -ntp install -DskipTests

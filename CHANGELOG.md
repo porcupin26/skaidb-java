@@ -9,7 +9,8 @@ compatibility section for which server versions each release speaks to.
 First standalone release. The driver previously lived in the skaidb
 monorepo under `drivers/java`; its history is carried over unchanged.
 
-- Published as `com.github.porcupin26:skaidb-java` (via JitPack).
+- Published as `com.github.porcupin26:skaidb-java` (via JitPack); a Maven
+  Wrapper (`./mvnw`, Maven 3.9.9) is checked in.
 - The version the driver reports to the server in its Hello frame is now
   derived from the package metadata (`Skaidb.VERSION`), never a literal.
 - `SkaidbException` and the internal `Unpreparable` carry a `serialVersionUID`.

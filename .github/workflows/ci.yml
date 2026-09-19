@@ -22,7 +22,7 @@ jobs:
           java-version: ${{ matrix.java }}
           cache: maven
       - name: Build, test, package (jar + sources + javadoc)
-        run: mvn -B -ntp verify
+        run: ./mvnw -B -ntp verify
       - name: Examples compile against the built classes
         run: |
           mkdir -p /tmp/examples-out

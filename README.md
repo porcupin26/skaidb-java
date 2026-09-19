@@ -494,8 +494,9 @@ whether a connection is closed, broken or mid-stream.
 ## Building and testing
 
 ```sh
-mvn -B verify        # compiles with -Xlint:all (warnings fail the build), runs the tests,
+./mvnw -B verify     # compiles with -Xlint:all (warnings fail the build), runs the tests,
                      # packages the jar plus -sources.jar and -javadoc.jar in target/
+                     # (the wrapper fetches Maven 3.9.9; a local mvn >= 3.6.3 works too)
 ```
 
 The tests need no server: `SkaidbTest` covers the pure functions

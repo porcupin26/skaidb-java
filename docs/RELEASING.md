@@ -8,7 +8,7 @@ There is nothing to upload.
    `FALLBACK_VERSION` literal in `Skaidb.java` in step — it is only used by
    a hand-built class tree with no manifest, but should not drift.
 2. Add the entry to `CHANGELOG.md`.
-3. `mvn -B verify` locally; CI must be green on `main`.
+3. `./mvnw -B verify` locally; CI must be green on `main`.
 4. Tag and push: `git tag vX.Y.Z && git push origin main vX.Y.Z`.
 5. Warm JitPack (optional, the first consumer would otherwise wait for the
    build): fetch
@@ -19,7 +19,8 @@ There is nothing to upload.
 JitPack forces the coordinates `com.github.porcupin26:skaidb-java:<tag>`;
 the tag is used verbatim as the version (so `v1.0.0`, not `1.0.0`). The
 build runs on the JDK pinned in `jitpack.yml` (OpenJDK 17) with
-`mvn install -DskipTests`; sources and Javadoc jars are attached because
+`./mvnw install -DskipTests` (the wrapper pins Maven 3.9.9, because JitPack's
+own Maven predates the plugin versions used here); sources and Javadoc jars are attached because
 the plugins are bound to the `package` phase.
 
 ## Maven Central

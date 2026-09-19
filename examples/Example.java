@@ -8,7 +8,7 @@ import com.skaidb.Skaidb;
 //   java -cp out Example [host] [port] [user] [password]
 //
 // Or against the packaged jar:
-//   mvn -B -ntp package -DskipTests
+//   ./mvnw -B -ntp package -DskipTests
 //   javac -cp target/classes -d out examples/Example.java
 //   java -cp target/classes:out Example localhost 7000 skaidb secret
 public class Example {
