@@ -43,8 +43,12 @@ The artifact is published through [JitPack](https://jitpack.io/#porcupin26/skaid
 which builds it from the git tag on first request. Coordinates:
 
 ```
-com.github.porcupin26:skaidb-java:v1.0.0
+com.github.porcupin26:skaidb-java:v1.0.1
 ```
+
+> **Note:** `v1.0.0` is not resolvable through JitPack — its first build
+> failed on JitPack's stock Maven and JitPack caches a tag's first result
+> for good — so use `v1.0.1` or newer. The driver code is identical.
 
 The JitPack repository has to be declared once — that is the only step
 Maven Central would spare you (publishing there needs a Sonatype account and
@@ -64,7 +68,7 @@ GPG-signed artifacts, which this project does not have yet).
   <dependency>
     <groupId>com.github.porcupin26</groupId>
     <artifactId>skaidb-java</artifactId>
-    <version>v1.0.0</version>
+    <version>v1.0.1</version>
   </dependency>
 </dependencies>
 ```
@@ -78,7 +82,7 @@ repositories {
 }
 
 dependencies {
-    implementation("com.github.porcupin26:skaidb-java:v1.0.0")
+    implementation("com.github.porcupin26:skaidb-java:v1.0.1")
 }
 ```
 
@@ -91,7 +95,7 @@ repositories {
 }
 
 dependencies {
-    implementation 'com.github.porcupin26:skaidb-java:v1.0.0'
+    implementation 'com.github.porcupin26:skaidb-java:v1.0.1'
 }
 ```
 

@@ -6,7 +6,7 @@ verbatim from `Skaidb.java`; the README explains how to use them.
 ## `Skaidb`
 
 ```java
-public static final String VERSION;                  // the driver version, e.g. "1.0.0"
+public static final String VERSION;                  // the driver version, e.g. "1.0.1"
 public static String version();                      // same, as a method
 
 public static final int CONSISTENCY_ONE    = 0;

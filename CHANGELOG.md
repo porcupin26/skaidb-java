@@ -4,6 +4,17 @@ All notable changes to the skaidb Java driver. The driver has its own
 version series, independent of the skaidb server; see the README's
 compatibility section for which server versions each release speaks to.
 
+## 1.0.1
+
+Republished under a new tag because JitPack cached a failed v1.0.0 build;
+no code changes.
+
+- The first commit under tag `v1.0.0` built with JitPack's stock Maven,
+  which is too old for `maven-compiler-plugin` 3.13.0; JitPack cached that
+  failure and never re-resolves a tag, so
+  `com.github.porcupin26:skaidb-java:v1.0.0` does not resolve. Use
+  `v1.0.1` or newer.
+
 ## 1.0.0
 
 First standalone release. The driver previously lived in the skaidb

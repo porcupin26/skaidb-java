@@ -6,7 +6,7 @@
 
   <groupId>com.github.porcupin26</groupId>
   <artifactId>skaidb-java</artifactId>
-  <version>1.0.0</version>
+  <version>1.0.1</version>
   <packaging>jar</packaging>
 
   <name>skaidb-java</name>
@@ -25,7 +25,7 @@
     <url>https://github.com/porcupin26/skaidb-java</url>
     <connection>scm:git:https://github.com/porcupin26/skaidb-java.git</connection>
     <developerConnection>scm:git:git@github.com:porcupin26/skaidb-java.git</developerConnection>
-    <tag>v1.0.0</tag>
+    <tag>v1.0.1</tag>
   </scm>
 
   <properties>
