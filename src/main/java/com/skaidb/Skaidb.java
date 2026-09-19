@@ -42,12 +42,74 @@ public final class Skaidb {
 
     private Skaidb() {}
 
+    /**
+     * The driver's own version, as reported to the server in the Hello frame
+     * (the {@code drivers} table's client_version). Derived from the package
+     * metadata so it always equals the published artifact version: the jar
+     * manifest's Implementation-Version first, then the build-time
+     * {@code version.properties} resource, and only then the literal below.
+     */
+    public static final String VERSION = detectVersion();
+
+    private static final String FALLBACK_VERSION = "1.0.0";
+
+    private static String detectVersion() {
+        try {
+            Package pkg = Skaidb.class.getPackage();
+            String v = pkg == null ? null : pkg.getImplementationVersion();
+            if (v != null && !v.isEmpty()) return v;
+            try (java.io.InputStream in = Skaidb.class.getResourceAsStream("version.properties")) {
+                if (in != null) {
+                    java.util.Properties props = new java.util.Properties();
+                    props.load(in);
+                    v = props.getProperty("version");
+                    if (v != null && !v.isEmpty() && !v.startsWith("$")) return v;
+                }
+            }
+        } catch (IOException | RuntimeException e) {
+            // fall through: a build without metadata still identifies itself
+        }
+        return FALLBACK_VERSION;
+    }
+
+    /** {@link #VERSION}, as a method for callers that prefer one. */
+    public static String version() { return VERSION; }
+
     public static final int CONSISTENCY_ONE = 0;
     public static final int CONSISTENCY_QUORUM = 1;
     public static final int CONSISTENCY_ALL = 2;
 
-    /** Connect using a {@code skaidb://user:pass@host:port/?consistency=quorum} URL. */
+    /**
+     * Connect using a {@code skaidb://user:pass@host:port/db?consistency=quorum}
+     * URL. See {@link #parseDsn} for every accepted component.
+     */
     public static Connection connect(String dsn) {
+        Dsn d = parseDsn(dsn);
+        return new Connection(d.seeds, d.user, d.password, d.consistency, d.database,
+                              d.tls, d.tlsCa, d.tlsInsecure, d.tlsServerName);
+    }
+
+    /** The decoded parts of a {@code skaidb://} URL; see {@link #parseDsn}. */
+    static final class Dsn {
+        final List<String> seeds;
+        final String user, password, database, tlsCa, tlsServerName;
+        final int consistency;
+        final boolean tls, tlsInsecure;
+        Dsn(List<String> seeds, String user, String password, int consistency, String database,
+            boolean tls, String tlsCa, boolean tlsInsecure, String tlsServerName) {
+            this.seeds = seeds; this.user = user; this.password = password;
+            this.consistency = consistency; this.database = database; this.tls = tls;
+            this.tlsCa = tlsCa; this.tlsInsecure = tlsInsecure; this.tlsServerName = tlsServerName;
+        }
+    }
+
+    /**
+     * Decode a DSN without dialling. {@code skaidb://[user[:pass]@]host[:port][,host2[:port]...][/db][?options]}
+     * with options {@code consistency=one|quorum|all}, {@code tls=true},
+     * {@code tls_ca=/path/ca.pem}, {@code tls_insecure=true},
+     * {@code tls_server_name=name}.
+     */
+    static Dsn parseDsn(String dsn) {
         try {
             URI u = URI.create(dsn);
             if (!"skaidb".equals(u.getScheme()))
@@ -100,13 +162,14 @@ public final class Skaidb {
                 seeds.add(h.contains(":") ? h : h + ":" + port);
             }
             if (seeds.isEmpty()) throw new SkaidbException("DSN has no host");
-            return new Connection(seeds, user, pass, consistency, database,
-                                  tls, tlsCa, tlsInsecure, tlsName);
+            return new Dsn(seeds, user, pass, consistency, database,
+                           tls, tlsCa, tlsInsecure, tlsName);
         } catch (IllegalArgumentException e) {
             throw new SkaidbException("bad DSN: " + e.getMessage());
         }
     }
 
+    /** Connect to one host explicitly: QUORUM consistency, no TLS, no session database. */
     public static Connection connect(String host, int port, String user, String password) {
         return new Connection(java.util.Collections.singletonList(host + ":" + port),
                               user, password, CONSISTENCY_QUORUM, "",
@@ -125,6 +188,7 @@ public final class Skaidb {
 
     /** Thrown on connection, protocol, or statement errors. */
     public static final class SkaidbException extends RuntimeException {
+        private static final long serialVersionUID = 1L;
         public SkaidbException(String message) { super(message); }
         public SkaidbException(String message, Throwable cause) { super(message, cause); }
     }
@@ -233,7 +297,7 @@ public final class Skaidb {
         private void sendHello() {
             try {
                 byte[] name = "java".getBytes(StandardCharsets.UTF_8);
-                byte[] ver = "0.1.0".getBytes(StandardCharsets.UTF_8);
+                byte[] ver = VERSION.getBytes(StandardCharsets.UTF_8);
                 Buf req = new Buf();
                 req.u8(8).u32(name.length).raw(name).u32(ver.length).raw(ver);
                 writeFrame(req.toBytes());
@@ -1214,6 +1278,7 @@ public final class Skaidb {
      * client-side text binding, exactly as the Python driver does.
      */
     static final class Unpreparable extends RuntimeException {
+        private static final long serialVersionUID = 1L;
         Unpreparable(String m) { super(m); }
     }
 
@@ -1354,8 +1419,11 @@ public final class Skaidb {
      *
      * <pre>{@code
      * try (Skaidb.Pool pool = new Skaidb.Pool("skaidb://u:p@h1:7000,h2:7000/app", 8)) {
-     *     long n = pool.withConnection(c -> c.prepare("SELECT count(*) AS n FROM t")
-     *                                        .executeQuery().nextLong("n"));
+     *     long n = pool.withConnection(c -> {
+     *         Skaidb.ResultSet rs = c.query("SELECT count(*) AS n FROM t");
+     *         rs.next();
+     *         return rs.getLong("n");
+     *     });
      * }
      * }</pre>
      */

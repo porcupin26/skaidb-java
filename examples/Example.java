@@ -1,8 +1,16 @@
 import com.skaidb.Skaidb;
 
-// Compile & run:
-//   javac -d out src/main/java/com/skaidb/Skaidb.java Example.java
+// The 30-second tour: connect, create a table, insert with bound parameters,
+// query, drop.
+//
+// Compile & run from the repository root (no build tool needed):
+//   javac -d out src/main/java/com/skaidb/Skaidb.java examples/Example.java
 //   java -cp out Example [host] [port] [user] [password]
+//
+// Or against the packaged jar:
+//   mvn -B -ntp package -DskipTests
+//   javac -cp target/classes -d out examples/Example.java
+//   java -cp target/classes:out Example localhost 7000 skaidb secret
 public class Example {
     public static void main(String[] args) {
         String host = args.length > 0 ? args[0] : "localhost";
