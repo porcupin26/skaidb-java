@@ -32,7 +32,7 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: The tag is the version in pom.xml
         id: version
@@ -58,7 +58,7 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Releasing $GROUP:$ARTIFACT:$TAG (pom version $VERSION)"
 
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: '17'
@@ -135,21 +135,29 @@ jobs:
           set -euo pipefail
           BASE="https://jitpack.io/${GROUP//.//}/$ARTIFACT/$TAG"
           API="https://jitpack.io/api/builds/$GROUP/$ARTIFACT/$TAG"
-          # The first request for the pom is what makes JitPack build the tag.
-          # JitPack holds that request open until the build ends, so it runs
-          # in the background while the build API is polled (up to 10 min).
-          curl -sS -o /dev/null -w 'pom request: HTTP %{http_code}\n' --max-time 900 "$BASE/$ARTIFACT-$TAG.pom" &
-          trigger=$!
+          # A request for the pom is what makes JitPack build a tag, and the
+          # request then blocks until the build ends, so it runs in the
+          # background while the build API is polled (up to 10 min). Made
+          # before JitPack has seen the tag (it caches a repo's refs for a
+          # short while: status tagNotFound, HTTP 404) the request does
+          # nothing, so it is re-issued whenever the previous one has
+          # returned and the build is not finished.
+          trigger=
           status=none
           for _ in $(seq 1 40); do
+            if [[ -z "$trigger" ]] || ! kill -0 "$trigger" 2>/dev/null; then
+              curl -sS -o /dev/null -w 'pom request: HTTP %{http_code}\n' --max-time 900 "$BASE/$ARTIFACT-$TAG.pom" &
+              trigger=$!
+            fi
+            sleep 15
             status=$(curl -sS --max-time 30 "$API" | python3 -c 'import json, sys; print(json.load(sys.stdin).get("status", "unknown"))' 2>/dev/null || echo unreachable)
             echo "$(date -u +%H:%M:%S) JitPack status for $TAG: $status"
             if [[ "$status" == ok || "$status" == Error ]]; then
               break
             fi
-            sleep 15
           done
-          wait "$trigger" || true
+          kill "$trigger" 2>/dev/null || true
+          wait "$trigger" 2>/dev/null || true
           if [[ "$status" != ok ]]; then
             echo "::error::JitPack build of $TAG ended with status '$status' (an Error is cached for good: fix and release the next patch version) — log: $BASE/build.log"
             echo "--- tail of $BASE/build.log ---"
