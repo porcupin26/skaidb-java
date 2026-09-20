@@ -51,7 +51,7 @@ public final class Skaidb {
      */
     public static final String VERSION = detectVersion();
 
-    private static final String FALLBACK_VERSION = "1.0.1";
+    private static final String FALLBACK_VERSION = "1.0.2";
 
     private static String detectVersion() {
         try {

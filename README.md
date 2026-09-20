@@ -43,7 +43,7 @@ The artifact is published through [JitPack](https://jitpack.io/#porcupin26/skaid
 which builds it from the git tag on first request. Coordinates:
 
 ```
-com.github.porcupin26:skaidb-java:v1.0.1
+com.github.porcupin26:skaidb-java:v1.0.2
 ```
 
 > **Note:** `v1.0.0` is not resolvable through JitPack — its first build
@@ -68,7 +68,7 @@ GPG-signed artifacts, which this project does not have yet).
   <dependency>
     <groupId>com.github.porcupin26</groupId>
     <artifactId>skaidb-java</artifactId>
-    <version>v1.0.1</version>
+    <version>v1.0.2</version>
   </dependency>
 </dependencies>
 ```
@@ -82,7 +82,7 @@ repositories {
 }
 
 dependencies {
-    implementation("com.github.porcupin26:skaidb-java:v1.0.1")
+    implementation("com.github.porcupin26:skaidb-java:v1.0.2")
 }
 ```
 
@@ -95,7 +95,7 @@ repositories {
 }
 
 dependencies {
-    implementation 'com.github.porcupin26:skaidb-java:v1.0.1'
+    implementation 'com.github.porcupin26:skaidb-java:v1.0.2'
 }
 ```
 
@@ -511,7 +511,8 @@ handshake, the Hello frame, prepared statements, batches, multiple result
 sets, streaming, the abandon/drain rule, reconnection and the pool.
 
 Releases: bump `<version>` in `pom.xml`, add a CHANGELOG entry, tag `vX.Y.Z`
-and push the tag. JitPack builds it on the first request; see
+and push the tag. GitHub Actions then runs the tests, publishes the GitHub
+Release with the jars attached and has JitPack build the tag; see
 [docs/RELEASING.md](docs/RELEASING.md).
 
 ## License

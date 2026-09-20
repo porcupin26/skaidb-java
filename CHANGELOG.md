@@ -4,6 +4,17 @@ All notable changes to the skaidb Java driver. The driver has its own
 version series, independent of the skaidb server; see the README's
 compatibility section for which server versions each release speaks to.
 
+## 1.0.2
+
+Release automation: published from GitHub Actions. No driver changes.
+
+- Pushing a tag `vX.Y.Z` now runs the release workflow
+  (`.github/workflows/release.yml`) on GitHub-hosted runners: it checks the
+  tag against `pom.xml`, builds and tests on Temurin 17, creates the GitHub
+  Release with the jar, `-sources.jar`, `-javadoc.jar`, pom and checksums
+  attached and this section as the notes, then has JitPack build the tag
+  and verifies that `com.github.porcupin26:skaidb-java:vX.Y.Z` resolves.
+
 ## 1.0.1
 
 Republished under a new tag because JitPack cached a failed v1.0.0 build;

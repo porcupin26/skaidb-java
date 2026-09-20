@@ -1,0 +1,175 @@
+name: Release
+
+# Pushing a tag vX.Y.Z is the whole release procedure. On GitHub-hosted
+# runners this workflow
+#   1. checks that the tag is the version in pom.xml (and that <scm><tag>,
+#      the FALLBACK_VERSION literal and the CHANGELOG heading agree),
+#   2. builds and tests (./mvnw verify: jar, -sources.jar, -javadoc.jar),
+#   3. creates the GitHub Release with those jars, the pom and checksums
+#      attached and the version's CHANGELOG section as the notes,
+#   4. asks JitPack to build the tag, waits for the build and checks that
+#      com.github.porcupin26:skaidb-java:vX.Y.Z resolves.
+#
+# JitPack builds public GitHub tags on demand and needs no credential, so
+# there is no secret to configure. It caches a tag's FIRST build result for
+# good, which is why it is only asked once the build has passed here. If the
+# JitPack job times out, re-run the failed jobs: every step is idempotent.
+
+on:
+  push:
+    tags: ['v*']
+
+env:
+  GROUP: com.github.porcupin26
+  ARTIFACT: skaidb-java
+
+jobs:
+  release:
+    name: Build, test, GitHub Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: The tag is the version in pom.xml
+        id: version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}"
+          if [[ "$VERSION" == "$TAG" || ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::tag '$TAG' is not of the form vX.Y.Z[-suffix]"
+            exit 1
+          fi
+          ns='{http://maven.apache.org/POM/4.0.0}'
+          POM_VERSION=$(python3 -c "import xml.etree.ElementTree as E; print(E.parse('pom.xml').getroot().findtext('${ns}version').strip())")
+          SCM_TAG=$(python3 -c "import xml.etree.ElementTree as E; print(E.parse('pom.xml').getroot().findtext('${ns}scm/${ns}tag').strip())")
+          FALLBACK=$(grep -oP 'FALLBACK_VERSION = "\K[^"]+' src/main/java/com/skaidb/Skaidb.java)
+          ok=1
+          [[ "$POM_VERSION" == "$VERSION" ]] || { echo "::error file=pom.xml::<version> is $POM_VERSION but the tag is $TAG"; ok=0; }
+          [[ "$SCM_TAG" == "$TAG" ]] || { echo "::error file=pom.xml::<scm><tag> is $SCM_TAG but the tag is $TAG"; ok=0; }
+          [[ "$FALLBACK" == "$VERSION" ]] || { echo "::error file=src/main/java/com/skaidb/Skaidb.java::FALLBACK_VERSION is $FALLBACK but the tag is $TAG"; ok=0; }
+          grep -qE "^## ${VERSION//./\\.}( |$)" CHANGELOG.md || { echo "::error file=CHANGELOG.md::no '## $VERSION' section"; ok=0; }
+          [[ $ok == 1 ]]
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Releasing $GROUP:$ARTIFACT:$TAG (pom version $VERSION)"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      - name: Build, test, package (jar + sources + javadoc)
+        run: ./mvnw -B -ntp verify
+
+      - name: The jar announces the released version
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          unzip -p "target/$ARTIFACT-$VERSION.jar" META-INF/MANIFEST.MF | tr -d '\r' | grep -x "Implementation-Version: $VERSION"
+          ls -l target/*.jar
+
+      - name: Release assets and notes
+        env:
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          cp pom.xml "target/$ARTIFACT-$VERSION.pom"
+          (cd target && sha256sum "$ARTIFACT-$VERSION.jar" "$ARTIFACT-$VERSION-sources.jar" "$ARTIFACT-$VERSION-javadoc.jar" "$ARTIFACT-$VERSION.pom" > SHA256SUMS)
+          cat target/SHA256SUMS
+          # The notes are the version's CHANGELOG section (up to the next
+          # heading) followed by the coordinates.
+          python3 - "$VERSION" > target/release-notes.md <<'PY'
+          import re, sys
+          v = sys.argv[1]
+          text = open('CHANGELOG.md', encoding='utf-8').read()
+          m = re.search(r'^## ' + re.escape(v) + r'(?:[ \t].*)?$\n(.*?)(?=^## |\Z)', text, re.M | re.S)
+          print(m.group(1).strip() if m else '')
+          PY
+          {
+            echo
+            echo "## Install"
+            echo
+            echo "Served by [JitPack](https://jitpack.io/#porcupin26/skaidb-java/$TAG); declare the JitPack repository once (see the README), then depend on"
+            echo
+            echo '```'
+            echo "$GROUP:$ARTIFACT:$TAG"
+            echo '```'
+          } >> target/release-notes.md
+          cat target/release-notes.md
+
+      - name: GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          body_path: target/release-notes.md
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          make_latest: ${{ !contains(github.ref_name, '-') }}
+          fail_on_unmatched_files: true
+          files: |
+            target/skaidb-java-${{ steps.version.outputs.version }}.jar
+            target/skaidb-java-${{ steps.version.outputs.version }}-sources.jar
+            target/skaidb-java-${{ steps.version.outputs.version }}-javadoc.jar
+            target/skaidb-java-${{ steps.version.outputs.version }}.pom
+            target/SHA256SUMS
+
+  jitpack:
+    name: JitPack build of the tag
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      TAG: ${{ github.ref_name }}
+      VERSION: ${{ needs.release.outputs.version }}
+    steps:
+      - name: Ask JitPack to build the tag and wait for it
+        run: |
+          set -euo pipefail
+          BASE="https://jitpack.io/${GROUP//.//}/$ARTIFACT/$TAG"
+          API="https://jitpack.io/api/builds/$GROUP/$ARTIFACT/$TAG"
+          # The first request for the pom is what makes JitPack build the tag.
+          # JitPack holds that request open until the build ends, so it runs
+          # in the background while the build API is polled (up to 10 min).
+          curl -sS -o /dev/null -w 'pom request: HTTP %{http_code}\n' --max-time 900 "$BASE/$ARTIFACT-$TAG.pom" &
+          trigger=$!
+          status=none
+          for _ in $(seq 1 40); do
+            status=$(curl -sS --max-time 30 "$API" | python3 -c 'import json, sys; print(json.load(sys.stdin).get("status", "unknown"))' 2>/dev/null || echo unreachable)
+            echo "$(date -u +%H:%M:%S) JitPack status for $TAG: $status"
+            if [[ "$status" == ok || "$status" == Error ]]; then
+              break
+            fi
+            sleep 15
+          done
+          wait "$trigger" || true
+          if [[ "$status" != ok ]]; then
+            echo "::error::JitPack build of $TAG ended with status '$status' (an Error is cached for good: fix and release the next patch version) — log: $BASE/build.log"
+            echo "--- tail of $BASE/build.log ---"
+            curl -sS --max-time 60 "$BASE/build.log" | tail -n 100 || true
+            exit 1
+          fi
+
+      - name: The artifact resolves from JitPack and announces the version
+        run: |
+          set -euo pipefail
+          BASE="https://jitpack.io/${GROUP//.//}/$ARTIFACT/$TAG"
+          curl -sSf --max-time 300 -o /tmp/jitpack.jar "$BASE/$ARTIFACT-$TAG.jar"
+          unzip -p /tmp/jitpack.jar META-INF/MANIFEST.MF | tr -d '\r' | grep -x "Implementation-Version: $VERSION"
+          for f in "$ARTIFACT-$TAG.pom" "$ARTIFACT-$TAG-sources.jar" "$ARTIFACT-$TAG-javadoc.jar"; do
+            code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 300 "$BASE/$f")
+            echo "$f: HTTP $code"
+            [[ "$code" == 200 ]]
+          done
+          {
+            echo "## JitPack"
+            echo
+            echo "\`$GROUP:$ARTIFACT:$TAG\` resolves — [build page](https://jitpack.io/#porcupin26/skaidb-java/$TAG), [build log]($BASE/build.log)."
+          } >> "$GITHUB_STEP_SUMMARY"
