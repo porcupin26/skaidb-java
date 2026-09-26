@@ -176,7 +176,7 @@ class SkaidbTest {
 
     @Test
     void parsesAFullDsn() {
-        Skaidb.Dsn d = Skaidb.parseDsn(
+        Skaidb.ConnectOptions d = Skaidb.parseDsn(
             "skaidb://ada:s3cret@h1:7001,h2,h3:7003/app?consistency=all&tls_ca=/etc/ca.pem&tls_server_name=node1");
         assertEquals(Arrays.asList("h1:7001", "h2:7000", "h3:7003"), d.seeds);
         assertEquals("ada", d.user);
@@ -191,7 +191,7 @@ class SkaidbTest {
 
     @Test
     void dsnDefaults() {
-        Skaidb.Dsn d = Skaidb.parseDsn("skaidb://localhost");
+        Skaidb.ConnectOptions d = Skaidb.parseDsn("skaidb://localhost");
         assertEquals(List.of("localhost:7000"), d.seeds);
         assertEquals("anonymous", d.user);
         assertEquals("", d.password);
@@ -204,7 +204,7 @@ class SkaidbTest {
         assertEquals(Skaidb.CONSISTENCY_QUORUM, Skaidb.parseDsn("skaidb://h/?consistency=QUORUM").consistency);
         assertTrue(Skaidb.parseDsn("skaidb://h/?tls=true").tls);
         assertTrue(Skaidb.parseDsn("skaidb://h/?tls=1").tls);
-        Skaidb.Dsn insecure = Skaidb.parseDsn("skaidb://h/?tls_insecure=true");
+        Skaidb.ConnectOptions insecure = Skaidb.parseDsn("skaidb://h/?tls_insecure=true");
         assertTrue(insecure.tls);
         assertTrue(insecure.tlsInsecure);
         assertEquals("", Skaidb.parseDsn("skaidb://u@h:7000/").database);

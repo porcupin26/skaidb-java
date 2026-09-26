@@ -51,7 +51,7 @@ public final class Skaidb {
      */
     public static final String VERSION = detectVersion();
 
-    private static final String FALLBACK_VERSION = "1.0.2";
+    private static final String FALLBACK_VERSION = "1.1.0";
 
     private static String detectVersion() {
         try {
@@ -84,32 +84,147 @@ public final class Skaidb {
      * URL. See {@link #parseDsn} for every accepted component.
      */
     public static Connection connect(String dsn) {
-        Dsn d = parseDsn(dsn);
-        return new Connection(d.seeds, d.user, d.password, d.consistency, d.database,
-                              d.tls, d.tlsCa, d.tlsInsecure, d.tlsServerName);
+        return new Connection(parseDsn(dsn));
     }
 
-    /** The decoded parts of a {@code skaidb://} URL; see {@link #parseDsn}. */
-    static final class Dsn {
-        final List<String> seeds;
-        final String user, password, database, tlsCa, tlsServerName;
-        final int consistency;
-        final boolean tls, tlsInsecure;
-        Dsn(List<String> seeds, String user, String password, int consistency, String database,
-            boolean tls, String tlsCa, boolean tlsInsecure, String tlsServerName) {
-            this.seeds = seeds; this.user = user; this.password = password;
-            this.consistency = consistency; this.database = database; this.tls = tls;
-            this.tlsCa = tlsCa; this.tlsInsecure = tlsInsecure; this.tlsServerName = tlsServerName;
+    /** Connect with explicit {@link ConnectOptions} (no URL quoting involved). */
+    public static Connection connect(ConnectOptions options) {
+        return new Connection(options.copy().validate());
+    }
+
+    /** Authenticate with SCRAM-SHA-256 (user name + password). The default. */
+    public static final String AUTH_SCRAM = "scram";
+    /**
+     * Authenticate with the TLS client certificate (wire mechanism EXTERNAL):
+     * the certificate's Common Name is the user, no password is sent.
+     */
+    public static final String AUTH_CERTIFICATE = "certificate";
+
+    /**
+     * Everything a connection needs, as a mutable builder. {@link #parseDsn}
+     * produces one from a URL; {@link Skaidb#connect(ConnectOptions)} dials it.
+     * Values are taken verbatim, so passwords need no URL escaping here.
+     *
+     * <pre>{@code
+     * Skaidb.connect(new Skaidb.ConnectOptions()
+     *         .host("db1", 7000).host("db2", 7000)
+     *         .user("app").password("s3cret").database("orders")
+     *         .tlsCa("/etc/skaidb/ca.pem"));
+     * }</pre>
+     */
+    public static final class ConnectOptions {
+        List<String> seeds = new ArrayList<>();
+        /** Null = not given: "anonymous" for SCRAM, empty for certificate login. */
+        String user;
+        String password = "";
+        String database = "";
+        int consistency = CONSISTENCY_QUORUM;
+        boolean tls = false;
+        String tlsCa = "";
+        boolean tlsInsecure = false;
+        String tlsServerName = "skaidb";
+        String tlsClientCert = "";
+        String tlsClientKey = "";
+        String authMechanism = AUTH_SCRAM;
+
+        public ConnectOptions() {}
+
+        /** Add a seed endpoint. Seeds are dialled in shuffled order until one authenticates. */
+        public ConnectOptions host(String host, int port) {
+            if (host == null || host.isEmpty()) throw new SkaidbException("empty host");
+            seeds.add(host + ":" + port);
+            return this;
         }
+        /** Add a seed as {@code host} or {@code host:port} (port 7000 when omitted). */
+        public ConnectOptions host(String hostPort) {
+            String h = hostPort == null ? "" : hostPort.trim();
+            if (h.isEmpty()) throw new SkaidbException("empty host");
+            seeds.add(hasPort(h) ? h : h + ":7000");
+            return this;
+        }
+        public ConnectOptions user(String user) { this.user = user; return this; }
+        public ConnectOptions password(String password) { this.password = password == null ? "" : password; return this; }
+        /** Session database, entered with {@code USE} after every connect and reconnect. */
+        public ConnectOptions database(String database) { this.database = database == null ? "" : database; return this; }
+        /** Default consistency: {@link #CONSISTENCY_ONE}, {@link #CONSISTENCY_QUORUM} or {@link #CONSISTENCY_ALL}. */
+        public ConnectOptions consistency(int level) {
+            if (level < 0 || level > 2) throw new SkaidbException("bad consistency " + level);
+            this.consistency = level;
+            return this;
+        }
+        /** {@code one}, {@code quorum} or {@code all}. */
+        public ConnectOptions consistency(String level) { this.consistency = parseConsistency(level); return this; }
+        /** Encrypt with TLS, verifying the server against the JVM trust store (or {@link #tlsCa}). */
+        public ConnectOptions tls(boolean tls) { this.tls = tls; return this; }
+        /** Trust only the CA certificate(s) in this PEM file. Implies TLS. */
+        public ConnectOptions tlsCa(String pemPath) { this.tlsCa = pemPath == null ? "" : pemPath; return this; }
+        /** Encrypt but verify nothing. Development only. Implies TLS. */
+        public ConnectOptions tlsInsecure(boolean insecure) { this.tlsInsecure = insecure; return this; }
+        /** SNI name and the name the server certificate must carry (default {@code skaidb}). */
+        public ConnectOptions tlsServerName(String name) { this.tlsServerName = name; return this; }
+        /**
+         * Present this client certificate (PEM, leaf first, optionally followed
+         * by its chain) in the TLS handshake. Implies TLS; needs {@link #tlsClientKey}.
+         */
+        public ConnectOptions tlsClientCert(String pemPath) { this.tlsClientCert = pemPath == null ? "" : pemPath; return this; }
+        /**
+         * The client certificate's private key: an unencrypted PEM file,
+         * PKCS#8 ({@code BEGIN PRIVATE KEY}, RSA / EC / Ed25519) or PKCS#1
+         * ({@code BEGIN RSA PRIVATE KEY}).
+         */
+        public ConnectOptions tlsClientKey(String pemPath) { this.tlsClientKey = pemPath == null ? "" : pemPath; return this; }
+        /** {@link #AUTH_SCRAM} (default) or {@link #AUTH_CERTIFICATE}. */
+        public ConnectOptions authMechanism(String mechanism) {
+            String m = mechanism == null ? "" : mechanism.toLowerCase(java.util.Locale.ROOT);
+            if (m.isEmpty()) m = AUTH_SCRAM;
+            if (!m.equals(AUTH_SCRAM) && !m.equals(AUTH_CERTIFICATE))
+                throw new SkaidbException("unknown auth_mechanism " + mechanism + " (use scram or certificate)");
+            this.authMechanism = m;
+            return this;
+        }
+
+        ConnectOptions copy() {
+            ConnectOptions c = new ConnectOptions();
+            c.seeds = new ArrayList<>(seeds);
+            c.user = user; c.password = password; c.database = database;
+            c.consistency = consistency; c.tls = tls; c.tlsCa = tlsCa;
+            c.tlsInsecure = tlsInsecure; c.tlsServerName = tlsServerName;
+            c.tlsClientCert = tlsClientCert; c.tlsClientKey = tlsClientKey;
+            c.authMechanism = authMechanism;
+            return c;
+        }
+
+        /** Derive the implied settings and refuse contradictory ones. */
+        ConnectOptions validate() {
+            if (seeds.isEmpty()) throw new SkaidbException("no host given");
+            if (tlsServerName == null || tlsServerName.isEmpty()) tlsServerName = "skaidb";
+            if (tlsClientCert.isEmpty() != tlsClientKey.isEmpty())
+                throw new SkaidbException("tls_client_cert and tls_client_key go together");
+            tls = tls || !tlsCa.isEmpty() || tlsInsecure || !tlsClientCert.isEmpty();
+            if (authMechanism.equals(AUTH_CERTIFICATE) && tlsClientCert.isEmpty())
+                throw new SkaidbException(
+                    "certificate authentication needs TLS with a client certificate "
+                    + "(tls_client_cert and tls_client_key)");
+            if (user == null) user = authMechanism.equals(AUTH_CERTIFICATE) ? "" : "anonymous";
+            return this;
+        }
+    }
+
+    private static boolean hasPort(String h) {
+        // [v6]:port, host:port; a bare IPv6 literal has several colons
+        if (h.startsWith("[")) return h.contains("]:");
+        return h.indexOf(':') >= 0 && h.indexOf(':') == h.lastIndexOf(':');
     }
 
     /**
      * Decode a DSN without dialling. {@code skaidb://[user[:pass]@]host[:port][,host2[:port]...][/db][?options]}
      * with options {@code consistency=one|quorum|all}, {@code tls=true},
      * {@code tls_ca=/path/ca.pem}, {@code tls_insecure=true},
-     * {@code tls_server_name=name}.
+     * {@code tls_server_name=name}, {@code tls_client_cert=/path/client.pem},
+     * {@code tls_client_key=/path/client.key},
+     * {@code auth_mechanism=scram|certificate}.
      */
-    static Dsn parseDsn(String dsn) {
+    static ConnectOptions parseDsn(String dsn) {
         try {
             URI u = URI.create(dsn);
             if (!"skaidb".equals(u.getScheme()))
@@ -122,48 +237,47 @@ public final class Skaidb {
             authority = authority.replaceFirst("^//", "");
             int slash = authority.indexOf('/');
             if (slash >= 0) authority = authority.substring(0, slash);
-            String user = "anonymous", pass = "";
+            ConnectOptions o = new ConnectOptions();
             int at = authority.lastIndexOf('@');
             if (at >= 0) {
                 String ui = authority.substring(0, at);
                 authority = authority.substring(at + 1);
                 String[] up = ui.split(":", 2);
-                user = up[0];
-                if (up.length > 1) pass = up[1];
+                o.user = up[0];
+                if (up.length > 1) o.password = up[1];
             }
-            int port = 7000;
-            int consistency = CONSISTENCY_QUORUM;
             // Session database from the URL path: skaidb://host:7000/app
-            String database = u.getPath() == null ? "" : u.getPath().replaceFirst("^/", "");
-            String tlsCa = "", tlsName = "skaidb";
-            boolean tls = false, tlsInsecure = false;
+            o.database = u.getPath() == null ? "" : u.getPath().replaceFirst("^/", "");
             String q = u.getQuery();
             if (q != null) {
                 for (String part : q.split("&")) {
                     if (part.startsWith("consistency=")) {
-                        consistency = parseConsistency(part.substring("consistency=".length()));
+                        o.consistency = parseConsistency(part.substring("consistency=".length()));
                     } else if (part.startsWith("tls_ca=")) {
-                        tlsCa = part.substring("tls_ca=".length());
+                        o.tlsCa = part.substring("tls_ca=".length());
                     } else if (part.startsWith("tls_server_name=")) {
-                        tlsName = part.substring("tls_server_name=".length());
+                        o.tlsServerName = part.substring("tls_server_name=".length());
+                    } else if (part.startsWith("tls_client_cert=")) {
+                        o.tlsClientCert = part.substring("tls_client_cert=".length());
+                    } else if (part.startsWith("tls_client_key=")) {
+                        o.tlsClientKey = part.substring("tls_client_key=".length());
+                    } else if (part.startsWith("auth_mechanism=")) {
+                        o.authMechanism(part.substring("auth_mechanism=".length()));
                     } else if (part.equals("tls_insecure=true") || part.equals("tls_insecure=1")) {
-                        tlsInsecure = true;
+                        o.tlsInsecure = true;
                     } else if (part.equals("tls=true") || part.equals("tls=1")) {
-                        tls = true;
+                        o.tls = true;
                     }
                 }
             }
-            tls = tls || !tlsCa.isEmpty() || tlsInsecure;
             // Seeds: skaidb://user:pass@h1:7000,h2:7000,h3/db
-            java.util.List<String> seeds = new java.util.ArrayList<>();
             for (String h : authority.split(",")) {
                 h = h.trim();
                 if (h.isEmpty()) continue;
-                seeds.add(h.contains(":") ? h : h + ":" + port);
+                o.seeds.add(h.contains(":") ? h : h + ":7000");
             }
-            if (seeds.isEmpty()) throw new SkaidbException("DSN has no host");
-            return new Dsn(seeds, user, pass, consistency, database,
-                           tls, tlsCa, tlsInsecure, tlsName);
+            if (o.seeds.isEmpty()) throw new SkaidbException("DSN has no host");
+            return o.validate();
         } catch (IllegalArgumentException e) {
             throw new SkaidbException("bad DSN: " + e.getMessage());
         }
@@ -171,13 +285,11 @@ public final class Skaidb {
 
     /** Connect to one host explicitly: QUORUM consistency, no TLS, no session database. */
     public static Connection connect(String host, int port, String user, String password) {
-        return new Connection(java.util.Collections.singletonList(host + ":" + port),
-                              user, password, CONSISTENCY_QUORUM, "",
-                              false, "", false, "skaidb");
+        return connect(new ConnectOptions().host(host, port).user(user).password(password));
     }
 
-    private static int parseConsistency(String s) {
-        switch (s.toLowerCase()) {
+    static int parseConsistency(String s) {
+        switch (s.toLowerCase(java.util.Locale.ROOT)) {
             case "one": return CONSISTENCY_ONE;
             case "all": return CONSISTENCY_ALL;
             case "":
@@ -216,27 +328,15 @@ public final class Skaidb {
         private volatile boolean streaming = false;
         private final java.util.Map<String, long[]> prepared = new java.util.HashMap<>();
         // Retained so a reconnect can repeat the original connect exactly.
-        private final java.util.List<String> seeds;
-        private final String user;
-        private final String password;
-        private final String database;
-        private final boolean tls;
-        private final String tlsCa;
-        private final boolean tlsInsecure;
-        private final String tlsServerName;
+        private final ConnectOptions opts;
+        /** SO_TIMEOUT for every read, 0 = none; re-applied on each re-dial. */
+        private volatile int readTimeoutMs = 0;
+        /** How many times ensureLive re-dialled; see {@link #reconnects()}. */
+        private volatile long reconnects = 0;
 
-        Connection(java.util.List<String> seeds, String user, String password, int consistency,
-                   String database, boolean tls, String tlsCa, boolean tlsInsecure,
-                   String tlsServerName) {
-            this.consistency = consistency;
-            this.seeds = new java.util.ArrayList<>(seeds);
-            this.user = user;
-            this.password = password;
-            this.database = database;
-            this.tls = tls;
-            this.tlsCa = tlsCa;
-            this.tlsInsecure = tlsInsecure;
-            this.tlsServerName = tlsServerName;
+        Connection(ConnectOptions opts) {
+            this.opts = opts;
+            this.consistency = opts.consistency;
             dial();
         }
 
@@ -250,7 +350,7 @@ public final class Skaidb {
             // accepts TCP while unhealthy must not swallow the attempt. skaidb
             // is leaderless, so any node serves; shuffled so many clients
             // spread instead of stampeding the first entry.
-            java.util.List<String> order = new java.util.ArrayList<>(seeds);
+            java.util.List<String> order = new java.util.ArrayList<>(opts.seeds);
             java.util.Collections.shuffle(order);
             Socket connected = null;
             Exception last = null;
@@ -262,7 +362,8 @@ public final class Skaidb {
                     Socket s = new Socket();
                     s.connect(new InetSocketAddress(h, p), 10_000);
                     s.setTcpNoDelay(true);
-                    if (tls) s = tlsWrap(s, h, p, tlsCa, tlsInsecure, tlsServerName);
+                    if (opts.tls) s = tlsWrap(s, p, opts);
+                    s.setSoTimeout(readTimeoutMs);
                     connected = s;
                     break;
                 } catch (Exception e) {
@@ -277,14 +378,18 @@ public final class Skaidb {
                 socket = connected;
                 in = new DataInputStream(socket.getInputStream());
                 out = socket.getOutputStream();
-                handshake(user, password);
-            } catch (IOException e) {
+                if (opts.authMechanism.equals(AUTH_CERTIFICATE)) handshakeCertificate(opts.user);
+                else handshake(opts.user, opts.password);
+            } catch (IOException | RuntimeException e) {
+                // A refused login must not leave the socket open behind it.
+                try { socket.close(); } catch (IOException ignored) {}
+                if (e instanceof SkaidbException) throw (SkaidbException) e;
                 throw new SkaidbException("connect failed: " + e.getMessage(), e);
             }
             sendHello();
             // USE is per-connection session state, so it runs on every dial.
-            if (database != null && !database.isEmpty()) {
-                execute("USE \"" + database.replace("\"", "\"\"") + "\"");
+            if (opts.database != null && !opts.database.isEmpty()) {
+                execute("USE \"" + opts.database.replace("\"", "\"\"") + "\"");
             }
         }
 
@@ -314,8 +419,10 @@ public final class Skaidb {
          * certificate — skaidb's own certs carry DNS:skaidb, which is usually
          * NOT the address you dialled, hence the separate knob.
          */
-        private static Socket tlsWrap(Socket raw, String host, int port, String caFile,
-                                      boolean insecure, String serverName) throws IOException {
+        private static Socket tlsWrap(Socket raw, int port, ConnectOptions o) throws IOException {
+            String caFile = o.tlsCa;
+            boolean insecure = o.tlsInsecure;
+            String serverName = o.tlsServerName;
             try {
                 javax.net.ssl.SSLContext ctx = javax.net.ssl.SSLContext.getInstance("TLS");
                 javax.net.ssl.TrustManager[] tm = null;
@@ -348,7 +455,9 @@ public final class Skaidb {
                     tmf.init(ks);
                     tm = tmf.getTrustManagers();
                 }
-                ctx.init(null, tm, null);
+                javax.net.ssl.KeyManager[] km = null;
+                if (!o.tlsClientCert.isEmpty()) km = clientKeyManagers(o.tlsClientCert, o.tlsClientKey);
+                ctx.init(km, tm, null);
                 javax.net.ssl.SSLSocket ss = (javax.net.ssl.SSLSocket) ctx.getSocketFactory()
                         .createSocket(raw, serverName, port, true);
                 ss.setUseClientMode(true);
@@ -379,6 +488,16 @@ public final class Skaidb {
 
         /** Run a SELECT with no parameters. */
         public ResultSet query(String sql) { return new Query(this, sql).executeQuery(); }
+
+        /**
+         * Send {@code sql} verbatim as one statement ({@code ?} is not a
+         * placeholder here) and report whichever kind of answer it produced.
+         */
+        public Result executeRaw(String sql) {
+            Object res = run(sql, true);
+            if (res instanceof ResultSet) return new Result((ResultSet) res, -1L);
+            return new Result(null, (Long) res);
+        }
 
         /** One change captured by a stream. */
         public static final class Event {
@@ -450,6 +569,35 @@ public final class Skaidb {
          */
         public boolean isUsable() { return !closed && !broken && !streaming; }
 
+        /**
+         * How many times this connection has re-dialled after a transport
+         * failure. Session state (a {@code BEGIN} transaction, {@code SET}
+         * variables other than the session database) does not survive a
+         * re-dial, so a caller holding such state compares this before and
+         * after its statements.
+         */
+        public long reconnects() { return reconnects; }
+
+        /**
+         * Bound every read on this connection to {@code millis} (0 = wait
+         * forever, the default). A read that times out throws and marks the
+         * connection broken — the server may still be running the statement
+         * and its answer would arrive out of turn — so the next statement
+         * re-dials. Applies to later re-dials too.
+         */
+        public synchronized void setReadTimeout(int millis) {
+            if (millis < 0) throw new SkaidbException("read timeout must be >= 0");
+            readTimeoutMs = millis;
+            try {
+                if (socket != null) socket.setSoTimeout(millis);
+            } catch (IOException e) {
+                broken = true;
+            }
+        }
+
+        /** The read timeout in milliseconds; 0 = none. */
+        public int getReadTimeout() { return readTimeoutMs; }
+
         @Override public void close() {
             if (closed) return;
             closed = true;
@@ -487,33 +635,36 @@ public final class Skaidb {
             int iterations = r.u32();
             String serverNonce = r.text();
 
-            byte[] authMessage = String.join("\0",
-                user, clientNonce, serverNonce, hex(salt), Integer.toString(iterations))
-                .getBytes(StandardCharsets.UTF_8);
-            byte[] salted = pbkdf2(password.getBytes(StandardCharsets.UTF_8), salt, iterations, 32);
-            byte[] clientKey = hmac(salted, "Client Key".getBytes(StandardCharsets.UTF_8));
-            byte[] storedKey = sha256(clientKey);
-            byte[] clientSig = hmac(storedKey, authMessage);
-            byte[] proof = new byte[32];
-            for (int i = 0; i < 32; i++) proof[i] = (byte) (clientKey[i] ^ clientSig[i]);
+            byte[] authMessage = scramAuthMessage(user, clientNonce, serverNonce, salt, iterations);
+            byte[] salted = scramSaltedPassword(password, salt, iterations);
+            byte[][] proofAndSig = scramProof(salted, authMessage);
 
             Buf finish = new Buf();
-            finish.u8(12).raw(proof);
+            finish.u8(12).raw(proofAndSig[0]);
             writeFrame(finish.toBytes());
 
             Reader r2 = new Reader(readFrame());
             if (r2.u8() != 13) throw new SkaidbException("bad handshake outcome");
             if (r2.u8() == 1) {
                 byte[] serverSig = r2.take(32);
-                if (!password.isEmpty()) {
-                    byte[] serverKey = hmac(salted, "Server Key".getBytes(StandardCharsets.UTF_8));
-                    byte[] expected = hmac(serverKey, authMessage);
-                    if (!MessageDigest.isEqual(serverSig, expected))
-                        throw new SkaidbException("server signature mismatch (mutual auth failed)");
-                }
+                if (!password.isEmpty() && !MessageDigest.isEqual(serverSig, proofAndSig[1]))
+                    throw new SkaidbException("server signature mismatch (mutual auth failed)");
             } else {
                 throw new SkaidbException("authentication denied: " + r2.text());
             }
+        }
+
+        /**
+         * EXTERNAL (PROTOCOL.md §2.4): the TLS client certificate is the
+         * credential and its Common Name the user; {@code user} is empty or
+         * must equal it. No exchange follows AuthStart, and the outcome's
+         * 32 zero bytes are NOT verified — TLS already authenticated the server.
+         */
+        private void handshakeCertificate(String user) throws IOException {
+            writeFrame(externalAuthStart(user));
+            Reader r = new Reader(readFrame());
+            if (r.u8() != 13) throw new SkaidbException("bad handshake outcome");
+            if (r.u8() != 1) throw new SkaidbException("authentication denied: " + r.text());
         }
 
         /**
@@ -583,7 +734,8 @@ public final class Skaidb {
                 }
                 // Mutation/Ddl: one frame and the exchange is over, so the
                 // wire stays free and the stream owns nothing.
-                if (tag == 1 || tag == 2) return new RowStream(this, new String[0], false);
+                if (tag == 1) return new RowStream(this, new String[0], false, r.u64());
+                if (tag == 2) return new RowStream(this, new String[0], false, -1L);
                 if (tag != 5) {
                     // The server answered a stream request with something a
                     // stream cannot start with; whatever follows is not ours
@@ -595,7 +747,7 @@ public final class Skaidb {
                 String[] cols = new String[ncols];
                 for (int i = 0; i < ncols; i++) cols[i] = r.text();
                 streaming = true;      // released by RowStream: RowsEnd, Error or close()
-                return new RowStream(this, cols, true);
+                return new RowStream(this, cols, true, -1L);
             } catch (IOException e) {
                 // Half a request may be on the wire, or half a header off it.
                 broken = true;
@@ -784,6 +936,7 @@ public final class Skaidb {
             // Cleared BEFORE dialling: dial() issues USE, which runs a
             // statement, which would otherwise re-enter this method forever.
             broken = false;
+            reconnects++;
             try {
                 dial();      // seed failover + handshake + USE, as at connect
             } catch (RuntimeException e) {
@@ -816,17 +969,25 @@ public final class Skaidb {
         /** True while this stream, and not the connection, owns the wire. */
         private boolean owns;
         private Object[] current;
+        private final long affected;
 
-        RowStream(Connection conn, String[] columns, boolean live) {
+        RowStream(Connection conn, String[] columns, boolean live, long affected) {
             this.conn = conn;
             this.columns = columns;
             this.live = live;
+            this.affected = affected;
             // A non-row statement answered in one frame owns nothing: the
             // connection was never marked busy for it.
             this.owns = live;
         }
 
         public String[] getColumnNames() { return columns.clone(); }
+
+        /**
+         * The affected-row count when the streamed statement was a mutation
+         * (it then has no columns and no rows); -1 for rows and for DDL.
+         */
+        public long getAffected() { return affected; }
 
         /** Advance to the next row; false once the stream is exhausted. */
         public boolean next() {
@@ -1021,7 +1182,23 @@ public final class Skaidb {
          */
         public long executeBatch(java.util.List<Object[]> rows) {
             if (rows.isEmpty()) return 0L;
-            long[] p = conn.prepareServer(sql);
+            long[] p;
+            try {
+                p = conn.prepareServer(sql);
+            } catch (Unpreparable e) {
+                // A statement kind the server will not prepare (DDL, session
+                // statements): run the rows one by one with client-side
+                // binding, as a single execution would.
+                long total = 0;
+                for (Object[] r : rows) {
+                    if (r.length != params.length)
+                        throw new SkaidbException(
+                            "batch row expects " + params.length + " parameters, got " + r.length);
+                    Object res = conn.run(bind(sql, r), true, level());
+                    if (res instanceof Long && (Long) res > 0) total += (Long) res;
+                }
+                return total;
+            }
             for (Object[] r : rows) {
                 if (r.length != p[1])
                     throw new SkaidbException(
@@ -1036,7 +1213,44 @@ public final class Skaidb {
             return (res instanceof Long) ? (Long) res : 0L;
         }
 
+        /**
+         * Run the statement and report whichever kind of answer it produced:
+         * rows, an affected count, or neither (DDL). The general form of
+         * {@link #executeQuery} / {@link #executeUpdate} for callers that do
+         * not know the statement kind in advance.
+         */
+        public Result execute() {
+            Object res = exec();
+            if (res instanceof ResultSet) return new Result((ResultSet) res, -1L);
+            return new Result(null, (Long) res);
+        }
+
+        /** The number of {@code ?} placeholders (outside string literals). */
+        public int getParameterCount() { return params.length; }
+
         @Override public void close() {}
+    }
+
+    // ---- Result -----------------------------------------------------------
+
+    /** What {@link Query#execute()} produced: rows, an affected count, or DDL. */
+    public static final class Result {
+        private final ResultSet rows;
+        private final long affected;
+
+        Result(ResultSet rows, long affected) {
+            this.rows = rows;
+            this.affected = affected;
+        }
+
+        /** True when the statement returned a result set. */
+        public boolean hasRows() { return rows != null; }
+        /** The result set, or null when the statement returned none. */
+        public ResultSet getResultSet() { return rows; }
+        /** The affected-row count of a mutation; -1 for rows and for DDL. */
+        public long getAffected() { return affected; }
+        /** True for a statement that returned neither rows nor a count (DDL, session statements). */
+        public boolean isDdl() { return rows == null && affected < 0; }
     }
 
     // ---- ResultSet --------------------------------------------------------
@@ -1220,6 +1434,125 @@ public final class Skaidb {
     }
 
     // ---- crypto + small helpers -------------------------------------------
+
+    /** The SCRAM auth message (PROTOCOL.md §2.1): the five fields joined by NUL. */
+    static byte[] scramAuthMessage(String user, String clientNonce, String serverNonce,
+                                   byte[] salt, int iterations) {
+        return String.join("\0", user, clientNonce, serverNonce, hex(salt), Integer.toString(iterations))
+            .getBytes(StandardCharsets.UTF_8);
+    }
+
+    /** PBKDF2-HMAC-SHA-256 of the UTF-8 password, 32 bytes. */
+    static byte[] scramSaltedPassword(String password, byte[] salt, int iterations) {
+        return pbkdf2(password.getBytes(StandardCharsets.UTF_8), salt, iterations, 32);
+    }
+
+    /** {client proof, expected server signature} for a salted password and auth message. */
+    static byte[][] scramProof(byte[] salted, byte[] authMessage) {
+        byte[] clientKey = hmac(salted, "Client Key".getBytes(StandardCharsets.UTF_8));
+        byte[] clientSig = hmac(sha256(clientKey), authMessage);
+        byte[] proof = new byte[32];
+        for (int i = 0; i < 32; i++) proof[i] = (byte) (clientKey[i] ^ clientSig[i]);
+        byte[] serverKey = hmac(salted, "Server Key".getBytes(StandardCharsets.UTF_8));
+        return new byte[][] { proof, hmac(serverKey, authMessage) };
+    }
+
+    /** AuthStart for mechanism EXTERNAL: the user (may be empty), an empty nonce, mechanism byte 2. */
+    static byte[] externalAuthStart(String user) {
+        return new Buf().u8(10).str(user == null ? "" : user).str("").u8(2).toBytes();
+    }
+
+    /** A KeyManager presenting the PEM certificate chain with its PEM private key. */
+    static javax.net.ssl.KeyManager[] clientKeyManagers(String certPath, String keyPath)
+            throws IOException, java.security.GeneralSecurityException {
+        java.security.cert.Certificate[] chain;
+        try (java.io.InputStream fin = java.nio.file.Files.newInputStream(java.nio.file.Paths.get(certPath))) {
+            chain = java.security.cert.CertificateFactory.getInstance("X.509")
+                .generateCertificates(fin).toArray(new java.security.cert.Certificate[0]);
+        }
+        if (chain.length == 0) throw new SkaidbException("no certificate found in tls_client_cert " + certPath);
+        java.security.PrivateKey key = loadPrivateKey(keyPath);
+        java.security.KeyStore ks = java.security.KeyStore.getInstance("PKCS12");
+        ks.load(null, null);
+        char[] pw = "skaidb-client".toCharArray();   // in-memory only; some JDKs refuse an empty one
+        ks.setKeyEntry("client", key, pw, chain);
+        javax.net.ssl.KeyManagerFactory kmf = javax.net.ssl.KeyManagerFactory
+            .getInstance(javax.net.ssl.KeyManagerFactory.getDefaultAlgorithm());
+        kmf.init(ks, pw);
+        return kmf.getKeyManagers();
+    }
+
+    /**
+     * An unencrypted PEM private key: PKCS#8 ({@code BEGIN PRIVATE KEY}; RSA,
+     * EC or Ed25519/Ed448 where the JDK has it) or PKCS#1 RSA ({@code BEGIN
+     * RSA PRIVATE KEY}, wrapped into PKCS#8 here).
+     */
+    static java.security.PrivateKey loadPrivateKey(String path)
+            throws IOException, java.security.GeneralSecurityException {
+        String pem = new String(java.nio.file.Files.readAllBytes(java.nio.file.Paths.get(path)),
+                                StandardCharsets.US_ASCII);
+        java.util.regex.Matcher m = java.util.regex.Pattern
+            .compile("-----BEGIN ([A-Z0-9 ]+)-----([^-]*)-----END \\1-----").matcher(pem);
+        while (m.find()) {
+            String kind = m.group(1);
+            if (!kind.endsWith("PRIVATE KEY")) continue;
+            byte[] der = java.util.Base64.getMimeDecoder().decode(m.group(2));
+            if (kind.equals("PRIVATE KEY")) {
+                return pkcs8Key(der);
+            } else if (kind.equals("RSA PRIVATE KEY")) {
+                return java.security.KeyFactory.getInstance("RSA")
+                    .generatePrivate(new java.security.spec.PKCS8EncodedKeySpec(wrapPkcs1(der)));
+            } else if (kind.equals("ENCRYPTED PRIVATE KEY")) {
+                throw new SkaidbException("tls_client_key " + path + " is encrypted; decrypt it "
+                    + "(openssl pkcs8 -topk8 -nocrypt -in key.pem -out key.pk8.pem)");
+            } else {
+                throw new SkaidbException("tls_client_key " + path + " holds a " + kind + "; convert it "
+                    + "to PKCS#8 (openssl pkcs8 -topk8 -nocrypt -in key.pem -out key.pk8.pem)");
+            }
+        }
+        throw new SkaidbException("no PEM private key found in tls_client_key " + path);
+    }
+
+    private static java.security.PrivateKey pkcs8Key(byte[] der) throws java.security.GeneralSecurityException {
+        java.security.spec.PKCS8EncodedKeySpec spec = new java.security.spec.PKCS8EncodedKeySpec(der);
+        java.security.GeneralSecurityException last = null;
+        for (String alg : new String[] { "RSA", "EC", "Ed25519", "EdDSA", "Ed448", "RSASSA-PSS" }) {
+            try {
+                return java.security.KeyFactory.getInstance(alg).generatePrivate(spec);
+            } catch (java.security.GeneralSecurityException e) {
+                last = e;
+            }
+        }
+        throw new java.security.spec.InvalidKeySpecException("unsupported private key algorithm", last);
+    }
+
+    /** PKCS#1 RSAPrivateKey -> PKCS#8 PrivateKeyInfo (version 0, rsaEncryption, NULL params). */
+    private static byte[] wrapPkcs1(byte[] pkcs1) {
+        byte[] algId = { 0x30, 0x0d, 0x06, 0x09, 0x2a, (byte) 0x86, 0x48, (byte) 0x86, (byte) 0xf7,
+                         0x0d, 0x01, 0x01, 0x01, 0x05, 0x00 };
+        byte[] version = { 0x02, 0x01, 0x00 };
+        byte[] octet = derTlv(0x04, pkcs1);
+        byte[] body = new byte[version.length + algId.length + octet.length];
+        System.arraycopy(version, 0, body, 0, version.length);
+        System.arraycopy(algId, 0, body, version.length, algId.length);
+        System.arraycopy(octet, 0, body, version.length + algId.length, octet.length);
+        return derTlv(0x30, body);
+    }
+
+    private static byte[] derTlv(int tag, byte[] value) {
+        java.io.ByteArrayOutputStream o = new java.io.ByteArrayOutputStream();
+        o.write(tag);
+        int n = value.length;
+        if (n < 0x80) {
+            o.write(n);
+        } else {
+            int bytes = n > 0xffffff ? 4 : n > 0xffff ? 3 : n > 0xff ? 2 : 1;
+            o.write(0x80 | bytes);
+            for (int i = bytes - 1; i >= 0; i--) o.write((n >>> (8 * i)) & 0xff);
+        }
+        o.write(value, 0, n);
+        return o.toByteArray();
+    }
 
     private static byte[] hmac(byte[] key, byte[] msg) {
         try {

@@ -31,6 +31,11 @@ jobs:
         run: |
           unzip -p target/skaidb-java-*[0-9].jar META-INF/MANIFEST.MF | tr -d '\r' | grep -E '^Implementation-Version: ' 
           ls -l target/*.jar
+      - name: Vendored conformance vectors match the published copy
+        if: matrix.java == '17'
+        run: |
+          curl -fsSL https://skaidb.org/conformance/vectors.json -o "$RUNNER_TEMP/published-vectors.json"
+          cmp "$RUNNER_TEMP/published-vectors.json" conformance/vectors.json
       - uses: actions/upload-artifact@v4
         if: matrix.java == '17'
         with:

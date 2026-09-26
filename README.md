@@ -7,16 +7,21 @@ The official [skaidb](https://skaidb.org) driver for Java. A JDBC-flavoured
 client — `connect`, `prepare`, `setInt`/`setString`, `executeQuery`/
 `executeUpdate`, and a `ResultSet` with `next()`/`getInt`/`getString` — so a
 JDBC user has essentially nothing new to learn. It speaks skaidb's binary
-protocol directly: SCRAM-SHA-256 authentication, server-side prepared
-statements with typed parameters, streamed result sets, TLS, seed-list
-failover and connection pooling.
+protocol directly: SCRAM-SHA-256 or client-certificate authentication,
+server-side prepared statements with typed parameters, streamed result
+sets, TLS, seed-list failover and connection pooling.
 
-**Pure JDK, no dependencies, one source file** (`com.skaidb.Skaidb`).
-Requires Java 11 or newer.
+The same jar is also a **JDBC 4.3 driver** (`com.skaidb.jdbc`): `DriverManager`
+finds it by itself, `jdbc:skaidb://host/db` URLs work in any JDBC tool, and
+`SkaidbDataSource` plugs into HikariCP and other pools — see [JDBC](#jdbc).
+
+**Pure JDK, no dependencies.** The core client is one source file
+(`com.skaidb.Skaidb`); the JDBC layer builds on it. Requires Java 11 or newer.
 
 - Server documentation: <https://skaidb.org/docs/>
 - Wire protocol the driver implements: <https://skaidb.org/docs/PROTOCOL.html>
 - Full API reference in this repository: [docs/API.md](docs/API.md)
+- JDBC driver: [docs/JDBC.md](docs/JDBC.md)
 - Changelog: [CHANGELOG.md](CHANGELOG.md)
 
 ## Contents
@@ -30,11 +35,13 @@ Requires Java 11 or newer.
 - [Batches, transactions and prepared statements](#batches-transactions-and-prepared-statements)
 - [Connection pooling](#connection-pooling)
 - [Change streams (`subscribe`)](#change-streams-subscribe)
+- [JDBC](#jdbc)
 - [Type mapping](#type-mapping)
 - [Errors and reconnection](#errors-and-reconnection)
 - [Threading](#threading)
 - [Versions and compatibility](#versions-and-compatibility)
 - [Building and testing](#building-and-testing)
+- [Conformance](#conformance)
 - [License](#license)
 
 ## Install
@@ -43,7 +50,7 @@ The artifact is published through [JitPack](https://jitpack.io/#porcupin26/skaid
 which builds it from the git tag on first request. Coordinates:
 
 ```
-com.github.porcupin26:skaidb-java:v1.0.2
+com.github.porcupin26:skaidb-java:v1.1.0
 ```
 
 > **Note:** `v1.0.0` is not resolvable through JitPack — its first build
@@ -68,7 +75,7 @@ GPG-signed artifacts, which this project does not have yet).
   <dependency>
     <groupId>com.github.porcupin26</groupId>
     <artifactId>skaidb-java</artifactId>
-    <version>v1.0.2</version>
+    <version>v1.1.0</version>
   </dependency>
 </dependencies>
 ```
@@ -82,7 +89,7 @@ repositories {
 }
 
 dependencies {
-    implementation("com.github.porcupin26:skaidb-java:v1.0.2")
+    implementation("com.github.porcupin26:skaidb-java:v1.1.0")
 }
 ```
 
@@ -95,15 +102,17 @@ repositories {
 }
 
 dependencies {
-    implementation 'com.github.porcupin26:skaidb-java:v1.0.2'
+    implementation 'com.github.porcupin26:skaidb-java:v1.1.0'
 }
 ```
 
 Sources and Javadoc jars are attached (`-sources.jar`, `-javadoc.jar`), so
 IDEs resolve documentation automatically.
 
-**Without a build tool.** The driver is one file. Either copy
-`src/main/java/com/skaidb/Skaidb.java` into your tree, or:
+**Without a build tool.** The core client is one file. Either copy
+`src/main/java/com/skaidb/Skaidb.java` into your tree (the JDBC layer then
+needs `src/main/java/com/skaidb/jdbc/` and
+`src/main/resources/META-INF/services/` too), or:
 
 ```sh
 javac -d out src/main/java/com/skaidb/Skaidb.java
@@ -160,6 +169,8 @@ skaidb://[user[:password]@]host[:port][,host2[:port2]...][/database][?option=val
 | `tls_ca=/path/to/ca.pem` | Encrypt with TLS, trusting only the CA certificate(s) in that PEM file. Implies `tls=true`. | — |
 | `tls_insecure=true` | Encrypt but **verify nothing** — a man in the middle can present any certificate. Development only. Implies `tls=true`. | off |
 | `tls_server_name=name` | The SNI name sent and the name the server certificate must carry. skaidb's own certificates carry `DNS:skaidb`, which is usually not the address you dial, hence the separate knob. | `skaidb` |
+| `tls_client_cert=/path/client.pem`, `tls_client_key=/path/client.key` | Present this client certificate (PEM, leaf first) in the TLS handshake, with its unencrypted private key (PKCS#8 `BEGIN PRIVATE KEY` — RSA, EC or Ed25519 — or PKCS#1 `BEGIN RSA PRIVATE KEY`). Implies `tls=true`; the two go together. | — |
+| `auth_mechanism=scram\|certificate` | `certificate` logs in with the client certificate instead of a password: see [Certificate login](#certificate-login). | `scram` |
 
 Examples:
 
@@ -174,6 +185,46 @@ Skaidb.connect("skaidb://app:s3cret@db1/?tls_insecure=true");            // dev 
 A cluster configured with `client_tls = required` refuses plaintext
 outright: without one of the `tls*` options such a cluster is simply
 unreachable.
+
+### `Skaidb.connect(Skaidb.ConnectOptions options)`
+
+The same settings as a builder, with values taken verbatim (no URL
+escaping of passwords):
+
+```java
+Skaidb.connect(new Skaidb.ConnectOptions()
+        .host("db1", 7000).host("db2", 7000)      // or .host("db3:7000")
+        .user("app").password("p@ss/word")
+        .database("orders")
+        .consistency("one")                       // or Skaidb.CONSISTENCY_ONE
+        .tlsCa("/etc/skaidb/ca.pem"));
+```
+
+Setters: `host`, `user`, `password`, `database`, `consistency`, `tls`,
+`tlsCa`, `tlsInsecure`, `tlsServerName`, `tlsClientCert`, `tlsClientKey`,
+`authMechanism` (`Skaidb.AUTH_SCRAM` / `Skaidb.AUTH_CERTIFICATE`).
+
+### Certificate login
+
+With `auth_mechanism=certificate` the TLS client certificate **is** the
+login (wire mechanism EXTERNAL): the server maps the certificate's subject
+Common Name to a user and no password is sent. The server needs
+`auth.x509_enabled` and a client CA (`auth.x509_ca_file`) that signed the
+certificate.
+
+```java
+Skaidb.connect("skaidb://db1/app?tls_ca=/etc/skaidb/ca.pem"
+        + "&tls_client_cert=/etc/app/app.crt&tls_client_key=/etc/app/app.key"
+        + "&auth_mechanism=certificate");
+```
+
+Leave the user out and the server takes the name from the certificate;
+give one (`skaidb://app@db1/...`) only to assert the expected identity — a
+certificate whose CN differs fails the connect. The server's answer carries
+no signature to check: TLS has already authenticated the server. A client
+certificate without `auth_mechanism=certificate` only opens the TLS session
+(a server with client verification needs it); the login is then still the
+SCRAM user.
 
 ### `Skaidb.connect(String host, int port, String user, String password)`
 
@@ -200,19 +251,24 @@ several threads: the connection-level field is a plain shared setting.
 
 ### Timeouts
 
-Connecting to a seed times out after 10 seconds. There is **no read
-timeout**: a statement blocks for as long as the server takes, which is the
-JDBC default too. Put long-running work on its own connection (or pool) so
-it cannot delay unrelated statements.
+Connecting to a seed times out after 10 seconds. By default there is **no
+read timeout**: a statement blocks for as long as the server takes, which
+is the JDBC default too. `conn.setReadTimeout(millis)` bounds every read on
+the connection; a read that times out throws and marks the connection
+broken (the server may still answer later, out of turn), so the next
+statement re-dials. Put long-running work on its own connection (or pool)
+so it cannot delay unrelated statements.
 
 ## Statements and parameters
 
-Every statement auto-commits; there is no `BEGIN`/`COMMIT`.
+Every statement auto-commits unless you open a transaction (see
+[Transactions](#batches-transactions-and-prepared-statements)).
 
 | Method | Use for | Returns |
 |--------|---------|---------|
 | `conn.execute(sql)` | A statement with no parameters that returns no rows. | affected row count, or `-1` for DDL |
 | `conn.query(sql)` | A `SELECT` (or `CALL`) with no parameters. | `ResultSet` |
+| `conn.executeRaw(sql)` | Any statement, SQL sent verbatim (`?` is not a placeholder). | `Result` |
 | `conn.prepare(sql)` | A statement with `?` placeholders. | `Query` |
 | `conn.stream(sql)` | A large `SELECT`, read a chunk at a time. Takes no parameters. | `RowStream` |
 
@@ -237,8 +293,11 @@ index outside `1..n` throws immediately; a missing parameter is sent as
 
 `executeQuery()` returns a `ResultSet` (empty for a statement that produced
 none); `executeUpdate()` returns the affected count (`-1` for DDL, `0` for a
-statement that returned rows). `Query` is `AutoCloseable` for symmetry with
-JDBC but holds no resources.
+statement that returned rows). When the kind of statement is not known in
+advance, `execute()` returns a `Skaidb.Result` saying which it was:
+`hasRows()` / `getResultSet()`, `getAffected()` (the count, `-1` otherwise)
+and `isDdl()`. `getParameterCount()` is the number of placeholders. `Query`
+is `AutoCloseable` for symmetry with JDBC but holds no resources.
 
 ### How parameters travel
 
@@ -311,7 +370,9 @@ try (Skaidb.RowStream s = conn.stream("SELECT id, name FROM events")) {
 `RowStream.getObject(int)` is **0-based** (unlike `ResultSet`), and values
 come back as the raw mapped objects — there are no typed getters. A stream
 takes no parameters; build the SQL text yourself or use a prepared `Query`
-for a non-streamed result.
+for a non-streamed result. A statement that returns no rows yields a stream
+with no columns: `getAffected()` is then its affected-row count (`-1` for
+DDL).
 
 ### The abandon/drain rule
 
@@ -353,12 +414,17 @@ long n = conn.prepare("INSERT INTO users (id, name) VALUES (?, ?)").executeBatch
 Each row autocommits on its own: if one fails the server names it, earlier
 rows stay applied, and the batch throws. Make the statement idempotent so
 a retry is safe. Every row must carry exactly the statement's parameter count.
+A statement the server will not prepare (DDL, `USE`) runs row by row with
+client-side binding instead.
 
-**Transactions.** skaidb has no multi-statement transactions from the
-driver: every statement is atomic and auto-committed. Use conditional
-updates (compare-and-set style `UPDATE ... WHERE`) and batches for
-multi-row work; see the server documentation for the guarantees each
-consistency level gives.
+**Transactions.** Transaction state is per connection: `conn.execute("BEGIN")`
+on a standalone server (`BEGIN ATOMIC` on a cluster, which refuses plain
+`BEGIN`), then the statements, then `COMMIT` or `ROLLBACK`. DDL is not
+transactional. A re-dial after a transport failure starts a fresh session
+without the transaction — the server has discarded it — so compare
+`conn.reconnects()` before and after the transaction's statements, or use
+the JDBC layer, which does that check for you. Outside a transaction every
+statement is atomic and auto-committed.
 
 **Prepared statements** are implicit: `conn.prepare(sql)` with parameters
 prepares server-side and caches the id on that connection, so reusing the
@@ -450,6 +516,8 @@ It is one class; branch on the message if you must:
 | No seed reachable | `no reachable endpoint in ...` | never opened |
 | Wrong credentials | `authentication denied:` | closed |
 | Server signature wrong (MITM) | `server signature mismatch` | closed |
+| Certificate login without a client certificate, or `tls_client_cert` without `tls_client_key` | `certificate authentication needs TLS with a client certificate`, `tls_client_cert and tls_client_key go together` | never opened |
+| Unreadable client key | `tls_client_key ... is encrypted`, `... holds a EC PRIVATE KEY; convert it to PKCS#8`, `no PEM private key found` | never opened |
 | TLS setup problem | `TLS setup failed:` | never opened |
 | The server rejected a statement | the server's own text, e.g. a syntax or constraint error | **usable** |
 | Parameter misuse | `parameter index ... out of range`, `statement expects N parameters`, `cannot bind ...` | usable |
@@ -466,6 +534,53 @@ statement itself is **not retried**: it may already have executed, and an
 ambiguous write must never be repeated silently. Retry at the call site
 where you know whether that is safe. `isUsable()` tells a pool (or you)
 whether a connection is closed, broken or mid-stream.
+
+## JDBC
+
+The jar is a JDBC 4.3 driver too. It registers itself through
+`META-INF/services/java.sql.Driver`, so plain JDBC code works unchanged:
+
+```java
+try (Connection c = DriverManager.getConnection(
+         "jdbc:skaidb://db1:7000,db2:7000,db3:7000/app?consistency=quorum", "app", "s3cret");
+     PreparedStatement ps = c.prepareStatement("INSERT INTO users (id, name) VALUES (?, ?)")) {
+    for (long id = 1; id <= 1000; id++) {
+        ps.setLong(1, id);
+        ps.setString(2, "user" + id);
+        ps.addBatch();
+    }
+    ps.executeBatch();                 // ONE round trip for all 1000 rows
+}
+```
+
+URL: `jdbc:skaidb://host[:port][,host2[:port]...][/database][?key=value&...]`,
+with the same keys as the native DSN (`user`, `password`, `consistency`,
+`tls`, `tls_ca`, `tls_client_cert`, `auth_mechanism`, ...) plus
+`transaction`, `read_timeout` and `fetch_size`; `Properties` override the
+URL.
+
+With **HikariCP**:
+
+```java
+HikariConfig cfg = new HikariConfig();
+cfg.setJdbcUrl("jdbc:skaidb://db1:7000,db2:7000,db3:7000/app");
+cfg.setUsername("app");
+cfg.setPassword("s3cret");
+HikariDataSource ds = new HikariDataSource(cfg);
+```
+
+or `cfg.setDataSourceClassName("com.skaidb.jdbc.SkaidbDataSource")` with
+`url` / `user` / `password` data-source properties.
+
+Result sets are forward-only and read-only; a fetch size above zero streams
+them. `setAutoCommit(false)` opens a transaction (`BEGIN`, or `BEGIN ATOMIC`
+with `transaction=atomic` on a cluster). Errors are `SQLException`
+subclasses with SQLStates (`23505` for a unique violation, `42P01` for an
+unknown table, `28000` for a refused login, ...). Features skaidb or the
+driver lacks — scrollable cursors, savepoints, `CallableStatement`,
+generated keys — throw `SQLFeatureNotSupportedException`. The full
+reference, including the type mapping and the metadata sources, is
+[docs/JDBC.md](docs/JDBC.md); `examples/JdbcExample.java` is a runnable tour.
 
 ## Threading
 
@@ -492,6 +607,9 @@ whether a connection is closed, broken or mid-stream.
   (`stream`) and Hello need a server that knows those opcodes; on an older
   one `stream` throws `server does not support streaming` and the Hello
   reply is ignored.
+- Certificate login (`auth_mechanism=certificate`) needs a server that
+  knows the EXTERNAL mechanism and has `auth.x509_enabled`; an older server
+  closes the connection at the handshake.
 - Java 11 or newer (`maven.compiler.release` is 11). CI builds and tests on
   Temurin 11, 17 and 21.
 
@@ -505,15 +623,44 @@ whether a connection is closed, broken or mid-stream.
 
 The tests need no server: `SkaidbTest` covers the pure functions
 (placeholder counting, client-side binding, value encode/decode against the
-wire spec, DSN parsing, `ResultSet`), and `FakeServerTest` runs an
-in-process fake speaking just enough of the protocol to exercise the SCRAM
-handshake, the Hello frame, prepared statements, batches, multiple result
-sets, streaming, the abandon/drain rule, reconnection and the pool.
+wire spec, DSN parsing, `ResultSet`), `FakeServerTest` runs an in-process
+fake speaking just enough of the protocol to exercise the SCRAM handshake,
+the Hello frame, prepared statements, batches, multiple result sets,
+streaming, the abandon/drain rule, reconnection and the pool,
+`ConformanceTest` runs the shared conformance suite (below),
+`CertificateAuthTest` runs certificate login against a real TLS listener
+that requires a client certificate (a throwaway test CA lives in
+`src/test/resources/tls`), and `JdbcTest` drives the JDBC layer through
+`DriverManager` against the conformance fake server.
 
 Releases: bump `<version>` in `pom.xml`, add a CHANGELOG entry, tag `vX.Y.Z`
 and push the tag. GitHub Actions then runs the tests, publishes the GitHub
 Release with the jars attached and has JitPack build the tag; see
 [docs/RELEASING.md](docs/RELEASING.md).
+
+## Conformance
+
+`conformance/vectors.json` is skaidb's shared wire-protocol conformance
+suite, generated from the server's own encoders and published at
+<https://skaidb.org/conformance/vectors.json>; `conformance/README.md` is
+its contract. `ConformanceTest` runs all of it:
+
+- every value vector decodes to the expected value and encodes back to the
+  expected bytes;
+- every SCRAM vector (auth message, salted password, client proof, server
+  signature) is computed with the driver's own SCRAM code;
+- a fake server that verifies the client proof independently (JCE PBKDF2 /
+  HMAC) replays the reference responses, and every case runs through the
+  public API — `query` and `execute_prepared` via `Query.execute()`,
+  `execute_batch` via `Query.executeBatch`, `query_stream` via
+  `Connection.stream`, `sequence` on one connection — while the fake checks
+  each request byte for byte;
+- the auth outcomes: a correct server signature connects, a wrong one fails
+  the connect, and a denial fails it with the server's reason.
+
+Nothing is skipped: the driver has an API for every `call.method`. CI also
+checks that the vendored `vectors.json` is byte-identical to the published
+copy.
 
 ## License
 
