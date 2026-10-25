@@ -51,7 +51,7 @@ public final class Skaidb {
      */
     public static final String VERSION = detectVersion();
 
-    private static final String FALLBACK_VERSION = "1.1.0";
+    private static final String FALLBACK_VERSION = "1.2.0";
 
     private static String detectVersion() {
         try {
@@ -333,11 +333,36 @@ public final class Skaidb {
         private volatile int readTimeoutMs = 0;
         /** How many times ensureLive re-dialled; see {@link #reconnects()}. */
         private volatile long reconnects = 0;
+        /**
+         * The {@link Pool} that owns this connection: told each round trip's
+         * latency, each transport failure and each write, and asked for the
+         * dial order when the connection re-dials. Null outside a pool.
+         */
+        private volatile Pool pool;
+        /** The endpoint ({@code host:port}) the socket reached. */
+        volatile String connectedEp;
+        // The owning pool's bookkeeping, guarded by the pool's monitor: the
+        // member this connection counts against, whether it is checked out,
+        // and the affinity key it was checked out under.
+        String poolEp;
+        boolean poolOut;
+        Object poolAffinity;
 
         Connection(ConnectOptions opts) {
+            this(opts, null, null, 0);
+        }
+
+        /**
+         * Dial {@code order} ({@code host:port} endpoints, best first; null =
+         * the seeds, shuffled) on behalf of {@code pool} (null = none), with
+         * every read bounded to {@code readTimeoutMs} (0 = none).
+         */
+        Connection(ConnectOptions opts, Pool pool, java.util.List<String> order, int readTimeoutMs) {
             this.opts = opts;
             this.consistency = opts.consistency;
-            dial();
+            this.pool = pool;
+            this.readTimeoutMs = readTimeoutMs;
+            dial(order);
         }
 
         /**
@@ -345,52 +370,59 @@ public final class Skaidb {
          * first connect and for every reconnect, so a recovered connection is
          * indistinguishable from a fresh one.
          */
-        private void dial() {
-            // Try each seed until one connects AND authenticates — a node that
-            // accepts TCP while unhealthy must not swallow the attempt. skaidb
-            // is leaderless, so any node serves; shuffled so many clients
-            // spread instead of stampeding the first entry.
-            java.util.List<String> order = new java.util.ArrayList<>(opts.seeds);
-            java.util.Collections.shuffle(order);
-            Socket connected = null;
+        private void dial(java.util.List<String> order) {
+            // Try each endpoint until one connects AND authenticates — a node
+            // that accepts TCP while unhealthy, or closes the socket before
+            // the challenge because it is full, must not swallow the attempt.
+            // skaidb is leaderless, so any node serves; shuffled so many
+            // clients spread instead of stampeding the first entry. A login
+            // refused for its credentials ends the attempt: every node has the
+            // same users.
+            if (order == null) {
+                order = new java.util.ArrayList<>(opts.seeds);
+                java.util.Collections.shuffle(order);
+            }
             Exception last = null;
             for (String ep : order) {
                 int c = ep.lastIndexOf(':');
                 String h = c > 0 ? ep.substring(0, c) : ep;
                 int p = c > 0 ? Integer.parseInt(ep.substring(c + 1)) : 7000;
+                Socket s = null;
                 try {
-                    Socket s = new Socket();
+                    s = new Socket();
                     s.connect(new InetSocketAddress(h, p), 10_000);
                     s.setTcpNoDelay(true);
                     if (opts.tls) s = tlsWrap(s, p, opts);
                     s.setSoTimeout(readTimeoutMs);
-                    connected = s;
-                    break;
-                } catch (Exception e) {
+                    socket = s;
+                    in = new DataInputStream(s.getInputStream());
+                    out = s.getOutputStream();
+                    if (opts.authMechanism.equals(AUTH_CERTIFICATE)) handshakeCertificate(opts.user);
+                    else handshake(opts.user, opts.password);
+                } catch (IOException | RuntimeException e) {
+                    // A refused login must not leave the socket open behind it.
+                    if (s != null) {
+                        try { s.close(); } catch (IOException ignored) {}
+                    }
+                    if (!memberFault(e)) {
+                        if (e instanceof SkaidbException) throw (SkaidbException) e;
+                        throw new SkaidbException("connect failed: " + e.getMessage(), e);
+                    }
+                    Pool owner = pool;
+                    if (owner != null) owner.failed(ep);
                     last = e;
+                    continue;
                 }
+                connectedEp = ep;
+                sendHello();
+                // USE is per-connection session state, so it runs on every dial.
+                if (opts.database != null && !opts.database.isEmpty()) {
+                    execute("USE \"" + opts.database.replace("\"", "\"\"") + "\"");
+                }
+                return;
             }
-            if (connected == null) {
-                throw new SkaidbException("no reachable endpoint in " + String.join(", ", order)
-                        + (last == null ? "" : ": " + last.getMessage()), last);
-            }
-            try {
-                socket = connected;
-                in = new DataInputStream(socket.getInputStream());
-                out = socket.getOutputStream();
-                if (opts.authMechanism.equals(AUTH_CERTIFICATE)) handshakeCertificate(opts.user);
-                else handshake(opts.user, opts.password);
-            } catch (IOException | RuntimeException e) {
-                // A refused login must not leave the socket open behind it.
-                try { socket.close(); } catch (IOException ignored) {}
-                if (e instanceof SkaidbException) throw (SkaidbException) e;
-                throw new SkaidbException("connect failed: " + e.getMessage(), e);
-            }
-            sendHello();
-            // USE is per-connection session state, so it runs on every dial.
-            if (opts.database != null && !opts.database.isEmpty()) {
-                execute("USE \"" + opts.database.replace("\"", "\"\"") + "\"");
-            }
+            throw new SkaidbException("no reachable endpoint in " + String.join(", ", order)
+                    + (last == null ? "" : ": " + last.getMessage()), last);
         }
 
         /**
@@ -602,6 +634,34 @@ public final class Skaidb {
             if (closed) return;
             closed = true;
             try { socket.close(); } catch (IOException ignored) {}
+            // Closed while checked out instead of returned: the pool stops
+            // counting it against its member.
+            Pool owner = pool;
+            if (owner != null) owner.closedOut(this);
+        }
+
+        // -- what a pool is told --
+
+        /** A transport failure on an open connection counts against its member. */
+        private void observeFailure() {
+            Pool owner = pool;
+            String ep = connectedEp;
+            if (owner != null && ep != null && !closed) owner.failed(ep);
+        }
+
+        /** A request's first response frame arrived {@code nanos} after it was sent. */
+        private void observeRoundTrip(long nanos) {
+            Pool owner = pool;
+            if (owner != null) owner.roundTrip(this, nanos);
+        }
+
+        /**
+         * A statement succeeded: a pool with read-your-writes on remembers
+         * which member took a write.
+         */
+        void noteStatement(String sql) {
+            Pool owner = pool;
+            if (owner != null && isWrite(sql)) owner.wrote(this);
         }
 
         // -- framing --
@@ -698,7 +758,9 @@ public final class Skaidb {
             byte[] body = sql.getBytes(StandardCharsets.UTF_8);
             Buf req = new Buf();
             req.u8(1).u8(level).u32(body.length).raw(body);
-            return roundtrip(req.toBytes());
+            Object res = roundtrip(req.toBytes());
+            noteStatement(sql);
+            return res;
         }
 
         /**
@@ -724,25 +786,28 @@ public final class Skaidb {
             Buf req = new Buf();
             req.u8(5).u8(consistency).u32(body.length).raw(body);
             try {
+                long started = System.nanoTime();
                 writeFrame(req.toBytes());
                 Reader r = new Reader(readFrame());
+                observeRoundTrip(System.nanoTime() - started);
                 int tag = r.u8();
                 if (tag == 3) {
                     String msg = r.text();
                     throw new SkaidbException(msg.contains("unknown opcode")
                         ? "server does not support streaming: " + msg : msg);
                 }
-                // Mutation/Ddl: one frame and the exchange is over, so the
-                // wire stays free and the stream owns nothing.
-                if (tag == 1) return new RowStream(this, new String[0], false, r.u64());
-                if (tag == 2) return new RowStream(this, new String[0], false, -1L);
-                if (tag != 5) {
+                if (tag != 1 && tag != 2 && tag != 5) {
                     // The server answered a stream request with something a
                     // stream cannot start with; whatever follows is not ours
                     // to interpret, so do not reuse this socket.
                     broken = true;
                     throw new SkaidbException("unexpected response tag " + tag + " to stream request");
                 }
+                noteStatement(sql);
+                // Mutation/Ddl: one frame and the exchange is over, so the
+                // wire stays free and the stream owns nothing.
+                if (tag == 1) return new RowStream(this, new String[0], false, r.u64());
+                if (tag == 2) return new RowStream(this, new String[0], false, -1L);
                 int ncols = r.u32();
                 String[] cols = new String[ncols];
                 for (int i = 0; i < ncols; i++) cols[i] = r.text();
@@ -751,6 +816,7 @@ public final class Skaidb {
             } catch (IOException e) {
                 // Half a request may be on the wire, or half a header off it.
                 broken = true;
+                observeFailure();
                 throw new SkaidbException("stream failed: " + e.getMessage(), e);
             }
         }
@@ -769,6 +835,7 @@ public final class Skaidb {
                 return readFrame();
             } catch (IOException e) {
                 broken = true;   // socket gone; the next statement re-dials
+                observeFailure();
                 throw new SkaidbException("stream read failed: " + e.getMessage(), e);
             }
         }
@@ -802,8 +869,10 @@ public final class Skaidb {
             req.u8(2).u32(body.length).raw(body);
             if (closed) throw new SkaidbException("connection is closed");
             try {
+                long started = System.nanoTime();
                 writeFrame(req.toBytes());
                 Reader r = new Reader(readFrame());
+                observeRoundTrip(System.nanoTime() - started);
                 int tag = r.u8();
                 if (tag == 4) {                      // Prepared
                     long id = r.u32() & 0xffffffffL;
@@ -815,6 +884,10 @@ public final class Skaidb {
                 if (tag == 3) throw new Unpreparable(r.text());
                 throw new SkaidbException("unexpected prepare response tag " + tag);
             } catch (IOException e) {
+                // As in roundtrip: the wire position is unknown, so the next
+                // statement re-dials instead of reusing this socket.
+                broken = true;
+                observeFailure();
                 throw new SkaidbException("prepare failed: " + e.getMessage(), e);
             }
         }
@@ -860,9 +933,11 @@ public final class Skaidb {
             // the one place the busy-wire check has to hold.
             requireIdle();
             try {
+                long started = System.nanoTime();
                 writeFrame(request);
 
                 Reader r = new Reader(readFrame());
+                observeRoundTrip(System.nanoTime() - started);
                 int tag = r.u8();
                 if (tag == 0) {            // Rows
                     int ncols = r.u32();
@@ -912,6 +987,7 @@ public final class Skaidb {
                 // silently. The connection is marked broken; the next
                 // statement re-dials through ensureLive.
                 broken = true;
+                observeFailure();
                 throw new SkaidbException("query failed: " + e.getMessage(), e);
             }
         }
@@ -938,7 +1014,11 @@ public final class Skaidb {
             broken = false;
             reconnects++;
             try {
-                dial();      // seed failover + handshake + USE, as at connect
+                // Seed failover + handshake + USE, as at connect. Pooled: in
+                // the pool's order, usable members first and the one this
+                // connection just lost last.
+                Pool owner = pool;
+                dial(owner == null ? null : owner.dialOrder(connectedEp));
             } catch (RuntimeException e) {
                 broken = true;   // still down; the next statement retries
                 throw e;
@@ -1168,7 +1248,9 @@ public final class Skaidb {
                 if (p[1] != params.length)
                     throw new SkaidbException(
                         "statement expects " + p[1] + " parameters, got " + params.length);
-                return conn.execPrepared(p[0], params, level());
+                Object res = conn.execPrepared(p[0], params, level());
+                conn.noteStatement(sql);
+                return res;
             } catch (Unpreparable e) {
                 return conn.run(bind(sql, params), true, level());
             }
@@ -1205,6 +1287,7 @@ public final class Skaidb {
                         "batch row expects " + p[1] + " parameters, got " + r.length);
             }
             Object res = conn.execBatch(p[0], rows, level());
+            conn.noteStatement(sql);
             return res instanceof Long ? (Long) res : 0L;
         }
 
@@ -1738,13 +1821,249 @@ public final class Skaidb {
     }
     // ---- Pool --------------------------------------------------------------
 
+    // Leading keywords of statements that never write: everything else counts
+    // as a write for read-your-writes affinity (a read taken for a write only
+    // keeps the caller on its member a little longer).
+    private static final java.util.Set<String> READ_KEYWORDS = new java.util.HashSet<>(java.util.Arrays.asList(
+            "select", "show", "explain", "describe", "desc", "values", "with", "use"));
+
     /**
-     * A thread-safe pool of connections opened from one DSN.
+     * Whether {@code sql} counts as a write: its first keyword, after
+     * whitespace, comments and opening parentheses, is not a read keyword.
+     */
+    static boolean isWrite(String sql) {
+        int i = 0, n = sql.length();
+        while (i < n) {
+            char ch = sql.charAt(i);
+            if (Character.isWhitespace(ch) || ch == '(') {
+                i++;
+            } else if (sql.startsWith("--", i)) {
+                int j = sql.indexOf('\n', i);
+                i = j < 0 ? n : j + 1;
+            } else if (sql.startsWith("/*", i)) {
+                int j = sql.indexOf("*/", i + 2);
+                i = j < 0 ? n : j + 2;
+            } else {
+                break;
+            }
+        }
+        int j = i;
+        while (j < n && (Character.isLetter(sql.charAt(j)) || sql.charAt(j) == '_')) j++;
+        return !READ_KEYWORDS.contains(sql.substring(i, j).toLowerCase(java.util.Locale.ROOT));
+    }
+
+    /**
+     * Whether a failed dial says something about the member's health. A
+     * refused login is the caller's problem, not the member's — except a
+     * capacity refusal, which is the member being full.
+     */
+    static boolean memberFault(Throwable e) {
+        if (e instanceof IOException) return true;
+        String msg = e.getMessage() == null ? "" : e.getMessage();
+        if (msg.startsWith("authentication denied")) return msg.contains("too many connections:");
+        return !msg.startsWith("server signature mismatch");
+    }
+
+    /**
+     * How a {@link Pool} picks the member for a checkout (PROTOCOL.md §6.1).
+     */
+    public enum LoadBalancing {
+        /**
+         * Any idle connection; a new connection dials the usable members in
+         * random order and sticks to the member it reached. The default.
+         */
+        RANDOM,
+        /** The next usable member in endpoint order. */
+        ROUND_ROBIN,
+        /**
+         * Of two usable members picked at random, the one with the lower
+         * round-trip average × (checked-out connections + 1). A member not
+         * measured yet, or not in the last 2 s, scores 0, so it is tried.
+         */
+        LEAST_LATENCY;
+
+        /** {@code random}, {@code round_robin} or {@code least_latency}. */
+        public static LoadBalancing parse(String name) {
+            switch (name == null ? "" : name.toLowerCase(java.util.Locale.ROOT)) {
+                case "random": return RANDOM;
+                case "round_robin": return ROUND_ROBIN;
+                case "least_latency": return LEAST_LATENCY;
+                default: throw new SkaidbException("unknown load_balancing " + name
+                        + " (use random, round_robin or least_latency)");
+            }
+        }
+    }
+
+    /** Which idle connection a {@link Pool} hands out first. */
+    public enum IdleOrder {
+        /**
+         * The most recently returned, so a quiet pool keeps few sockets warm.
+         * The default.
+         */
+        LIFO,
+        /**
+         * The longest idle, so every idle connection keeps being used and a
+         * server-side idle timeout never finds one.
+         */
+        FIFO;
+
+        /** {@code lifo} or {@code fifo}. */
+        public static IdleOrder parse(String name) {
+            switch (name == null ? "" : name.toLowerCase(java.util.Locale.ROOT)) {
+                case "lifo": return LIFO;
+                case "fifo": return FIFO;
+                default: throw new SkaidbException("unknown idle_order " + name + " (use lifo or fifo)");
+            }
+        }
+    }
+
+    /**
+     * How a {@link Pool} sizes itself and balances across the cluster's
+     * members, as a mutable builder. Every setting starts at the default of
+     * PROTOCOL.md §6.1, the rules every skaidb driver shares, so {@code new
+     * PoolOptions()} gives the pool {@code new Pool(dsn)} gives.
+     *
+     * <pre>{@code
+     * new Skaidb.Pool("skaidb://app:pw@db1,db2,db3/app", new Skaidb.PoolOptions()
+     *         .maxSize(16)
+     *         .loadBalancing(Skaidb.LoadBalancing.LEAST_LATENCY)
+     *         .discover(true)
+     *         .readYourWrites(Duration.ofSeconds(2)));
+     * }</pre>
+     */
+    public static final class PoolOptions {
+        int maxSize = 10;
+        LoadBalancing loadBalancing = LoadBalancing.RANDOM;
+        IdleOrder idleOrder = IdleOrder.LIFO;
+        boolean discover = false;
+        java.time.Duration refreshInterval = java.time.Duration.ofSeconds(60);
+        java.time.Duration readYourWrites = java.time.Duration.ZERO;
+        int ejectErrors = 3;
+        double ejectLatencyFactor = 3.0;
+        java.time.Duration ejectLatencyFloor = java.time.Duration.ofMillis(50);
+        java.time.Duration ejectBackoff = java.time.Duration.ofSeconds(5);
+        java.time.Duration ejectBackoffMax = java.time.Duration.ofSeconds(60);
+
+        public PoolOptions() {}
+
+        /** Idle connections kept (default 10, at least 1); checkouts are not bounded. */
+        public PoolOptions maxSize(int maxSize) {
+            if (maxSize < 1) throw new SkaidbException("maxsize must be >= 1");
+            this.maxSize = maxSize;
+            return this;
+        }
+        /** The checkout policy (default {@link LoadBalancing#RANDOM}). */
+        public PoolOptions loadBalancing(LoadBalancing policy) {
+            if (policy == null) throw new SkaidbException("load_balancing must not be null");
+            this.loadBalancing = policy;
+            return this;
+        }
+        /** {@code random} (default), {@code round_robin} or {@code least_latency}. */
+        public PoolOptions loadBalancing(String policy) { this.loadBalancing = LoadBalancing.parse(policy); return this; }
+        /** Which idle connection goes out first (default {@link IdleOrder#LIFO}). */
+        public PoolOptions idleOrder(IdleOrder order) {
+            if (order == null) throw new SkaidbException("idle_order must not be null");
+            this.idleOrder = order;
+            return this;
+        }
+        /** {@code lifo} (default) or {@code fifo}. */
+        public PoolOptions idleOrder(String order) { this.idleOrder = IdleOrder.parse(order); return this; }
+        /**
+         * Learn the members with {@code SHOW ENDPOINTS} (server 0.327 or
+         * newer) on the first connection to each member and every
+         * {@link #refreshInterval} after (default off): members that join are
+         * added, members that leave are dropped (a seed is kept, marked
+         * {@code unlisted}), and members reported {@code resyncing} or
+         * {@code unreachable} get no new connections until they are
+         * {@code ready}.
+         */
+        public PoolOptions discover(boolean discover) { this.discover = discover; return this; }
+        /**
+         * How often discovery re-reads the members (default 60 s); every 5 s
+         * instead while a listed member is not ready.
+         */
+        public PoolOptions refreshInterval(java.time.Duration interval) {
+            this.refreshInterval = nonNegative(interval, "refresh_interval");
+            return this;
+        }
+        /**
+         * How long after a write checkouts under the same affinity key go to
+         * the member that took it (default zero = off). See
+         * {@link Pool#acquire(Object)}.
+         */
+        public PoolOptions readYourWrites(java.time.Duration window) {
+            this.readYourWrites = nonNegative(window, "read_your_writes");
+            return this;
+        }
+        /**
+         * Consecutive transport failures (failed dial, I/O error or timeout
+         * mid-request, capacity refusal) that eject a member (default 3).
+         * Statement errors and refused logins do not count.
+         */
+        public PoolOptions ejectErrors(int n) {
+            if (n < 1) throw new SkaidbException("eject_errors must be >= 1");
+            this.ejectErrors = n;
+            return this;
+        }
+        /**
+         * Eject a member whose round-trip average is above this many times
+         * the other usable members' median and more than
+         * {@link #ejectLatencyFloor} above it (default 3; 0 disables).
+         */
+        public PoolOptions ejectLatencyFactor(double factor) {
+            if (!(factor >= 0)) throw new SkaidbException("eject_latency_factor must be >= 0");
+            this.ejectLatencyFactor = factor;
+            return this;
+        }
+        /** See {@link #ejectLatencyFactor} (default 50 ms). */
+        public PoolOptions ejectLatencyFloor(java.time.Duration floor) {
+            this.ejectLatencyFloor = nonNegative(floor, "eject_latency_floor");
+            return this;
+        }
+        /**
+         * How long an ejection lasts (default 5 s), doubled for each repeat up
+         * to {@link #ejectBackoffMax}; then a background probe re-admits the
+         * member.
+         */
+        public PoolOptions ejectBackoff(java.time.Duration backoff) {
+            this.ejectBackoff = nonNegative(backoff, "eject_backoff");
+            return this;
+        }
+        /**
+         * The longest ejection (default 60 s); a member healthy this long
+         * after a re-admission starts over at {@link #ejectBackoff}.
+         */
+        public PoolOptions ejectBackoffMax(java.time.Duration max) {
+            this.ejectBackoffMax = nonNegative(max, "eject_backoff_max");
+            return this;
+        }
+
+        PoolOptions copy() {
+            PoolOptions c = new PoolOptions();
+            c.maxSize = maxSize; c.loadBalancing = loadBalancing; c.idleOrder = idleOrder;
+            c.discover = discover; c.refreshInterval = refreshInterval;
+            c.readYourWrites = readYourWrites; c.ejectErrors = ejectErrors;
+            c.ejectLatencyFactor = ejectLatencyFactor; c.ejectLatencyFloor = ejectLatencyFloor;
+            c.ejectBackoff = ejectBackoff; c.ejectBackoffMax = ejectBackoffMax;
+            return c;
+        }
+
+        private static java.time.Duration nonNegative(java.time.Duration d, String what) {
+            if (d == null || d.isNegative()) throw new SkaidbException(what + " must be >= 0");
+            return d;
+        }
+    }
+
+    /**
+     * A thread-safe pool of connections, balanced across the cluster's
+     * members.
      *
      * <p>{@code maxsize} bounds the connections kept IDLE, not the number
      * checked out: a burst creates extras and the surplus is closed on return.
-     * Pooled connections come from {@link Skaidb#connect(String)}, so they
-     * inherit seed failover, TLS and the session database.
+     * Pooled connections are dialed with the pool's connect options, so they
+     * inherit TLS, credentials, consistency and the session database; one
+     * that loses its socket re-dials in the pool's order (usable members
+     * first, the one it lost last).
      *
      * <p>This matters more in Java than elsewhere: a {@code Connection}
      * serializes every statement through one socket, so threads sharing one
@@ -1759,44 +2078,258 @@ public final class Skaidb {
      *     });
      * }
      * }</pre>
+     *
+     * <p>Balancing follows PROTOCOL.md §6.1, the rules every skaidb driver
+     * shares, set through {@link PoolOptions}:
+     * <ul>
+     * <li>{@link LoadBalancing}: {@code RANDOM} (default: each new connection
+     *     dials the members in random order), {@code ROUND_ROBIN} (checkouts
+     *     rotate over the members) or {@code LEAST_LATENCY} (of two members
+     *     picked at random, the one with the lower latency average ×
+     *     checked-out connections).</li>
+     * <li>{@link IdleOrder}: {@code LIFO} (default) or {@code FIFO}.</li>
+     * <li>Discovery ({@link PoolOptions#discover}): the members come from
+     *     {@code SHOW ENDPOINTS}; resyncing and unreachable ones get no new
+     *     connections.</li>
+     * <li>Health ejection: a member with {@link PoolOptions#ejectErrors}
+     *     consecutive transport failures, or whose latency average is far
+     *     above the other members', gets no connections for
+     *     {@link PoolOptions#ejectBackoff} (doubling per repeat), then a
+     *     background probe re-admits it. The last usable member is never
+     *     ejected. Ejections and re-admissions are logged at WARNING on the
+     *     {@code com.skaidb.pool} {@link System.Logger}.</li>
+     * <li>Read-your-writes ({@link PoolOptions#readYourWrites}): checkouts
+     *     under an affinity key follow the member that took the key's last
+     *     write.</li>
+     * </ul>
+     * The probe and discovery refresh run on one daemon thread per pool,
+     * started on first need and stopped by {@link #close}.
      */
     public static final class Pool implements AutoCloseable {
         /** Work handed a pooled connection. */
         public interface Work<T> { T run(Connection conn); }
 
-        private final String dsn;
-        private final int maxsize;
-        private final java.util.ArrayDeque<Connection> idle = new java.util.ArrayDeque<>();
-        private boolean closed = false;
+        /** One member as {@link #members()} saw it: a snapshot. */
+        public static final class Member {
+            /** The endpoint the pool dials, {@code host:port}. */
+            public final String endpoint;
+            /** The member's own name from {@code SHOW ENDPOINTS}; null until discovered. */
+            public final String canonical;
+            /** {@code ready}, {@code ejected}, {@code resyncing}, {@code unreachable} or {@code unlisted}. */
+            public final String state;
+            /** The round-trip average in milliseconds; null until measured. */
+            public final Double latencyMs;
+            /** Connections to it checked out now. */
+            public final int inUse;
+            /** Idle connections to it in the pool. */
+            public final int idle;
+            /** Whether it is a configured endpoint (discovery never drops a seed). */
+            public final boolean seed;
 
-        public Pool(String dsn) { this(dsn, 10); }
+            Member(String endpoint, String canonical, String state, Double latencyMs,
+                   int inUse, int idle, boolean seed) {
+                this.endpoint = endpoint; this.canonical = canonical; this.state = state;
+                this.latencyMs = latencyMs; this.inUse = inUse; this.idle = idle; this.seed = seed;
+            }
 
-        public Pool(String dsn, int maxsize) {
-            if (maxsize < 1) throw new SkaidbException("maxsize must be >= 1");
-            this.dsn = dsn;
-            this.maxsize = maxsize;
-        }
-
-        /** Check out a usable connection, reusing an idle one when possible. */
-        public Connection acquire() {
-            for (;;) {
-                Connection c;
-                synchronized (this) {
-                    if (closed) throw new SkaidbException("pool is closed");
-                    c = idle.pollLast();
-                }
-                if (c == null) return Skaidb.connect(dsn);
-                // A connection the server closed while it sat idle still looks
-                // fine locally, so check before handing it out.
-                if (c.isUsable()) return c;
-                c.close();
+            @Override public String toString() {
+                return endpoint + (canonical == null || canonical.equals(endpoint) ? "" : " (" + canonical + ")")
+                    + " " + state + (latencyMs == null ? "" : String.format(java.util.Locale.ROOT, " %.2f ms", latencyMs))
+                    + " in_use=" + inUse + " idle=" + idle + (seed ? " seed" : "");
             }
         }
 
-        /** Return a connection, closing it if broken or the pool is full. */
+        /** One member as the pool sees it; guarded by the pool's monitor. */
+        static final class MemberState {
+            final String endpoint;      // what the pool dials
+            final boolean seed;         // configured: discovery never drops it
+            String canonical;           // its own SHOW ENDPOINTS name
+            String listed = "ready";    // ready | resyncing | unreachable | unlisted
+            double ewma;                // round-trip average, ns; meaningful once samples > 0
+            int samples;
+            long lastSample;            // System.nanoTime() of the latest sample
+            int errors;                 // consecutive transport failures
+            boolean ejected;
+            long ejectedUntil;
+            int ejections;
+            boolean readmitted;         // a probe re-admitted it at least once
+            long readmittedAt;
+            int inUse;
+            boolean probing;
+
+            MemberState(String endpoint, boolean seed) {
+                this.endpoint = endpoint;
+                this.seed = seed;
+            }
+        }
+
+        /** Where read-your-writes sends an affinity key's checkouts, and until when. */
+        private static final class Affinity {
+            final String endpoint;
+            final long until;
+            Affinity(String endpoint, long until) { this.endpoint = endpoint; this.until = until; }
+        }
+
+        // Latency EWMA: each round trip moves a member's average 5% toward
+        // it, and no sample counts for more than 10x the larger of the current
+        // average and the ejection floor — one slow query does not eject a
+        // healthy member, a member that stays slow is ejected within a few
+        // dozen statements.
+        private static final double EWMA_WEIGHT = 0.05;
+        private static final double EWMA_CLAMP = 10.0;
+        /** Round trips a member (and at least one other) needs before its average can eject it. */
+        private static final int EWMA_MIN_SAMPLES = 10;
+        /**
+         * A least-latency average older than this scores like an unmeasured
+         * one, so a lightly loaded pool keeps re-measuring every member
+         * instead of settling forever on whichever answered fastest once.
+         */
+        private static final long STALE_SAMPLE_NANOS = 2_000_000_000L;
+        /**
+         * Discovery refresh while a listed member is not ready: a member is
+         * often unreachable or resyncing only for seconds (a peer's circuit
+         * breaker right after it restarts), and waiting a whole refresh
+         * interval to let it back in leaves the load on the others.
+         */
+        private static final long REFRESH_NOT_READY_NANOS = 5_000_000_000L;
+        /** How often the background thread checks for members due a re-probe. */
+        private static final long MAINTAIN_TICK_MS = 250;
+        /**
+         * The read bound for probes and member listings: the background
+         * thread serves every member, so one that hangs must not stall it.
+         */
+        private static final int BACKGROUND_TIMEOUT_MS = 10_000;
+        /** Affinity keys kept before the expired ones are swept. */
+        private static final int AFFINITY_SWEEP = 4096;
+        private static final System.Logger LOG = System.getLogger("com.skaidb.pool");
+
+        private final ConnectOptions opts;
+        private final int maxsize;
+        private final LoadBalancing policy;
+        private final boolean fifo;
+        private final boolean discover;
+        // Durations in nanoseconds.
+        private final long refreshInterval;
+        private final long readYourWrites;
+        private final long ejectFloor;
+        private final long backoff;
+        private final long backoffMax;
+        private final int ejectErrors;
+        private final double ejectFactor;
+
+        // Everything below is guarded by this pool's monitor.
+        private final java.util.ArrayDeque<Connection> idle = new java.util.ArrayDeque<>();
+        /** By the endpoint the pool dials, seeds first. */
+        final Map<String, MemberState> members = new LinkedHashMap<>();
+        private final Map<Object, Affinity> affinity = new java.util.HashMap<>();
+        private int rr = -1;
+        boolean discoveryOff = false;
+        long nextRefresh;
+        private Thread maintainer;
+        private boolean closed = false;
+
+        /** A pool over {@code dsn} (see {@link Skaidb#connect(String)}) keeping up to 10 idle connections. */
+        public Pool(String dsn) { this(dsn, 10); }
+
+        /** A pool over {@code dsn} keeping up to {@code maxsize} idle connections. */
+        public Pool(String dsn, int maxsize) { this(parseDsn(dsn), new PoolOptions().maxSize(maxsize)); }
+
+        /** A pool over {@code dsn}, sized and balanced by {@code options}. */
+        public Pool(String dsn, PoolOptions options) { this(parseDsn(dsn), options); }
+
+        /** A pool dialing with {@code connect}, with the default pool options. */
+        public Pool(ConnectOptions connect) { this(connect, new PoolOptions()); }
+
+        /** A pool dialing with {@code connect}, sized and balanced by {@code options}. */
+        public Pool(ConnectOptions connect, PoolOptions options) {
+            this.opts = connect.copy().validate();
+            PoolOptions o = options.copy();
+            this.maxsize = o.maxSize;
+            this.policy = o.loadBalancing;
+            this.fifo = o.idleOrder == IdleOrder.FIFO;
+            this.discover = o.discover;
+            this.refreshInterval = nanos(o.refreshInterval);
+            this.readYourWrites = nanos(o.readYourWrites);
+            this.ejectErrors = o.ejectErrors;
+            this.ejectFactor = o.ejectLatencyFactor;
+            this.ejectFloor = nanos(o.ejectLatencyFloor);
+            this.backoff = nanos(o.ejectBackoff);
+            this.backoffMax = nanos(o.ejectBackoffMax);
+            for (String ep : opts.seeds) members.putIfAbsent(ep, new MemberState(ep, true));
+            this.nextRefresh = System.nanoTime();
+        }
+
+        /** A duration in nanoseconds, saturated well clear of overflow when added to a clock reading. */
+        private static long nanos(java.time.Duration d) {
+            try {
+                return Math.min(d.toNanos(), Long.MAX_VALUE / 4);
+            } catch (ArithmeticException e) {
+                return Long.MAX_VALUE / 4;
+            }
+        }
+
+        // -- checkout / checkin --
+
+        /** Check out a usable connection under the pool-wide affinity key. */
+        public Connection acquire() { return acquire(null); }
+
+        /**
+         * Check out a usable connection: an idle one to the member the policy
+         * picks, or a new one dialed to it (falling back to the other members).
+         * {@code affinity} scopes read-your-writes: within
+         * {@link PoolOptions#readYourWrites} of a write made on a connection
+         * checked out under the same key (a user id, a session id), the
+         * checkout goes to the member that took the write, which reads it back
+         * at any consistency. Null is the pool-wide key.
+         */
+        public Connection acquire(Object affinity) {
+            for (;;) {
+                Connection c;
+                java.util.List<Connection> stale = new java.util.ArrayList<>();
+                java.util.List<String> order = null;
+                synchronized (this) {
+                    if (closed) throw new SkaidbException("pool is closed");
+                    MemberState target = pick(affinity);
+                    c = takeIdle(target, stale);
+                    if (c == null) order = order(target, null);
+                }
+                for (Connection s : stale) s.close();
+                if (c == null) {
+                    c = new Connection(opts, this, order, 0);
+                    synchronized (this) { c.poolEp = c.connectedEp; }
+                    discoverThrough(c);
+                    if (!c.isUsable()) {
+                        c.close();
+                        continue;
+                    }
+                } else if (!c.isUsable()) {
+                    // A connection that broke while it sat idle: drop it, try again.
+                    c.close();
+                    continue;
+                }
+                synchronized (this) {
+                    MemberState m = members.get(c.poolEp);
+                    if (m != null) m.inUse++;
+                    c.poolAffinity = affinity;
+                    c.poolOut = true;
+                }
+                return c;
+            }
+        }
+
+        /**
+         * Return a connection, closing it instead if it is broken or still
+         * streaming, its member is ejected, not ready or gone, or the idle set
+         * is full.
+         */
         public void release(Connection c) {
             synchronized (this) {
-                if (!closed && c.isUsable() && idle.size() < maxsize) {
+                MemberState m = members.get(c.poolEp);
+                if (c.poolOut) {
+                    c.poolOut = false;
+                    if (m != null && m.inUse > 0) m.inUse--;
+                }
+                if (!closed && c.isUsable() && m != null && usable(m) && idle.size() < maxsize) {
                     idle.addLast(c);
                     return;
                 }
@@ -1805,8 +2338,11 @@ public final class Skaidb {
         }
 
         /** Run {@code work} with a checked-out connection, returning it after. */
-        public <T> T withConnection(Work<T> work) {
-            Connection c = acquire();
+        public <T> T withConnection(Work<T> work) { return withConnection(null, work); }
+
+        /** {@link #withConnection(Work)} under an affinity key; see {@link #acquire(Object)}. */
+        public <T> T withConnection(Object affinity, Work<T> work) {
+            Connection c = acquire(affinity);
             try {
                 return work.run(c);
             } finally {
@@ -1814,15 +2350,434 @@ public final class Skaidb {
             }
         }
 
-        /** Close the pool and every idle connection. */
+        /**
+         * The members as the pool sees them, for monitoring: endpoint,
+         * discovered name, state, latency average, connections checked out and
+         * idle, and whether each is a seed. Ordered by endpoint.
+         */
+        public synchronized java.util.List<Member> members() {
+            Map<String, Integer> idleBy = new java.util.HashMap<>();
+            for (Connection c : idle) idleBy.merge(c.poolEp, 1, Integer::sum);
+            java.util.List<MemberState> sorted = new ArrayList<>(members.values());
+            sorted.sort(java.util.Comparator.comparing((MemberState m) -> m.endpoint));
+            java.util.List<Member> out = new ArrayList<>(sorted.size());
+            for (MemberState m : sorted) {
+                out.add(new Member(m.endpoint, m.canonical, m.ejected ? "ejected" : m.listed,
+                    m.samples == 0 ? null : m.ewma / 1e6, m.inUse, idleBy.getOrDefault(m.endpoint, 0), m.seed));
+            }
+            return java.util.Collections.unmodifiableList(out);
+        }
+
+        /**
+         * Close the pool and every idle connection, and stop its background
+         * thread. Checked-out connections are closed when they are returned.
+         */
         @Override public void close() {
             java.util.List<Connection> drained;
             synchronized (this) {
                 closed = true;
                 drained = new java.util.ArrayList<>(idle);
                 idle.clear();
+                notifyAll();   // wakes the background thread, which then exits
             }
             for (Connection c : drained) c.close();
+        }
+
+        // -- choosing a member (callers hold the monitor) --
+
+        private static boolean usable(MemberState m) {
+            return !m.ejected && m.listed.equals("ready");
+        }
+
+        /**
+         * The member this checkout should go to, or null for "any" (the
+         * random policy, or no usable member at all).
+         */
+        private MemberState pick(Object key) {
+            if (readYourWrites > 0) {
+                Affinity hit = affinity.get(key);
+                if (hit != null) {
+                    MemberState m = members.get(hit.endpoint);
+                    if (System.nanoTime() - hit.until >= 0 || m == null) affinity.remove(key);
+                    else if (usable(m)) return m;
+                }
+            }
+            java.util.List<MemberState> live = new ArrayList<>();
+            for (MemberState m : members.values()) if (usable(m)) live.add(m);
+            if (live.isEmpty() || policy == LoadBalancing.RANDOM) return null;
+            if (policy == LoadBalancing.ROUND_ROBIN) {
+                live.sort(java.util.Comparator.comparing((MemberState m) -> m.endpoint));
+                rr = (rr + 1) % live.size();
+                return live.get(rr);
+            }
+            if (live.size() == 1) return live.get(0);
+            java.util.concurrent.ThreadLocalRandom rnd = java.util.concurrent.ThreadLocalRandom.current();
+            int i = rnd.nextInt(live.size());
+            int j = rnd.nextInt(live.size() - 1);
+            if (j >= i) j++;
+            MemberState a = live.get(i), b = live.get(j);
+            long now = System.nanoTime();
+            return score(a, now) <= score(b, now) ? a : b;
+        }
+
+        private static double score(MemberState m, long now) {
+            // A member never measured, or not lately, scores 0: it is tried
+            // and measured.
+            if (m.samples == 0 || now - m.lastSample > STALE_SAMPLE_NANOS) return 0.0;
+            return m.ewma * (m.inUse + 1);
+        }
+
+        /**
+         * Remove and return an idle connection (to {@code target}, or to any
+         * usable member), moving the idle connections found to belong to
+         * members no longer usable into {@code stale} (to close outside the
+         * monitor).
+         */
+        private Connection takeIdle(MemberState target, java.util.List<Connection> stale) {
+            java.util.Iterator<Connection> it = fifo ? idle.iterator() : idle.descendingIterator();
+            while (it.hasNext()) {
+                Connection c = it.next();
+                MemberState m = members.get(c.poolEp);
+                if (m == null || !usable(m)) {
+                    it.remove();
+                    stale.add(c);
+                    continue;
+                }
+                if (target == null || m == target) {
+                    it.remove();
+                    return c;
+                }
+            }
+            return null;
+        }
+
+        /**
+         * Endpoints to dial, best first: {@code first}, the other usable
+         * members in random order, then the rest (resyncing/unreachable before
+         * ejected, the soonest re-admission first) — a dial never has nowhere
+         * to go while any member is configured. {@code exclude} goes last.
+         */
+        private java.util.List<String> order(MemberState first, String exclude) {
+            java.util.List<MemberState> live = new ArrayList<>(), rest = new ArrayList<>();
+            for (MemberState m : members.values()) {
+                if (m == first) continue;
+                (usable(m) ? live : rest).add(m);
+            }
+            java.util.Collections.shuffle(live);
+            rest.sort((a, b) -> a.ejected != b.ejected ? (a.ejected ? 1 : -1)
+                    : a.ejected ? Long.signum(a.ejectedUntil - b.ejectedUntil) : 0);
+            java.util.List<String> eps = new ArrayList<>();
+            if (first != null) eps.add(first.endpoint);
+            for (MemberState m : live) eps.add(m.endpoint);
+            for (MemberState m : rest) eps.add(m.endpoint);
+            if (exclude != null && eps.size() > 1 && eps.remove(exclude)) eps.add(exclude);
+            return eps;
+        }
+
+        // -- what connections report (any thread) --
+
+        /** A pooled connection re-dialing: the pool's order, the member it lost last. */
+        synchronized java.util.List<String> dialOrder(String exclude) {
+            return order(null, exclude);
+        }
+
+        synchronized void roundTrip(Connection conn, long elapsed) {
+            String ep = conn.connectedEp;
+            if (ep == null) return;
+            if (!ep.equals(conn.poolEp)) {
+                // The connection re-dialed to another member mid-checkout.
+                if (conn.poolOut) {
+                    MemberState old = conn.poolEp == null ? null : members.get(conn.poolEp);
+                    if (old != null && old.inUse > 0) old.inUse--;
+                    MemberState now = members.get(ep);
+                    if (now != null) now.inUse++;
+                }
+                conn.poolEp = ep;
+            }
+            MemberState m = members.get(ep);
+            if (m == null) return;
+            m.errors = 0;
+            if (m.samples == 0) {
+                m.ewma = elapsed;
+            } else {
+                double cap = EWMA_CLAMP * Math.max(m.ewma, ejectFloor);
+                m.ewma += EWMA_WEIGHT * (Math.min(elapsed, cap) - m.ewma);
+            }
+            m.samples++;
+            m.lastSample = System.nanoTime();
+            // Only a member still in rotation: round trips finishing on
+            // connections checked out before an ejection must not eject it
+            // again (and stretch its backoff).
+            if (usable(m) && m.samples >= EWMA_MIN_SAMPLES && ejectFactor > 0) {
+                java.util.List<Double> others = new ArrayList<>();
+                for (MemberState o : members.values()) {
+                    if (o != m && usable(o) && o.samples >= EWMA_MIN_SAMPLES) others.add(o.ewma);
+                }
+                if (!others.isEmpty()) {
+                    java.util.Collections.sort(others);
+                    double median = others.get((others.size() - 1) / 2);   // the lower middle when even
+                    if (m.ewma > ejectFactor * median && m.ewma - median > ejectFloor) {
+                        eject(m, String.format(java.util.Locale.ROOT, "latency %.1f ms vs median %.1f ms",
+                            m.ewma / 1e6, median / 1e6));
+                    }
+                }
+            }
+        }
+
+        synchronized void failed(String ep) {
+            MemberState m = members.get(ep);
+            if (m == null) return;
+            m.errors++;
+            if (m.errors >= ejectErrors && !m.ejected) eject(m, m.errors + " consecutive connection failures");
+        }
+
+        synchronized void closedOut(Connection conn) {
+            if (!conn.poolOut) return;
+            conn.poolOut = false;
+            MemberState m = members.get(conn.poolEp);
+            if (m != null && m.inUse > 0) m.inUse--;
+        }
+
+        void wrote(Connection conn) {
+            if (readYourWrites <= 0) return;
+            long now = System.nanoTime();
+            synchronized (this) {
+                if (!conn.poolOut || conn.connectedEp == null) return;
+                if (affinity.size() >= AFFINITY_SWEEP) affinity.values().removeIf(a -> a.until - now <= 0);
+                affinity.put(conn.poolAffinity, new Affinity(conn.connectedEp, now + readYourWrites));
+            }
+        }
+
+        // -- ejection and re-admission --
+
+        /**
+         * Take {@code m} out of rotation and close its idle connections
+         * (caller holds the monitor) — unless it is the last usable member: a
+         * slow or flaky member beats none.
+         */
+        private void eject(MemberState m, String why) {
+            boolean another = false;
+            for (MemberState o : members.values()) if (o != m && usable(o)) another = true;
+            if (!another) return;
+            long now = System.nanoTime();
+            if (!m.readmitted || now - m.readmittedAt > backoffMax) m.ejections = 0;   // healthy for a while: start over
+            m.ejections++;
+            m.ejected = true;
+            m.ejectedUntil = now + backoffFor(m);
+            for (java.util.Iterator<Connection> it = idle.iterator(); it.hasNext();) {
+                Connection c = it.next();
+                if (m.endpoint.equals(c.poolEp)) {
+                    it.remove();
+                    c.close();
+                }
+            }
+            LOG.log(System.Logger.Level.WARNING, "skaidb pool: ejecting {0} ({1})", m.endpoint, why);
+            ensureMaintainer();
+        }
+
+        /** The ejection length for {@code m}'s current repeat count, in nanoseconds. */
+        long backoffFor(MemberState m) {
+            long b = backoff;
+            for (int i = 1; i < m.ejections && b < backoffMax; i++) b *= 2;
+            return Math.min(b, backoffMax);
+        }
+
+        /**
+         * Start the background thread (caller holds the monitor): it
+         * re-probes ejected members and refreshes discovery. A daemon, so it
+         * never keeps the JVM alive.
+         */
+        private void ensureMaintainer() {
+            if (maintainer != null || closed) return;
+            Thread t = new Thread(this::maintain, "skaidb-pool");
+            t.setDaemon(true);
+            maintainer = t;
+            t.start();
+        }
+
+        private void maintain() {
+            for (;;) {
+                java.util.List<MemberState> due = new ArrayList<>();
+                boolean refresh;
+                synchronized (this) {
+                    try {
+                        if (!closed) wait(MAINTAIN_TICK_MS);
+                    } catch (InterruptedException e) {
+                        return;
+                    }
+                    if (closed) return;
+                    long now = System.nanoTime();
+                    for (MemberState m : members.values()) {
+                        if (m.ejected && now - m.ejectedUntil >= 0 && !m.probing) {
+                            m.probing = true;
+                            due.add(m);
+                        }
+                    }
+                    refresh = discover && !discoveryOff && now - nextRefresh >= 0;
+                    // A listing sets the real next refresh; this one stands if it fails.
+                    if (refresh) nextRefresh = now + refreshInterval;
+                }
+                for (MemberState m : due) probe(m);
+                if (refresh) refresh();
+            }
+        }
+
+        /**
+         * Dial {@code m} alone and run one statement: success re-admits it
+         * (the probe connection joins the idle set), failure ejects it again
+         * for twice as long.
+         */
+        private void probe(MemberState m) {
+            Connection c = null;
+            boolean ok;
+            try {
+                c = new Connection(opts, null, java.util.Collections.singletonList(m.endpoint), BACKGROUND_TIMEOUT_MS);
+                c.run("SHOW DATABASES", true);
+                c.setReadTimeout(0);
+                ok = c.isUsable();
+            } catch (RuntimeException e) {
+                ok = false;
+            }
+            synchronized (this) {
+                m.probing = false;
+                if (closed) {
+                    ok = false;
+                } else if (ok) {
+                    m.ejected = false;
+                    m.errors = 0;
+                    m.samples = 0;
+                    m.ewma = 0;
+                    m.readmitted = true;
+                    m.readmittedAt = System.nanoTime();
+                    LOG.log(System.Logger.Level.WARNING, "skaidb pool: re-admitted {0}", m.endpoint);
+                    if (members.get(m.endpoint) == m && idle.size() < maxsize) {
+                        c.pool = this;
+                        c.poolEp = m.endpoint;
+                        idle.addLast(c);
+                        c = null;
+                    }
+                } else {
+                    m.ejections++;
+                    m.ejectedUntil = System.nanoTime() + backoffFor(m);
+                }
+            }
+            if (c != null) c.close();
+        }
+
+        // -- discovery --
+
+        /**
+         * Run discovery on a freshly dialed connection when the member it
+         * reached has not named itself yet (once per member, so seeds given as
+         * host names are matched to the endpoints the server reports).
+         */
+        private void discoverThrough(Connection c) {
+            if (!discover) return;
+            synchronized (this) {
+                if (discoveryOff) return;
+                MemberState m = members.get(c.poolEp);
+                if (m == null || m.canonical != null) return;
+                ensureMaintainer();
+            }
+            listThrough(c);
+        }
+
+        private void refresh() {
+            Connection c;
+            try {
+                c = acquire();
+            } catch (SkaidbException e) {
+                return;   // nothing reachable now; the next refresh tries again
+            }
+            try {
+                listThrough(c);
+            } finally {
+                release(c);
+            }
+        }
+
+        /** Read the members through {@code c} and fold them in. */
+        void listThrough(Connection c) {
+            java.util.List<Object[]> rows = new ArrayList<>();
+            int timeout = c.getReadTimeout();
+            try {
+                if (timeout == 0 || timeout > BACKGROUND_TIMEOUT_MS) c.setReadTimeout(BACKGROUND_TIMEOUT_MS);
+                ResultSet rs = c.query("SHOW ENDPOINTS");
+                while (rs.next()) rows.add(new Object[] { rs.getObject(1), rs.getObject(2), rs.getObject(3) });
+            } catch (SkaidbException e) {
+                // A statement error on a healthy connection: a server that
+                // predates the statement. Keep the seeds, stop asking.
+                if (e.getCause() == null && c.isUsable()) {
+                    synchronized (this) { discoveryOff = true; }
+                }
+                return;
+            } finally {
+                c.setReadTimeout(timeout);
+            }
+            synchronized (this) {
+                if (rows.isEmpty()) {
+                    // A standalone server: keep the seeds, stop asking.
+                    discoveryOff = true;
+                    return;
+                }
+                applyListing(c.poolEp, rows);
+                long interval = refreshInterval;
+                for (MemberState m : members.values()) {
+                    if (m.listed.equals("resyncing") || m.listed.equals("unreachable"))
+                        interval = Math.min(interval, REFRESH_NOT_READY_NANOS);
+                }
+                nextRefresh = System.nanoTime() + interval;
+            }
+        }
+
+        /** Fold a non-empty {@code SHOW ENDPOINTS} answer (caller holds the monitor). */
+        private void applyListing(String dialed, java.util.List<Object[]> rows) {
+            Map<String, String> listed = new LinkedHashMap<>();
+            for (Object[] row : rows) {
+                String endpoint = String.valueOf(row[0]);
+                listed.put(endpoint, String.valueOf(row[1]));
+                if (Boolean.TRUE.equals(row[2]) || "true".equals(String.valueOf(row[2]))) {
+                    MemberState me = members.get(dialed);
+                    if (me != null) me.canonical = endpoint;
+                }
+            }
+            // A member reported under the name of one already known (a seed
+            // given as a host name) is that member, not a new one.
+            Map<String, MemberState> byName = new java.util.HashMap<>();
+            for (MemberState m : members.values()) {
+                if (m.canonical != null && (!byName.containsKey(m.canonical) || m.seed)) byName.put(m.canonical, m);
+            }
+            // A duplicate of a seed goes.
+            members.values().removeIf(m -> m.canonical != null && byName.get(m.canonical) != m);
+            java.util.Set<MemberState> seen = java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
+            for (Map.Entry<String, String> e : listed.entrySet()) {
+                MemberState m = byName.get(e.getKey());
+                if (m == null) {
+                    String ep = hasPort(e.getKey()) ? e.getKey() : e.getKey() + ":7000";
+                    m = members.get(ep);
+                    if (m == null) {
+                        m = new MemberState(ep, false);
+                        members.put(ep, m);
+                    }
+                    m.canonical = e.getKey();
+                }
+                String state = e.getValue();
+                if (!state.equals("resyncing") && !state.equals("unreachable")) state = "ready";
+                if (state.equals("ready") && !m.listed.equals("ready")) {
+                    // Back in rotation: measured afresh, like a re-admission.
+                    m.ewma = 0;
+                    m.samples = 0;
+                    m.errors = 0;
+                }
+                m.listed = state;
+                seen.add(m);
+            }
+            for (java.util.Iterator<MemberState> it = members.values().iterator(); it.hasNext();) {
+                MemberState m = it.next();
+                if (seen.contains(m) || (m.seed && m.canonical == null)) continue;   // listed, or a seed not identified yet
+                if (m.seed) m.listed = "unlisted";   // configured, but no longer a member
+                else it.remove();
+            }
         }
     }
 }

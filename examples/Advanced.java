@@ -1,5 +1,6 @@
 import com.skaidb.Skaidb;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -11,7 +12,8 @@ import java.util.UUID;
 // The rest of the API in one file: a DSN with a seed list and a session
 // database, typed parameters (arrays, documents, UUIDs, timestamps), a
 // one-round-trip batch, per-statement consistency, streaming a large result,
-// the abandon/drain rule, a pool, a multi-result-set CALL and a change stream.
+// the abandon/drain rule, a pool balanced across the members, a
+// multi-result-set CALL and a change stream.
 //
 //   javac -d out src/main/java/com/skaidb/Skaidb.java examples/Advanced.java
 //   java -cp out Advanced "skaidb://skaidb:secret@h1:7000,h2:7000/app?consistency=quorum"
@@ -71,14 +73,22 @@ public class Advanced {
             conn.execute("DROP TABLE events");
         }
 
-        // ---- pool: one connection per worker thread; maxsize bounds the IDLE set.
-        try (Skaidb.Pool pool = new Skaidb.Pool(dsn, 8)) {
-            String v = pool.withConnection(c -> {
+        // ---- pool: one connection per worker thread; maxSize bounds the IDLE
+        // set. Least-latency balancing over the members SHOW ENDPOINTS lists,
+        // and read-your-writes: within 2 s of a write under the key "user-42",
+        // that key's checkouts go to the member that took the write.
+        try (Skaidb.Pool pool = new Skaidb.Pool(dsn, new Skaidb.PoolOptions()
+                .maxSize(8)
+                .loadBalancing(Skaidb.LoadBalancing.LEAST_LATENCY)
+                .discover(true)
+                .readYourWrites(Duration.ofSeconds(2)))) {
+            String v = pool.withConnection("user-42", c -> {
                 Skaidb.ResultSet rs = c.query("SELECT 1 AS one");
                 rs.next();
                 return rs.getString("one");
             });
             System.out.println("pooled query -> " + v);
+            for (Skaidb.Pool.Member m : pool.members()) System.out.println("  member " + m);
         }
 
         // ---- change streams: CREATE STREAM s ON t; then follow it. Blocks

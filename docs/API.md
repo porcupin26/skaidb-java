@@ -8,7 +8,7 @@ is described in [JDBC.md](JDBC.md).
 ## `Skaidb`
 
 ```java
-public static final String VERSION;                  // the driver version, e.g. "1.1.0"
+public static final String VERSION;                  // the driver version, e.g. "1.2.0"
 public static String version();                      // same, as a method
 
 public static final int CONSISTENCY_ONE    = 0;
@@ -205,15 +205,69 @@ Not thread-safe. Reading to the end releases the connection before
 ```java
 public interface Work<T> { T run(Connection conn); }
 
-public Pool(String dsn);                 // up to 10 idle
-public Pool(String dsn, int maxsize);    // maxsize >= 1 bounds the IDLE set
-public Connection acquire();             // idle-and-usable, else a fresh connect(dsn)
-public void       release(Connection c); // parks it if usable and room remains, else closes it
+public Pool(String dsn);                                  // up to 10 idle, default balancing
+public Pool(String dsn, int maxsize);                     // maxsize >= 1 bounds the IDLE set
+public Pool(String dsn, PoolOptions options);
+public Pool(ConnectOptions connect);
+public Pool(ConnectOptions connect, PoolOptions options);
+
+public Connection acquire();                              // under the pool-wide affinity key
+public Connection acquire(Object affinity);               // idle to the picked member, else a fresh dial
+public void       release(Connection c);                  // parks it if usable, its member usable and room remains; else closes it
 public <T> T      withConnection(Work<T> work);
-public void       close();               // closes every idle connection; acquire() then throws
+public <T> T      withConnection(Object affinity, Work<T> work);
+public List<Member> members();                            // snapshot per member, ordered by endpoint
+public void       close();                                // closes every idle connection, stops the background thread
 ```
 
-Thread-safe.
+Thread-safe. A malformed DSN throws from the constructor. The probe and
+discovery refresh run on one daemon thread per pool, started on first need.
+Balancing follows
+[PROTOCOL.md §6.1](https://skaidb.org/docs/PROTOCOL.html#61-balancing-a-pool-across-members);
+the README's [Balancing across members](../README.md#balancing-across-members)
+explains each option.
+
+### `Skaidb.Pool.Member`
+
+```java
+public final String  endpoint;   // what the pool dials, host:port
+public final String  canonical;  // the member's own SHOW ENDPOINTS name; null until discovered
+public final String  state;      // ready | ejected | resyncing | unreachable | unlisted
+public final Double  latencyMs;  // round-trip average; null until measured
+public final int     inUse;      // checked out now
+public final int     idle;       // idle in the pool
+public final boolean seed;       // a configured endpoint (never dropped by discovery)
+```
+
+### `Skaidb.PoolOptions`
+
+A mutable builder; every setter returns `this` and refuses an invalid value
+with `SkaidbException`.
+
+```java
+public PoolOptions maxSize(int maxSize);                   // 10; >= 1
+public PoolOptions loadBalancing(LoadBalancing policy);    // RANDOM
+public PoolOptions loadBalancing(String policy);           // "random" | "round_robin" | "least_latency"
+public PoolOptions idleOrder(IdleOrder order);             // LIFO
+public PoolOptions idleOrder(String order);                // "lifo" | "fifo"
+public PoolOptions discover(boolean discover);             // false
+public PoolOptions refreshInterval(Duration interval);     // 60 s (5 s while a member is not ready)
+public PoolOptions readYourWrites(Duration window);        // zero = off
+public PoolOptions ejectErrors(int n);                     // 3; >= 1
+public PoolOptions ejectLatencyFactor(double factor);      // 3.0; 0 disables
+public PoolOptions ejectLatencyFloor(Duration floor);      // 50 ms
+public PoolOptions ejectBackoff(Duration backoff);         // 5 s, doubling per repeat
+public PoolOptions ejectBackoffMax(Duration max);          // 60 s
+```
+
+### `Skaidb.LoadBalancing`, `Skaidb.IdleOrder`
+
+```java
+public enum LoadBalancing { RANDOM, ROUND_ROBIN, LEAST_LATENCY;
+    public static LoadBalancing parse(String name); }      // case-insensitive
+public enum IdleOrder { LIFO, FIFO;
+    public static IdleOrder parse(String name); }
+```
 
 ## Wire protocol
 

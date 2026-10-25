@@ -4,6 +4,42 @@ All notable changes to the skaidb Java driver. The driver has its own
 version series, independent of the skaidb server; see the README's
 compatibility section for which server versions each release speaks to.
 
+## 1.2.0 (2026-10-25)
+
+Connection-pool load balancing across the cluster's members.
+
+- **Pool load balancing across members** (the rules every skaidb driver
+  shares, PROTOCOL.md §6.1), set through the new `Skaidb.PoolOptions`
+  (`new Pool(dsn, options)`, `new Pool(connectOptions, options)`; the
+  existing constructors keep working): `LoadBalancing.ROUND_ROBIN` /
+  `LEAST_LATENCY` (power of two choices on the round-trip average ×
+  checked-out connections, re-measuring a member not used in 2 s; `RANDOM`
+  stays the default), `IdleOrder.FIFO`, health ejection (consecutive
+  transport failures, or a latency average far above the other members')
+  with a background probe that re-admits the member, `discover(true)`
+  (members from `SHOW ENDPOINTS`, server ≥ 0.327: joiners added, leavers
+  dropped, resyncing/unreachable members skipped and re-checked every 5 s),
+  and `readYourWrites(Duration)` with `acquire(affinity)` /
+  `withConnection(affinity, work)` — reads follow the member that took the
+  key's last write. `pool.members()` reports each member's state, latency
+  and connections. The probe and refresh run on one daemon thread per pool,
+  stopped by `close()`.
+- A pooled connection that re-dials does so in the pool's order (usable
+  members first, the one it lost last).
+- Changed: a seed that closes the connection during the handshake (a
+  capacity refusal, a node going down) no longer ends a connect — the next
+  seed is tried — and `authentication denied: too many connections: ...`
+  counts as unreachable (`no reachable endpoint`, JDBC SQLState `08001`, not
+  `28000`). A login refused for its credentials still fails at once.
+- Changed: `new Pool(dsn)` parses the DSN in the constructor, so a malformed
+  DSN throws there rather than at the first `acquire()`.
+- Fixed: a transport failure while preparing a statement left the connection
+  looking usable; it is now marked broken and re-dials on its next
+  statement, as after a failure mid-query.
+- JDBC: `SkaidbDataSource` leaves pooling to HikariCP and the like, whose
+  connections land on random members; docs/JDBC.md says so and points to
+  `Skaidb.Pool` for balancing.
+
 ## 1.1.0 (2026-09-26)
 
 JDBC driver, certificate login, and the shared wire-protocol conformance suite.

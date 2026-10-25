@@ -96,6 +96,17 @@ HikariDataSource ds = new HikariDataSource(cfg);
 timeout, so no `connectionTestQuery` is needed. `setNetworkTimeout` bounds
 every read on the connection.
 
+**Balancing across members.** A JDBC pool opens each physical connection
+through the driver, which dials the URL's hosts in shuffled order and keeps
+the connection on the member it reached — so a HikariCP pool's connections
+land on random members, and stay there until the pool retires them
+(`maxLifetime`). The driver does not run a pool of its own behind
+`DataSource`. Balancing policies (round-robin, least-latency), member
+discovery from `SHOW ENDPOINTS`, health ejection with re-probe and
+read-your-writes affinity are features of the native `Skaidb.Pool`; see the
+README's [Balancing across members](../README.md#balancing-across-members)
+and [PROTOCOL.md §6.1](https://skaidb.org/docs/PROTOCOL.html#61-balancing-a-pool-across-members).
+
 ## Statements
 
 - `Statement` sends the SQL verbatim; `?` is not a placeholder there.
@@ -210,7 +221,7 @@ Every failure is an `SQLException` subclass with an SQLState:
 
 | Situation | Exception | SQLState |
 |-----------|-----------|----------|
-| Bad URL or options; no seed reachable; TLS setup | `SQLNonTransientConnectionException` | `08001` |
+| Bad URL or options; no seed reachable (capacity refusals included); TLS setup | `SQLNonTransientConnectionException` | `08001` |
 | Wrong credentials, certificate refused, server signature mismatch | `SQLInvalidAuthorizationSpecException` | `28000` |
 | Transport failure mid-statement (the connection re-dials next time) | `SQLRecoverableException` | `08006` |
 | Read or query timeout | `SQLTimeoutException` | `HYT00` |

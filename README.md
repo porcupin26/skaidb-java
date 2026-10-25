@@ -9,7 +9,8 @@ client — `connect`, `prepare`, `setInt`/`setString`, `executeQuery`/
 JDBC user has essentially nothing new to learn. It speaks skaidb's binary
 protocol directly: SCRAM-SHA-256 or client-certificate authentication,
 server-side prepared statements with typed parameters, streamed result
-sets, TLS, seed-list failover and connection pooling.
+sets, TLS, seed-list failover and a connection pool that balances across
+the cluster's members.
 
 The same jar is also a **JDBC 4.3 driver** (`com.skaidb.jdbc`): `DriverManager`
 finds it by itself, `jdbc:skaidb://host/db` URLs work in any JDBC tool, and
@@ -50,7 +51,7 @@ The artifact is published through [JitPack](https://jitpack.io/#porcupin26/skaid
 which builds it from the git tag on first request. Coordinates:
 
 ```
-com.github.porcupin26:skaidb-java:v1.1.0
+com.github.porcupin26:skaidb-java:v1.2.0
 ```
 
 > **Note:** `v1.0.0` is not resolvable through JitPack — its first build
@@ -75,7 +76,7 @@ GPG-signed artifacts, which this project does not have yet).
   <dependency>
     <groupId>com.github.porcupin26</groupId>
     <artifactId>skaidb-java</artifactId>
-    <version>v1.1.0</version>
+    <version>v1.2.0</version>
   </dependency>
 </dependencies>
 ```
@@ -89,7 +90,7 @@ repositories {
 }
 
 dependencies {
-    implementation("com.github.porcupin26:skaidb-java:v1.1.0")
+    implementation("com.github.porcupin26:skaidb-java:v1.2.0")
 }
 ```
 
@@ -102,7 +103,7 @@ repositories {
 }
 
 dependencies {
-    implementation 'com.github.porcupin26:skaidb-java:v1.1.0'
+    implementation 'com.github.porcupin26:skaidb-java:v1.2.0'
 }
 ```
 
@@ -162,7 +163,7 @@ skaidb://[user[:password]@]host[:port][,host2[:port2]...][/database][?option=val
 | Part | Meaning | Default |
 |------|---------|---------|
 | `user`, `password` | SCRAM-SHA-256 credentials. Omit both for an anonymous connection (only works when the server allows it). | `anonymous`, empty |
-| `host[:port]`, comma-separated | Seed list. The driver shuffles it and dials seeds in turn until one **connects and authenticates**; a node that accepts TCP while unhealthy is skipped. skaidb is leaderless, so any node serves every statement. | port `7000` |
+| `host[:port]`, comma-separated | Seed list. The driver shuffles it and dials seeds in turn until one **connects and authenticates**; a node that accepts TCP while unhealthy, or closes the connection before the handshake because it is full, is skipped, while a login refused for its credentials stops at once. skaidb is leaderless, so any node serves every statement. | port `7000` |
 | `/database` | Session database: the driver runs `USE "database"` after every connect and reconnect. | none |
 | `consistency=one\|quorum\|all` | Default consistency level for statements on this connection. | `quorum` |
 | `tls=true` | Encrypt with TLS, verifying the server certificate against the JVM's default trust store. | off |
@@ -454,12 +455,82 @@ try (Skaidb.Pool pool = new Skaidb.Pool("skaidb://u:p@h1:7000,h2:7000/app", 8)) 
   sets that bound. `maxsize` bounds the connections kept **idle**, not the
   number checked out: a burst opens extras and the surplus is closed on
   return.
-- Pooled connections come from `Skaidb.connect(dsn)`, so they inherit seed
-  failover, TLS, consistency and the session database.
+- Pooled connections are dialed with the DSN's (or `ConnectOptions`')
+  settings, so they inherit TLS, credentials, consistency and the session
+  database. One that loses its socket re-dials in the pool's order: usable
+  members first, the one it lost last.
 - `acquire()` returns only connections that pass `isUsable()`; `release()`
   closes a broken or still-streaming connection instead of parking it.
-- `close()` closes the pool and every idle connection; a later `acquire()`
-  throws `pool is closed`.
+- `close()` closes the pool and every idle connection and stops its
+  background thread; a later `acquire()` throws `pool is closed`.
+
+### Balancing across members
+
+By default (`LoadBalancing.RANDOM`) each new connection dials the members in
+random order and stays on the member it reached — fine for many clients, but
+one process can end up with most of its connections on one member. Pick a
+policy with `Skaidb.PoolOptions` to spread a single process's load:
+
+```java
+Skaidb.Pool pool = new Skaidb.Pool(
+    new Skaidb.ConnectOptions().host("db1").host("db2").host("db3")
+        .user("app").password(pw).database("app"),
+    new Skaidb.PoolOptions()
+        .maxSize(16)
+        .loadBalancing(Skaidb.LoadBalancing.LEAST_LATENCY)  // or ROUND_ROBIN
+        .discover(true)                                    // learn members from the cluster
+        .readYourWrites(Duration.ofSeconds(2))             // see below
+        .idleOrder(Skaidb.IdleOrder.FIFO));
+```
+
+| `PoolOptions` setter | Default | What it does |
+|---|---|---|
+| `maxSize(int)` | `10` | Idle connections kept (see above). |
+| `loadBalancing(...)` | `RANDOM` | `ROUND_ROBIN`: checkouts rotate over the usable members in endpoint order. `LEAST_LATENCY`: of two members picked at random, the one with the lower round-trip average × (checked-out connections + 1), so near and idle members win; a member not measured in the last 2 s scores 0, so a quiet pool keeps re-measuring every member. Also accepts `"random"`, `"round_robin"`, `"least_latency"`. |
+| `idleOrder(...)` | `LIFO` | `FIFO` hands out the longest-idle connection first, so every idle connection keeps being used and a server-side idle timeout never finds one. Also accepts `"lifo"`, `"fifo"`. |
+| `discover(boolean)` | `false` | Reads the members with `SHOW ENDPOINTS` (server ≥ 0.327; no privilege needed) on the first connection to each member and every `refreshInterval` after (every 5 s while a member is not ready). New members are added, members that left are dropped (seeds are kept, marked `unlisted`), and members the server reports `resyncing` or `unreachable` get no new connections until they are `ready`. An older or standalone server leaves the seeds as they are and discovery stops. |
+| `refreshInterval(Duration)` | 60 s | How often discovery re-reads the members. |
+| `ejectErrors(int)` | `3` | Consecutive transport failures (failed dial, I/O error or timeout mid-request, capacity refusal) that eject a member. Statement errors and refused logins do not count. |
+| `ejectLatencyFactor(double)`, `ejectLatencyFloor(Duration)` | `3.0`, 50 ms | A member whose round-trip average is above factor × the other members' median **and** more than the floor above it is ejected (after 10 samples on it and on another member). Factor `0` disables. |
+| `ejectBackoff(Duration)`, `ejectBackoffMax(Duration)` | 5 s, 60 s | How long an ejection lasts, doubling per repeat up to the maximum (a member healthy that long after re-admission starts over). Afterwards the pool's background thread probes the member and re-admits it. The last usable member is never ejected. |
+| `readYourWrites(Duration)` | zero (off) | How long after a write checkouts with the same affinity key go to the member that took the write. |
+
+The constructors are `new Pool(dsn)`, `new Pool(dsn, maxsize)`,
+`new Pool(dsn, PoolOptions)`, `new Pool(ConnectOptions)` and
+`new Pool(ConnectOptions, PoolOptions)`.
+
+**Read-your-writes.** The member that coordinated a write reads it back at
+any consistency, `ONE` included; another member may not have applied it yet.
+With `readYourWrites` set, pass an affinity key — a user or session id —
+when you check out:
+
+```java
+pool.withConnection(userId, c ->
+    c.prepare("INSERT INTO notes (id, owner, body) VALUES (?, ?, ?)")
+        .setLong(1, noteId).setString(2, userId).setString(3, body).executeUpdate());
+// ... the next request for the same user, within the window, goes to the same member:
+String body = pool.withConnection(userId, c -> {
+    Skaidb.ResultSet rs = c.prepare("SELECT body FROM notes WHERE id = ?").setLong(1, noteId).executeQuery();
+    return rs.next() ? rs.getString("body") : null;
+});
+```
+
+`acquire(key)` is the manual form. Checkouts without a key share one
+pool-wide key, so with constant writes everything follows the latest writer
+— pass a key when you balance. A statement is a write unless it starts with
+`SELECT`, `SHOW`, `EXPLAIN`, `DESCRIBE`, `DESC`, `VALUES`, `WITH` or `USE`.
+
+**Watching it.** `pool.members()` returns one `Skaidb.Pool.Member` snapshot
+per member, with public fields `endpoint` (what the pool dials),
+`canonical` (the member's own name, once discovered), `state` (`ready`,
+`ejected`, `resyncing`, `unreachable` or `unlisted`), `latencyMs` (the
+round-trip average, `null` until measured), `inUse`, `idle` and `seed`.
+Ejections and re-admissions are logged at WARNING on the `com.skaidb.pool`
+`System.Logger` (java.util.logging unless you route it elsewhere). The rules
+are the same in every skaidb driver
+([PROTOCOL.md §6.1](https://skaidb.org/docs/PROTOCOL.html#61-balancing-a-pool-across-members)).
+The JDBC `SkaidbDataSource` leaves pooling to HikariCP and the like, which
+place connections on random members; see [docs/JDBC.md](docs/JDBC.md#connection-pools).
 
 ## Change streams (`subscribe`)
 
@@ -513,7 +584,7 @@ It is one class; branch on the message if you must:
 | Situation | Message starts with | Connection afterwards |
 |-----------|---------------------|-----------------------|
 | DSN malformed | `bad DSN:`, `DSN scheme must be skaidb://`, `DSN has no host`, `bad consistency` | never opened |
-| No seed reachable | `no reachable endpoint in ...` | never opened |
+| No seed reachable (a seed refusing for capacity counts as unreachable) | `no reachable endpoint in ...` | never opened |
 | Wrong credentials | `authentication denied:` | closed |
 | Server signature wrong (MITM) | `server signature mismatch` | closed |
 | Certificate login without a client certificate, or `tls_client_cert` without `tls_client_key` | `certificate authentication needs TLS with a client certificate`, `tls_client_cert and tls_client_key go together` | never opened |
@@ -590,7 +661,9 @@ reference, including the type mapping and the metadata sources, is
   `Query.setConsistency` from shared connections.
 - A `RowStream` is not thread-safe: one stream, one reader. It may be
   closed from another thread.
-- `Pool` is thread-safe.
+- `Pool` is thread-safe. Its probe and discovery refresh run on one daemon
+  thread per pool (`skaidb-pool`), started on first need and stopped by
+  `close()`; it never keeps the JVM alive.
 - `subscribe` blocks its calling thread.
 
 ## Versions and compatibility
@@ -607,6 +680,9 @@ reference, including the type mapping and the metadata sources, is
   (`stream`) and Hello need a server that knows those opcodes; on an older
   one `stream` throws `server does not support streaming` and the Hello
   reply is ignored.
+- Pool discovery (`PoolOptions.discover(true)`) uses `SHOW ENDPOINTS`,
+  server ≥ 0.327; an older server answers it with an error and the pool
+  keeps its seeds.
 - Certificate login (`auth_mechanism=certificate`) needs a server that
   knows the EXTERNAL mechanism and has `auth.x509_enabled`; an older server
   closes the connection at the handshake.
@@ -627,7 +703,9 @@ wire spec, DSN parsing, `ResultSet`), `FakeServerTest` runs an in-process
 fake speaking just enough of the protocol to exercise the SCRAM handshake,
 the Hello frame, prepared statements, batches, multiple result sets,
 streaming, the abandon/drain rule, reconnection and the pool,
-`ConformanceTest` runs the shared conformance suite (below),
+`LoadBalancingTest` drives the pool's balancing (policies, idle order,
+ejection and re-admission, discovery, read-your-writes) against fake
+members that each serve many connections, `ConformanceTest` runs the shared conformance suite (below),
 `CertificateAuthTest` runs certificate login against a real TLS listener
 that requires a client certificate (a throwaway test CA lives in
 `src/test/resources/tls`), and `JdbcTest` drives the JDBC layer through
