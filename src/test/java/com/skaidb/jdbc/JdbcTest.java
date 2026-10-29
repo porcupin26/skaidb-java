@@ -322,6 +322,112 @@ class JdbcTest {
         finish(failing);
     }
 
+    @Test
+    void fetchSizeStreamsAPreparedQueryWithItsParameters() throws Exception {
+        ConformanceServer server = vectorCase("stream_params");
+        try (Connection c = DriverManager.getConnection(url(server, "?fetch_size=100"), creds());
+             PreparedStatement ps = c.prepareStatement(
+                 "SELECT id, name FROM t WHERE a = ? AND b = ? AND c = ? AND d = ? AND e = ? AND f = ?")) {
+            ps.setInt(1, 7);
+            ps.setString(2, "o'neil");
+            ps.setDouble(3, 2.5);
+            ps.setBoolean(4, true);
+            ps.setNull(5, Types.VARCHAR);
+            ps.setBytes(6, new byte[] { (byte) 0xde, (byte) 0xad });
+            List<String> seen = new ArrayList<>();
+            try (ResultSet rs = ps.executeQuery()) {
+                assertThrows(SQLFeatureNotSupportedException.class, rs::isLast, "a streamed result set");
+                while (rs.next()) seen.add(rs.getLong("id") + "=" + rs.getString("name"));
+            }
+            assertEquals(List.of("1=a", "2=null", "3=c"), seen);
+        }
+        finish(server);
+        assertEquals(1, server.requests().size(), "one OP_QUERY_STREAM_PARAMS, no prepare");
+    }
+
+    @Test
+    void parameterisedStatementsStreamOnlyWhereTheyCan() throws Exception {
+        String insert = "INSERT INTO t (id) VALUES (?)";
+        String select = "SELECT id FROM t WHERE id > ?";
+
+        // A write keeps the prepared path (its statement id is reused); a query streams.
+        ConformanceServer current = new ConformanceServer("ok", List.of(
+            ex(ConformanceServer.prepareRequest(insert), ConformanceServer.preparedResponse(2, 1)),
+            ex(ConformanceServer.executeRequest(2, QUORUM, 1L), ConformanceServer.mutationResponse(1)),
+            ex(ConformanceServer.streamRequest(select, QUORUM, 6L), ConformanceServer.rowsHeaderResponse("id"),
+                ConformanceServer.rowsChunkResponse(new Object[] { 7L }), ConformanceServer.rowsEndResponse())));
+        try (Connection c = DriverManager.getConnection(url(current, "?fetch_size=10"), creds());
+             PreparedStatement w = c.prepareStatement(insert);
+             PreparedStatement r = c.prepareStatement(select)) {
+            w.setLong(1, 1);
+            assertEquals(1, w.executeUpdate());
+            r.setLong(1, 6);
+            try (ResultSet rs = r.executeQuery()) {
+                assertTrue(rs.next());
+                assertEquals(7, rs.getLong(1));
+                assertFalse(rs.next());
+            }
+        }
+        finish(current);
+
+        // A server older than 0.330 refuses the opcode: the query runs prepared,
+        // and the refusal is remembered, so the next execution goes straight there.
+        ConformanceServer old = new ConformanceServer("ok", List.of(
+            ex(ConformanceServer.streamRequest(select, QUORUM, 6L),
+                ConformanceServer.errorResponse("protocol error: malformed message: unknown opcode")),
+            ex(ConformanceServer.prepareRequest(select), ConformanceServer.preparedResponse(4, 1)),
+            ex(ConformanceServer.executeRequest(4, QUORUM, 6L),
+                ConformanceServer.rowsResponse(new String[] { "id" }, new Object[] { 7L })),
+            ex(ConformanceServer.executeRequest(4, QUORUM, 7L),
+                ConformanceServer.rowsResponse(new String[] { "id" }, new Object[] { 8L }))));
+        try (Connection c = DriverManager.getConnection(url(old, "?fetch_size=10"), creds());
+             PreparedStatement r = c.prepareStatement(select)) {
+            for (long id = 6; id <= 7; id++) {
+                r.setLong(1, id);
+                try (ResultSet rs = r.executeQuery()) {
+                    assertTrue(rs.next());
+                    assertEquals(id + 1, rs.getLong(1));
+                    assertTrue(rs.isLast(), "materialised");
+                }
+            }
+        }
+        finish(old);
+
+        // A placeholder the server's grammar refuses: as with a prepared
+        // statement, client-side binding still serves it — and this
+        // statement does not try to stream its parameters again.
+        String interval = "SELECT id FROM t WHERE at > now() - INTERVAL ?";
+        byte[] refused = ConformanceServer.errorResponse("parse error: expected an interval literal");
+        ConformanceServer parse = new ConformanceServer("ok", List.of(
+            ex(ConformanceServer.streamRequest(interval, QUORUM, "1 day"), refused),
+            ex(ConformanceServer.prepareRequest(interval), refused),
+            query("SELECT id FROM t WHERE at > now() - INTERVAL '1 day'",
+                ConformanceServer.rowsResponse(new String[] { "id" }, new Object[] { 9L })),
+            ex(ConformanceServer.prepareRequest(interval), refused),
+            query("SELECT id FROM t WHERE at > now() - INTERVAL '2 days'",
+                ConformanceServer.rowsResponse(new String[] { "id" }, new Object[] { 10L }))));
+        try (Connection c = DriverManager.getConnection(url(parse, "?fetch_size=10"), creds());
+             PreparedStatement r = c.prepareStatement(interval)) {
+            long want = 9;
+            for (String ago : new String[] { "1 day", "2 days" }) {
+                r.setString(1, ago);
+                try (ResultSet rs = r.executeQuery()) {
+                    assertTrue(rs.next());
+                    assertEquals(want++, rs.getLong(1));
+                }
+            }
+        }
+        finish(parse);
+
+        assertTrue(SkaidbPreparedStatement.isQuery("SELECT 1"));
+        assertTrue(SkaidbPreparedStatement.isQuery("  /* why */ (select a FROM t) UNION (SELECT b FROM u)"));
+        assertTrue(SkaidbPreparedStatement.isQuery("-- recent\nWITH r AS (SELECT 1) SELECT * FROM r"));
+        assertFalse(SkaidbPreparedStatement.isQuery("INSERT INTO t (id) VALUES (?)"));
+        assertFalse(SkaidbPreparedStatement.isQuery("CALL p(?)"));
+        assertFalse(SkaidbPreparedStatement.isQuery("SELECTED"));
+        assertFalse(SkaidbPreparedStatement.isQuery(""));
+    }
+
     // ---- errors -------------------------------------------------------------------------
 
     @Test

@@ -33,7 +33,7 @@ final class JdbcUrl {
         KEYS.put("auth_mechanism", "scram (default) or certificate");
         KEYS.put("transaction", "Statement that opens a transaction when autoCommit is false: begin (default, standalone server) or atomic (BEGIN ATOMIC, cluster)");
         KEYS.put("read_timeout", "Milliseconds a read may block before the statement fails (0 = none, the default)");
-        KEYS.put("fetch_size", "Default Statement fetch size: > 0 streams SELECTs from plain Statements (default 0 = materialise)");
+        KEYS.put("fetch_size", "Default Statement fetch size: > 0 streams result sets (default 0 = materialise)");
     }
 
     final Skaidb.ConnectOptions options;

@@ -277,6 +277,44 @@ public final class ConformanceServer implements AutoCloseable {
         return b.toBytes();
     }
 
+    /**
+     * A streaming request (§3.4): {@code OP_QUERY_STREAM} without parameters,
+     * {@code OP_QUERY_STREAM_PARAMS} with these Java values.
+     */
+    public static byte[] streamRequest(String sql, int level, Object... params) {
+        byte[] body = sql.getBytes(StandardCharsets.UTF_8);
+        if (params.length == 0) return new Skaidb.Buf().u8(5).u8(level).u32(body.length).raw(body).toBytes();
+        Skaidb.Buf b = new Skaidb.Buf().u8(9).u8(level).u32(body.length).raw(body).u16(params.length);
+        for (Object p : params) {
+            byte[] v = Skaidb.encodeValue(p);
+            b.u32(v.length).raw(v);
+        }
+        return b.toBytes();
+    }
+
+    /** A RowsHeader response: a stream's columns. */
+    public static byte[] rowsHeaderResponse(String... cols) {
+        Skaidb.Buf b = new Skaidb.Buf().u8(5).u32(cols.length);
+        for (String c : cols) b.str(c);
+        return b.toBytes();
+    }
+
+    /** A RowsChunk response with these Java values. */
+    public static byte[] rowsChunkResponse(Object[]... rows) {
+        Skaidb.Buf b = new Skaidb.Buf().u8(6).u32(rows.length);
+        for (Object[] row : rows) {
+            b.u32(row.length);
+            for (Object v : row) {
+                byte[] enc = Skaidb.encodeValue(v);
+                b.u32(enc.length).raw(enc);
+            }
+        }
+        return b.toBytes();
+    }
+
+    /** A RowsEnd response. */
+    public static byte[] rowsEndResponse() { return new byte[] { 7 }; }
+
     /** A Prepared response. */
     public static byte[] preparedResponse(int stmtId, int nparams) {
         return new Skaidb.Buf().u8(4).u32(stmtId).u16(nparams).toBytes();

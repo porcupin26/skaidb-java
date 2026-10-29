@@ -51,7 +51,7 @@ public final class Skaidb {
      */
     public static final String VERSION = detectVersion();
 
-    private static final String FALLBACK_VERSION = "1.2.0";
+    private static final String FALLBACK_VERSION = "1.3.0";
 
     private static String detectVersion() {
         try {
@@ -765,26 +765,63 @@ public final class Skaidb {
 
         /**
          * Stream a result set: rows arrive a chunk at a time instead of the
+         * whole set being materialised. For exports and large scans. The
+         * same as {@link #stream(String, Object...)} with no parameters.
+         */
+        public RowStream stream(String sql) {
+            return stream(sql, (Object[]) null);
+        }
+
+        /**
+         * Stream a result set: rows arrive a chunk at a time instead of the
          * whole set being materialised. For exports and large scans.
          *
-         * <pre>try (Skaidb.RowStream s = conn.stream("SELECT ...")) {
+         * <pre>{@code
+         * try (Skaidb.RowStream s = conn.stream(
+         *         "SELECT id, ts FROM events WHERE ts >= ? AND kind = ?", since, "click")) {
          *     while (s.next()) System.out.println(s.getObject(0));
+         * }
          * }</pre>
          *
-         * The connection is busy for the whole stream: any other statement on
+         * <p>{@code params} bind the statement's {@code ?} placeholders in
+         * order, typed: any value {@link Query#setObject} takes. They travel
+         * with the statement in {@code OP_QUERY_STREAM_PARAMS}, which needs a
+         * server ≥ 0.330 (an older one is refused with {@code server does not
+         * support parameterised streaming}), and bind exactly as a prepared
+         * statement's do, so the statement must be a kind the server prepares
+         * (not DDL or a session statement). Without parameters the request is
+         * {@code OP_QUERY_STREAM}, which every server knows. An {@code
+         * Object[]} passed alone is the parameter list; bind an array value
+         * as a {@code List}.
+         *
+         * <p>The connection is busy for the whole stream: any other statement on
          * it throws until the stream ends or is closed, and {@link #isUsable}
          * reports false so a {@link Pool} will not lend it out meanwhile.
          * Always close the stream (try-with-resources above) — Java collects
-         * the object but cannot drain the socket for you. Takes no parameters
-         * — the opcode carries SQL text.
+         * the object but cannot drain the socket for you.
          */
-        public synchronized RowStream stream(String sql) {
+        public synchronized RowStream stream(String sql, Object... params) {
             if (closed) throw new SkaidbException("connection is closed");
             requireIdle();
-            ensureLive();
+            boolean bound = params != null && params.length > 0;
+            if (bound && params.length > 0xffff)
+                throw new SkaidbException("too many parameters: " + params.length + " (at most 65535)");
             byte[] body = sql.getBytes(StandardCharsets.UTF_8);
             Buf req = new Buf();
-            req.u8(5).u8(consistency).u32(body.length).raw(body);
+            if (bound) {
+                // OP_QUERY_STREAM_PARAMS: the SQL, then the parameter vector
+                // OP_EXECUTE carries. Encoded before anything is sent, so a
+                // value that cannot be bound leaves the wire untouched.
+                req.u8(9).u8(consistency).u32(body.length).raw(body).u16(params.length);
+                for (Object p : params) {
+                    byte[] v = encodeValue(p);
+                    req.u32(v.length).raw(v);
+                }
+            } else {
+                // OP_QUERY_STREAM, byte for byte what every server knows.
+                req.u8(5).u8(consistency).u32(body.length).raw(body);
+            }
+            ensureLive();
             try {
                 long started = System.nanoTime();
                 writeFrame(req.toBytes());
@@ -793,8 +830,11 @@ public final class Skaidb {
                 int tag = r.u8();
                 if (tag == 3) {
                     String msg = r.text();
-                    throw new SkaidbException(msg.contains("unknown opcode")
-                        ? "server does not support streaming: " + msg : msg);
+                    if (msg.contains("unknown opcode")) {
+                        throw new SkaidbException("server does not support "
+                            + (bound ? "parameterised streaming (skaidb >= 0.330)" : "streaming") + ": " + msg);
+                    }
+                    throw new SkaidbException(msg);
                 }
                 if (tag != 1 && tag != 2 && tag != 5) {
                     // The server answered a stream request with something a
@@ -1028,9 +1068,10 @@ public final class Skaidb {
 
     /**
      * A streamed result set: holds one chunk, not the whole result. Obtained
-     * from {@link Connection#stream(String)}, which it owns until the last
-     * frame is read or {@link #close} runs — no other statement may use that
-     * connection meanwhile. Not thread-safe: one stream, one reader.
+     * from {@link Connection#stream(String, Object...)}; it owns the
+     * connection until the last frame is read or {@link #close} runs — no
+     * other statement may use that connection meanwhile. Not thread-safe:
+     * one stream, one reader.
      */
     public static final class RowStream implements AutoCloseable {
         /**

@@ -4,6 +4,31 @@ All notable changes to the skaidb Java driver. The driver has its own
 version series, independent of the skaidb server; see the README's
 compatibility section for which server versions each release speaks to.
 
+## 1.3.0 (2026-10-29)
+
+Streaming with bound parameters.
+
+- **Parameterised streaming**: `conn.stream(sql, params...)` binds `?`
+  placeholders, typed, exactly as a prepared `Query` does, over
+  `OP_QUERY_STREAM_PARAMS` (server ≥ 0.330) — a range-bounded export no
+  longer needs its literals interpolated into the SQL. Without parameters
+  the request is the original `OP_QUERY_STREAM`, so a parameterless stream
+  works against every server; an older server refuses a parameterised one
+  with `server does not support parameterised streaming (skaidb >= 0.330):
+  ...` and the connection stays usable. `stream(String)` keeps its
+  signature, so code compiled against 1.2.0 links unchanged; an `Object[]`
+  passed alone is the parameter list. There is deliberately no
+  `stream(String, int)` overload: it would read `stream(sql, 7)` as a
+  consistency level, so a stream keeps running at the connection's level.
+- JDBC: with a fetch size above zero, a `PreparedStatement` query (`SELECT`
+  or `WITH`) with parameters is streamed too, its parameters travelling with
+  it. Against a server older than 0.330 (remembered per connection until it
+  re-dials), or where the server's grammar takes no placeholder, it runs
+  prepared as before; other statements with parameters keep the prepared
+  path, which reuses the statement id.
+- The vendored conformance suite gains `stream_params`; `ConformanceTest`
+  passes `call.params` to `Connection.stream`.
+
 ## 1.2.0 (2026-10-25)
 
 Connection-pool load balancing across the cluster's members.

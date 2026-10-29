@@ -50,6 +50,12 @@ public final class SkaidbConnection implements Connection {
     private int holdability = ResultSet.HOLD_CURSORS_OVER_COMMIT;
     private final Properties clientInfo = new Properties();
     private SQLWarning warnings;
+    /**
+     * {@code conn.reconnects()} when the server refused a parameterised
+     * stream (older than 0.330), else -1. A re-dial may reach another
+     * member, so the refusal holds until the next one.
+     */
+    private long paramStreamsRefusedAt = -1;
 
     SkaidbConnection(Skaidb.Connection conn, JdbcUrl cfg, String url) {
         this.conn = conn;
@@ -120,6 +126,21 @@ public final class SkaidbConnection implements Connection {
     }
 
     Skaidb.Connection nativeConnection() { return conn; }
+
+    /** True while the server is known to refuse parameterised streams (see {@link #noteParameterStreamRefusal}). */
+    boolean refusesParameterStreams() { return paramStreamsRefusedAt == conn.reconnects(); }
+
+    /**
+     * Whether {@code e} is the server refusing a parameterised stream
+     * because it is older than 0.330 — it did not run the statement. If so,
+     * that is remembered until the next re-dial.
+     */
+    boolean noteParameterStreamRefusal(SQLException e) {
+        String m = e.getMessage() == null ? "" : e.getMessage();
+        if (!m.startsWith("server does not support parameterised streaming")) return false;
+        paramStreamsRefusedAt = conn.reconnects();
+        return true;
+    }
 
     // ---- statements ----------------------------------------------------------
 

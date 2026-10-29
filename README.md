@@ -51,7 +51,7 @@ The artifact is published through [JitPack](https://jitpack.io/#porcupin26/skaid
 which builds it from the git tag on first request. Coordinates:
 
 ```
-com.github.porcupin26:skaidb-java:v1.2.0
+com.github.porcupin26:skaidb-java:v1.3.0
 ```
 
 > **Note:** `v1.0.0` is not resolvable through JitPack — its first build
@@ -76,7 +76,7 @@ GPG-signed artifacts, which this project does not have yet).
   <dependency>
     <groupId>com.github.porcupin26</groupId>
     <artifactId>skaidb-java</artifactId>
-    <version>v1.2.0</version>
+    <version>v1.3.0</version>
   </dependency>
 </dependencies>
 ```
@@ -90,7 +90,7 @@ repositories {
 }
 
 dependencies {
-    implementation("com.github.porcupin26:skaidb-java:v1.2.0")
+    implementation("com.github.porcupin26:skaidb-java:v1.3.0")
 }
 ```
 
@@ -103,7 +103,7 @@ repositories {
 }
 
 dependencies {
-    implementation 'com.github.porcupin26:skaidb-java:v1.2.0'
+    implementation 'com.github.porcupin26:skaidb-java:v1.3.0'
 }
 ```
 
@@ -271,7 +271,7 @@ Every statement auto-commits unless you open a transaction (see
 | `conn.query(sql)` | A `SELECT` (or `CALL`) with no parameters. | `ResultSet` |
 | `conn.executeRaw(sql)` | Any statement, SQL sent verbatim (`?` is not a placeholder). | `Result` |
 | `conn.prepare(sql)` | A statement with `?` placeholders. | `Query` |
-| `conn.stream(sql)` | A large `SELECT`, read a chunk at a time. Takes no parameters. | `RowStream` |
+| `conn.stream(sql, params...)` | A large `SELECT`, read a chunk at a time; `?` placeholders bind the values after the SQL. | `RowStream` |
 
 `Query` binds parameters JDBC-style — `?` placeholders, **1-based**
 setters, chainable:
@@ -353,10 +353,12 @@ do {
 
 ## Streaming large results
 
-`conn.stream(sql)` returns a `Skaidb.RowStream`: the server sends the result
-in chunks (about 256 KB each) and the driver holds one chunk at a time, so
-a table of any size can be exported without materialising it — and without
-hitting the server's scan budgets for one-shot queries.
+`conn.stream(sql, params...)` returns a `Skaidb.RowStream`: the server sends
+the result in chunks (about 256 KB each) and the driver holds one chunk at a
+time, so a table of any size can be exported without materialising it. The
+server executes a plain `SELECT` page by page, and no scan budget applies to
+a streamed page (server ≥ 0.330; `EXPLAIN` says whether a statement pages —
+see [Streamed queries](https://skaidb.org/docs/query_syntax.html#streamed-queries-what-pages-server-side)).
 
 ```java
 try (Skaidb.RowStream s = conn.stream("SELECT id, name FROM events")) {
@@ -369,11 +371,31 @@ try (Skaidb.RowStream s = conn.stream("SELECT id, name FROM events")) {
 ```
 
 `RowStream.getObject(int)` is **0-based** (unlike `ResultSet`), and values
-come back as the raw mapped objects — there are no typed getters. A stream
-takes no parameters; build the SQL text yourself or use a prepared `Query`
-for a non-streamed result. A statement that returns no rows yields a stream
-with no columns: `getAffected()` is then its affected-row count (`-1` for
-DDL).
+come back as the raw mapped objects — there are no typed getters. A
+statement that returns no rows yields a stream with no columns:
+`getAffected()` is then its affected-row count (`-1` for DDL). The stream
+runs at the connection's consistency (`conn.setConsistency`).
+
+### Parameters
+
+The values after the SQL bind its `?` placeholders in order, typed — any
+value `Query.setObject` takes (see [Type mapping](#type-mapping)):
+
+```java
+try (Skaidb.RowStream s = conn.stream(
+        "SELECT id, who FROM events WHERE at >= ? AND who = ?", since, "ada")) {
+    while (s.next()) { /* ... */ }
+}
+```
+
+They travel with the statement in `OP_QUERY_STREAM_PARAMS`, which needs a
+server ≥ 0.330: an older one refuses it with `server does not support
+parameterised streaming (skaidb >= 0.330): ...`, and the connection stays
+usable. A stream without parameters sends the original `OP_QUERY_STREAM`
+and works against every server. The values bind exactly as a prepared
+statement's do, so the statement must be a kind the server prepares — not
+DDL or a session statement such as `USE`. An `Object[]` passed on its own is
+the parameter list; bind an array value as a `List`.
 
 ### The abandon/drain rule
 
@@ -600,6 +622,7 @@ It is one class; branch on the message if you must:
 | Parameter misuse | `parameter index ... out of range`, `statement expects N parameters`, `cannot bind ...` | usable |
 | A `NULL` read through a typed getter | `column x is NULL` | usable |
 | Another statement while streaming | `connection is busy streaming` | usable once the stream ends |
+| A stream with parameters on a server older than 0.330 | `server does not support parameterised streaming (skaidb >= 0.330):` | usable |
 | Transport failure mid-statement | `query failed:`, `stream read failed:`, `prepare failed:` | **broken**: re-dials on the next statement |
 | Used after `close()` | `connection is closed` | closed |
 
@@ -650,7 +673,8 @@ or `cfg.setDataSourceClassName("com.skaidb.jdbc.SkaidbDataSource")` with
 `url` / `user` / `password` data-source properties.
 
 Result sets are forward-only and read-only; a fetch size above zero streams
-them. `setAutoCommit(false)` opens a transaction (`BEGIN`, or `BEGIN ATOMIC`
+them, a `PreparedStatement` query's parameters included (server ≥ 0.330).
+`setAutoCommit(false)` opens a transaction (`BEGIN`, or `BEGIN ATOMIC`
 with `transaction=atomic` on a cluster). Errors are `SQLException`
 subclasses with SQLStates (`23505` for a unique violation, `42P01` for an
 unknown table, `28000` for a refused login, ...). Features skaidb or the
@@ -686,6 +710,10 @@ reference, including the type mapping and the metadata sources, is
   (`stream`) and Hello need a server that knows those opcodes; on an older
   one `stream` throws `server does not support streaming` and the Hello
   reply is ignored.
+- A stream with parameters (`stream(sql, params...)`) needs server ≥ 0.330;
+  an older one is refused with `server does not support parameterised
+  streaming`. A JDBC `PreparedStatement` with a fetch size runs prepared
+  there instead, its result in one frame.
 - Pool discovery (`PoolOptions.discover(true)`) uses `SHOW ENDPOINTS`,
   server ≥ 0.327; an older server answers it with an error and the pool
   keeps its seeds.
@@ -737,8 +765,9 @@ its contract. `ConformanceTest` runs all of it:
   HMAC) replays the reference responses, and every case runs through the
   public API — `query` and `execute_prepared` via `Query.execute()`,
   `execute_batch` via `Query.executeBatch`, `query_stream` via
-  `Connection.stream`, `sequence` on one connection — while the fake checks
-  each request byte for byte;
+  `Connection.stream` (with `call.params`, its parameterised form),
+  `sequence` on one connection — while the fake checks each request byte
+  for byte;
 - the auth outcomes: a correct server signature connects, a wrong one fails
   the connect, and a denial fails it with the server's reason.
 

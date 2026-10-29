@@ -32,6 +32,13 @@ import java.util.List;
  * {@link #executeBatch()} sends every row in ONE {@code OP_EXECUTE_BATCH}
  * round trip. Statement kinds the server will not prepare (DDL, {@code USE})
  * fall back to client-side literal binding.
+ *
+ * <p>With a fetch size above zero a statement without parameters is
+ * streamed ({@code OP_QUERY_STREAM}), and so is a query ({@code SELECT} or
+ * {@code WITH}) with parameters, which travel typed with it ({@code
+ * OP_QUERY_STREAM_PARAMS}, server ≥ 0.330). Against an older server, and
+ * for every other statement with parameters, it runs prepared as without a
+ * fetch size.
  */
 public final class SkaidbPreparedStatement extends SkaidbStatement implements PreparedStatement {
     private final String sql;
@@ -39,6 +46,11 @@ public final class SkaidbPreparedStatement extends SkaidbStatement implements Pr
     private final Object[] params;
     private final boolean[] set;
     private final List<Object[]> rows = new ArrayList<>();
+    /**
+     * A SELECT or WITH: with a fetch size its parameters stream along, until
+     * the server cannot parse it with its placeholders.
+     */
+    private boolean streamsParameters;
 
     SkaidbPreparedStatement(SkaidbConnection conn, String sql) throws SQLException {
         super(conn);
@@ -51,6 +63,37 @@ public final class SkaidbPreparedStatement extends SkaidbStatement implements Pr
         int n = query.getParameterCount();
         this.params = new Object[n];
         this.set = new boolean[n];
+        this.streamsParameters = isQuery(sql);
+    }
+
+    /**
+     * Whether the first keyword of {@code sql}, after whitespace, comments
+     * and opening parentheses, is {@code SELECT} or {@code WITH}: a
+     * statement whose result a fetch size is about. Other statements with
+     * parameters keep the prepared path, whose statement id is reused
+     * across executions and which binds client-side what the server will
+     * not prepare.
+     */
+    static boolean isQuery(String sql) {
+        int i = 0, n = sql.length();
+        while (i < n) {
+            char ch = sql.charAt(i);
+            if (Character.isWhitespace(ch) || ch == '(') {
+                i++;
+            } else if (sql.startsWith("--", i)) {
+                int j = sql.indexOf('\n', i);
+                i = j < 0 ? n : j + 1;
+            } else if (sql.startsWith("/*", i)) {
+                int j = sql.indexOf("*/", i + 2);
+                i = j < 0 ? n : j + 2;
+            } else {
+                break;
+            }
+        }
+        int j = i;
+        while (j < n && (Character.isLetter(sql.charAt(j)) || sql.charAt(j) == '_')) j++;
+        String word = sql.substring(i, j).toLowerCase(java.util.Locale.ROOT);
+        return word.equals("select") || word.equals("with");
     }
 
     private void bind(int index, Object nativeValue) throws SQLException {
@@ -76,9 +119,22 @@ public final class SkaidbPreparedStatement extends SkaidbStatement implements Pr
         Object[] row = boundRow();
         resetResults();
         conn.beforeStatement();
-        if (fetchSize > 0 && params.length == 0) {
+        if (fetchSize > 0) {
             Skaidb.Connection c = conn.nativeConnection();
-            return acceptStream(call(() -> c.stream(sql)));
+            if (row.length == 0) return acceptStream(call(() -> c.stream(sql)));
+            if (streamsParameters && !conn.refusesParameterStreams()) {
+                try {
+                    return acceptStream(call(() -> c.stream(sql, row)));
+                } catch (SQLException e) {
+                    // Refused before it ran — by a grammar that takes no
+                    // placeholder where one of this statement's sits (the
+                    // client-side binding below may still serve it), or by a
+                    // server older than 0.330 (remembered on the connection):
+                    // run it prepared, below, as without a fetch size.
+                    if ("42601".equals(e.getSQLState())) streamsParameters = false;
+                    else if (!conn.noteParameterStreamRefusal(e)) throw e;
+                }
+            }
         }
         return accept(call(() -> {
             for (int i = 0; i < row.length; i++) query.setObject(i + 1, row[i]);

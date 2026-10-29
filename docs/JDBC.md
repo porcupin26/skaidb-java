@@ -139,13 +139,18 @@ Forward-only and read-only (`TYPE_FORWARD_ONLY`, `CONCUR_READ_ONLY`,
 match wins.
 
 By default the whole result arrives in one frame. With a fetch size above
-zero (`Statement.setFetchSize`, or `fetch_size` in the URL) a `Statement` —
-or a `PreparedStatement` without parameters — is **streamed**: rows arrive a
-chunk at a time, so a table of any size can be read without materialising
-it and without the server's one-shot scan budgets. While a streamed result
-set is open it owns the connection: other statements on that connection fail
-with SQLState `HY010` until it is read to the end or closed (closing reads
-and discards the rest).
+zero (`Statement.setFetchSize`, or `fetch_size` in the URL) a `Statement` or
+a `PreparedStatement` without parameters is **streamed**, and so is a
+`PreparedStatement` query (`SELECT`, or `WITH ...`) with parameters, which
+travel typed with it (`OP_QUERY_STREAM_PARAMS`, server ≥ 0.330): rows arrive
+a chunk at a time, so a table of any size can be read without materialising
+it. The server executes a plain `SELECT` page by page, and no scan budget
+applies to a streamed page (server ≥ 0.330). Other statements with
+parameters, and every one against an older server, run prepared as without
+a fetch size, their result in one frame. While a streamed result set is open
+it owns the connection: other statements on that connection fail with
+SQLState `HY010` until it is read to the end or closed (closing reads and
+discards the rest).
 
 `getObject(i)` returns:
 

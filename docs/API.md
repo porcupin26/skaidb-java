@@ -8,7 +8,7 @@ is described in [JDBC.md](JDBC.md).
 ## `Skaidb`
 
 ```java
-public static final String VERSION;                  // the driver version, e.g. "1.2.0"
+public static final String VERSION;                  // the driver version, e.g. "1.3.0"
 public static String version();                      // same, as a method
 
 public static final int CONSISTENCY_ONE    = 0;
@@ -79,6 +79,7 @@ public long       execute(String sql);                // affected rows, or -1 fo
 public ResultSet  query(String sql);                  // a SELECT/CALL with no parameters
 public Result     executeRaw(String sql);             // SQL verbatim ('?' is not a placeholder); any answer
 public RowStream  stream(String sql);                 // chunked result; owns the connection until done
+public RowStream  stream(String sql, Object... params); // the same, '?' bound to params (server >= 0.330)
 public void       subscribe(String stream, String after, EventHandler handler);
 public boolean    isUsable();                         // !closed && !broken && !streaming
 public long       reconnects();                       // re-dials so far (session state does not survive one)
@@ -98,6 +99,16 @@ Semantics:
   `server does not support streaming` on a server without the opcode. A
   non-row statement passed to `stream` executes normally and yields a
   stream with no columns whose `getAffected()` is the affected count.
+- `stream(sql, params...)` binds the `?` placeholders in order, typed (any
+  value `Query.setObject` takes), and sends them with the SQL in
+  `OP_QUERY_STREAM_PARAMS`, server ≥ 0.330; an older server answers
+  `server does not support parameterised streaming (skaidb >= 0.330): ...`
+  and the connection stays usable. Without parameters (`stream(sql)`, an
+  empty or `null` array) the request is `OP_QUERY_STREAM`. The statement
+  must be a kind the server prepares (not DDL or a session statement). An
+  `Object[]` passed alone is the parameter list; a `List` binds as one
+  array value. A value that cannot be bound throws before anything is
+  sent. A stream runs at the connection's consistency level.
 - A read that exceeds `setReadTimeout` throws and marks the connection
   broken, like any transport error.
 - A transport error marks the connection broken; the next statement
@@ -275,5 +286,5 @@ The driver implements the skaidb binary protocol on port 7000: framing,
 SCRAM-SHA-256 handshake (with mutual verification when a password is set),
 the EXTERNAL (TLS client certificate) handshake,
 `OP_QUERY` (1), prepare/execute (2–4), streaming (5–7), batch (7), Hello
-(8) and the `ResultSets` reply (8). The specification is published at
-<https://skaidb.org/docs/PROTOCOL.html>.
+(8), streaming with parameters (9) and the `ResultSets` reply (8). The
+specification is published at <https://skaidb.org/docs/PROTOCOL.html>.

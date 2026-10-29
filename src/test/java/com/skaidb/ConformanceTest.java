@@ -176,7 +176,13 @@ class ConformanceTest {
                     return tag("affected", Long.toString(n));
                 }
                 case "query_stream": {
-                    try (Skaidb.RowStream s = conn.stream((String) call.get("sql"))) {
+                    // call.params (tagged, as execute_prepared's) select the
+                    // parameterised form; an empty list must keep the original
+                    // request, which the parameterless cases check byte for byte.
+                    List<Object> ps = call.containsKey("params") ? Json.arr(call.get("params")) : List.of();
+                    Object[] params = new Object[ps.size()];
+                    for (int i = 0; i < params.length; i++) params[i] = nativeValue(ps.get(i));
+                    try (Skaidb.RowStream s = conn.stream((String) call.get("sql"), params)) {
                         String[] cols = s.getColumnNames();
                         if (cols.length == 0) {
                             return s.getAffected() >= 0 ? tag("affected", Long.toString(s.getAffected()))
