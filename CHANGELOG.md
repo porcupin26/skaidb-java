@@ -4,6 +4,25 @@ All notable changes to the skaidb Java driver. The driver has its own
 version series, independent of the skaidb server; see the README's
 compatibility section for which server versions each release speaks to.
 
+## 1.4.0 (2026-10-29)
+
+A streamed `CALL` whose procedure body `EMIT`s result sets returns them.
+
+- Fixed: the server answers such a `CALL` with all of its result sets in
+  one `ResultSets` frame (tag 8) even to a stream request, and
+  `conn.stream(...)`, with or without parameters, refused that frame
+  (`unexpected response tag 8 to stream request`) and marked the connection
+  broken. The frame is now decoded by the code the buffered path uses: the
+  stream starts on the first set and the new `RowStream.nextResultSet()`
+  walks the rest, as `ResultSet.nextResultSet()` does. The exchange is
+  already over, so the stream owns nothing and the connection stays usable;
+  the new `RowStream.isStreamed()` is `false` for such a one-frame reply.
+- Fixed (JDBC): with a fetch size above zero a `Statement`, or a
+  `PreparedStatement` without parameters, streams every statement, so a
+  `CALL` whose procedure EMITs failed the same way. Its result sets now come
+  back through `getResultSet()` / `getMoreResults()`, materialised, exactly
+  as without a fetch size.
+
 ## 1.3.0 (2026-10-29)
 
 Streaming with bound parameters.

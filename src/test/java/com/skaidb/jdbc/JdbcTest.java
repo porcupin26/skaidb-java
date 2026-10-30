@@ -294,6 +294,65 @@ class JdbcTest {
         finish(server);
     }
 
+    /** Every result set of the last execution as "label:cells|label:cells", walked with getMoreResults. */
+    static String sets(Statement st) throws SQLException {
+        StringBuilder out = new StringBuilder();
+        do {
+            ResultSet rs = st.getResultSet();
+            if (out.length() > 0) out.append('|');
+            out.append(rs.getMetaData().getColumnLabel(1)).append(':');
+            while (rs.next()) out.append(rs.getString(1));
+        } while (st.getMoreResults());
+        return out.toString();
+    }
+
+    @Test
+    void fetchSizeStreamsACallAndItsResultSetsComeBackAsWithout() throws Exception {
+        // A CALL whose body EMITs is answered with ONE ResultSets frame even
+        // to a stream request; with a fetch size the sets must surface just
+        // as the buffered path's do, and the connection stay usable.
+        byte[] twoSets = ConformanceServer.resultSetsResponse(
+            ConformanceServer.rowsResponse(new String[] { "a" }, new Object[] { "x" }, new Object[] { "y" }),
+            ConformanceServer.rowsResponse(new String[] { "b" }, new Object[] { "z" }));
+        ConformanceServer server = new ConformanceServer("ok", List.of(
+            ex(ConformanceServer.streamRequest("CALL report()", QUORUM), twoSets),
+            ex(ConformanceServer.streamRequest("CALL report()", QUORUM), twoSets),
+            ex(ConformanceServer.streamRequest("SELECT 1", QUORUM), ConformanceServer.rowsHeaderResponse("x"),
+                ConformanceServer.rowsChunkResponse(new Object[] { 1L }), ConformanceServer.rowsEndResponse())));
+        try (Connection c = DriverManager.getConnection(url(server, "?fetch_size=10"), creds())) {
+            try (Statement st = c.createStatement()) {
+                assertTrue(st.execute("CALL report()"));
+                ResultSet a = st.getResultSet();
+                assertTrue(a.next());
+                assertEquals("x", a.getString("a"));
+                // Materialised, like every set of a buffered CALL: kept open
+                // past getMoreResults, and it knows its last row.
+                assertTrue(st.getMoreResults(Statement.KEEP_CURRENT_RESULT));
+                assertFalse(a.isClosed());
+                assertTrue(a.next());
+                assertTrue(a.isLast());
+                assertEquals("y", a.getString(1));
+                ResultSet b = st.getResultSet();
+                assertTrue(b.next());
+                assertEquals("z", b.getString("b"));
+                assertFalse(st.getMoreResults());
+                assertEquals(-1, st.getUpdateCount());
+            }
+            // A PreparedStatement without parameters streams the same request.
+            try (PreparedStatement ps = c.prepareStatement("CALL report()")) {
+                assertTrue(ps.execute());
+                assertEquals("a:xy|b:z", sets(ps));
+            }
+            // Nothing was left on the socket: the next statement, streamed
+            // too (the URL's fetch size), reads its own answer.
+            try (Statement st = c.createStatement(); ResultSet rs = st.executeQuery("SELECT 1")) {
+                assertTrue(rs.next());
+                assertEquals(1, rs.getInt(1));
+            }
+        }
+        finish(server);
+    }
+
     @Test
     void fetchSizeStreams() throws Exception {
         ConformanceServer server = vectorCase("stream_rows");

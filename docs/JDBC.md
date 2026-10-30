@@ -124,7 +124,7 @@ and [PROTOCOL.md §6.1](https://skaidb.org/docs/PROTOCOL.html#61-balancing-a-poo
 - `Statement.executeBatch()` runs its statements one after another.
 - DDL reports an update count of 0.
 - A `CALL` whose procedure `EMIT`s several result sets returns them through
-  `getMoreResults()`.
+  `getMoreResults()`, with or without a fetch size.
 - `setQueryTimeout(s)`: a statement that runs longer fails with
   `SQLTimeoutException`; the connection then re-dials, because the server's
   late answer would otherwise be read as the next statement's.
@@ -147,7 +147,10 @@ a chunk at a time, so a table of any size can be read without materialising
 it. The server executes a plain `SELECT` page by page, and no scan budget
 applies to a streamed page (server ≥ 0.330). Other statements with
 parameters, and every one against an older server, run prepared as without
-a fetch size, their result in one frame. While a streamed result set is open
+a fetch size, their result in one frame. A `CALL` whose procedure `EMIT`s
+result sets is answered in one frame even when streamed: its sets come back
+materialised, through `getMoreResults()`, exactly as without a fetch size,
+and it holds nothing. While a streamed result set is open
 it owns the connection: other statements on that connection fail with
 SQLState `HY010` until it is read to the end or closed (closing reads and
 discards the rest).

@@ -209,6 +209,58 @@ class NativeExtrasTest {
         assertNull(server.finish());
     }
 
+    // ---- a streamed CALL whose body EMITs (PROTOCOL.md §3.2) ----
+
+    /** Two result sets in one ResultSets frame: [a: x, y] then [b: z]. */
+    static byte[] twoSets() {
+        return ConformanceServer.resultSetsResponse(
+            ConformanceServer.rowsResponse(new String[] { "a" }, new Object[] { "x" }, new Object[] { "y" }),
+            ConformanceServer.rowsResponse(new String[] { "b" }, new Object[] { "z" }));
+    }
+
+    /** Every set of a stream as "cols:cells|cols:cells", walked with nextResultSet. */
+    static String walk(Skaidb.RowStream s) {
+        StringBuilder out = new StringBuilder();
+        try (s) {
+            do {
+                if (out.length() > 0) out.append('|');
+                out.append(String.join(",", s.getColumnNames())).append(':');
+                while (s.next()) out.append(s.getObject(0));
+            } while (s.nextResultSet());
+        }
+        return out.toString();
+    }
+
+    @Test
+    void aStreamedCallReturnsItsResultSets() throws Exception {
+        int q = Skaidb.CONSISTENCY_QUORUM;
+        ConformanceServer server = new ConformanceServer("ok", List.of(
+            new ConformanceServer.Exchange(ConformanceServer.streamRequest("CALL report(?)", q, 5L), List.of(twoSets())),
+            new ConformanceServer.Exchange(ConformanceServer.streamRequest("CALL report()", q), List.of(twoSets())),
+            q("SELECT 1", ConformanceServer.rowsResponse(new String[] { "x" }, new Object[] { 1L })),
+            stream(ConformanceServer.streamRequest("SELECT 2", q), "x", 2L)));
+        try (Skaidb.Connection c = connect(server)) {
+            // The server answers a CALL whose body EMITted with ONE ResultSets
+            // frame, parameterised stream or not: every set, in order, and the
+            // wire is free at once.
+            Skaidb.RowStream bound = c.stream("CALL report(?)", 5L);
+            assertFalse(bound.isStreamed());
+            assertTrue(c.isUsable(), "the whole reply is in one frame: the stream holds nothing");
+            assertEquals("a:xy|b:z", walk(bound));
+            Skaidb.RowStream plain = c.stream("CALL report()");
+            assertFalse(plain.isStreamed());
+            assertEquals("a:xy|b:z", walk(plain));
+            // The same socket serves the next statement: nothing was left on it.
+            assertEquals(1, c.query("SELECT 1").getRowCount());
+            assertEquals(0, c.reconnects());
+            // A real stream has one set.
+            Skaidb.RowStream rows = c.stream("SELECT 2");
+            assertTrue(rows.isStreamed());
+            assertEquals("x:2", walk(rows));
+        }
+        assertNull(server.finish());
+    }
+
     @Test
     void aRefusedLoginClosesItsSocket() throws Exception {
         AtomicReference<String> seen = new AtomicReference<>();

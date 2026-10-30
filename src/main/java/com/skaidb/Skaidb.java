@@ -51,7 +51,7 @@ public final class Skaidb {
      */
     public static final String VERSION = detectVersion();
 
-    private static final String FALLBACK_VERSION = "1.3.0";
+    private static final String FALLBACK_VERSION = "1.4.0";
 
     private static String detectVersion() {
         try {
@@ -836,7 +836,7 @@ public final class Skaidb {
                     }
                     throw new SkaidbException(msg);
                 }
-                if (tag != 1 && tag != 2 && tag != 5) {
+                if (tag != 1 && tag != 2 && tag != 5 && tag != 8) {
                     // The server answered a stream request with something a
                     // stream cannot start with; whatever follows is not ours
                     // to interpret, so do not reuse this socket.
@@ -848,6 +848,12 @@ public final class Skaidb {
                 // wire stays free and the stream owns nothing.
                 if (tag == 1) return new RowStream(this, new String[0], false, r.u64());
                 if (tag == 2) return new RowStream(this, new String[0], false, -1L);
+                // ResultSets: a CALL whose body EMITted is answered with every
+                // set in ONE frame, streamed or not — the frame the buffered
+                // path receives, decoded by the same code. The exchange is
+                // over, so this stream too owns nothing; nextResultSet()
+                // walks the sets.
+                if (tag == 8) return new RowStream(this, readResultSets(r));
                 int ncols = r.u32();
                 String[] cols = new String[ncols];
                 for (int i = 0; i < ncols; i++) cols[i] = r.text();
@@ -980,39 +986,9 @@ public final class Skaidb {
                 observeRoundTrip(System.nanoTime() - started);
                 int tag = r.u8();
                 if (tag == 0) {            // Rows
-                    int ncols = r.u32();
-                    String[] cols = new String[ncols];
-                    for (int i = 0; i < ncols; i++) cols[i] = r.text();
-                    int nrows = r.u32();
-                    List<Object[]> data = new ArrayList<>(nrows);
-                    for (int i = 0; i < nrows; i++) {
-                        int ncells = r.u32();
-                        Object[] row = new Object[ncells];
-                        for (int j = 0; j < ncells; j++) row[j] = decodeValue(new Reader(r.blob()));
-                        data.add(row);
-                    }
-                    return new ResultSet(cols, data);
+                    return readRows(r);
                 } else if (tag == 8) {     // ResultSets: a CALL whose body EMITted
-                    int nsets = r.u32();
-                    List<ResultSet> sets = new ArrayList<>(nsets);
-                    for (int s = 0; s < nsets; s++) {
-                        int ncols = r.u32();
-                        String[] cols = new String[ncols];
-                        for (int i = 0; i < ncols; i++) cols[i] = r.text();
-                        int nrows = r.u32();
-                        List<Object[]> data = new ArrayList<>(nrows);
-                        for (int i = 0; i < nrows; i++) {
-                            int ncells = r.u32();
-                            Object[] row = new Object[ncells];
-                            for (int j = 0; j < ncells; j++) row[j] = decodeValue(new Reader(r.blob()));
-                            data.add(row);
-                        }
-                        sets.add(new ResultSet(cols, data));
-                    }
-                    if (sets.isEmpty()) return new ResultSet(new String[0], new ArrayList<>());
-                    ResultSet first = sets.get(0);
-                    first.more = new ArrayList<>(sets.subList(1, sets.size()));
-                    return first;
+                    return readResultSets(r);
                 } else if (tag == 1) {     // Mutation
                     return r.u64();
                 } else if (tag == 2) {     // Ddl
@@ -1030,6 +1006,38 @@ public final class Skaidb {
                 observeFailure();
                 throw new SkaidbException("query failed: " + e.getMessage(), e);
             }
+        }
+
+        /** A Rows body (§3.2), also one set of ResultSets; {@code r} sits just past the tag. */
+        private static ResultSet readRows(Reader r) {
+            int ncols = r.u32();
+            String[] cols = new String[ncols];
+            for (int i = 0; i < ncols; i++) cols[i] = r.text();
+            int nrows = r.u32();
+            List<Object[]> data = new ArrayList<>(nrows);
+            for (int i = 0; i < nrows; i++) {
+                int ncells = r.u32();
+                Object[] row = new Object[ncells];
+                for (int j = 0; j < ncells; j++) row[j] = decodeValue(new Reader(r.blob()));
+                data.add(row);
+            }
+            return new ResultSet(cols, data);
+        }
+
+        /**
+         * A ResultSets body (§3.2: a CALL whose body EMITted), {@code r} just
+         * past the tag: the first set, with the rest behind {@link
+         * ResultSet#nextResultSet}. The buffered path and a stream request
+         * both receive this frame, and both decode it here.
+         */
+        private static ResultSet readResultSets(Reader r) {
+            int nsets = r.u32();
+            List<ResultSet> sets = new ArrayList<>(nsets);
+            for (int s = 0; s < nsets; s++) sets.add(readRows(r));
+            if (sets.isEmpty()) return new ResultSet(new String[0], new ArrayList<>());
+            ResultSet first = sets.get(0);
+            first.more = new ArrayList<>(sets.subList(1, sets.size()));
+            return first;
         }
 
         /**
@@ -1070,8 +1078,9 @@ public final class Skaidb {
      * A streamed result set: holds one chunk, not the whole result. Obtained
      * from {@link Connection#stream(String, Object...)}; it owns the
      * connection until the last frame is read or {@link #close} runs — no
-     * other statement may use that connection meanwhile. Not thread-safe:
-     * one stream, one reader.
+     * other statement may use that connection meanwhile. A reply the server
+     * sends in one frame instead (see {@link #isStreamed}) owns nothing. Not
+     * thread-safe: one stream, one reader.
      */
     public static final class RowStream implements AutoCloseable {
         /**
@@ -1083,23 +1092,38 @@ public final class Skaidb {
         private static final long DRAIN_BYTE_BUDGET = 8L * 1024 * 1024;
 
         private final Connection conn;
-        private final String[] columns;
+        private String[] columns;
         private java.util.List<Object[]> chunk = new ArrayList<>();
         private int pos = 0;
         private boolean live;            // more frames are still coming
         /** True while this stream, and not the connection, owns the wire. */
         private boolean owns;
+        /** Whether the server streams the result, as opposed to one frame. */
+        private final boolean streamed;
         private Object[] current;
         private final long affected;
+        /** The sets after the current one, of a CALL whose body EMITted. */
+        private List<ResultSet> moreSets = new ArrayList<>();
 
         RowStream(Connection conn, String[] columns, boolean live, long affected) {
             this.conn = conn;
             this.columns = columns;
             this.live = live;
+            this.streamed = live;
             this.affected = affected;
             // A non-row statement answered in one frame owns nothing: the
             // connection was never marked busy for it.
             this.owns = live;
+        }
+
+        /**
+         * The result sets of a CALL whose body EMITted, every one already
+         * here: the first set current, owning nothing.
+         */
+        RowStream(Connection conn, ResultSet sets) {
+            this(conn, sets.columns, false, -1L);
+            this.chunk = sets.rows;
+            this.moreSets = sets.more;
         }
 
         public String[] getColumnNames() { return columns.clone(); }
@@ -1109,6 +1133,35 @@ public final class Skaidb {
          * (it then has no columns and no rows); -1 for rows and for DDL.
          */
         public long getAffected() { return affected; }
+
+        /**
+         * Whether the server streams this result: its rows arrive a chunk at
+         * a time and the stream owns the connection until the last one is
+         * read or {@link #close} runs. False when the server answered in one
+         * frame — a statement without rows, or the result sets of a {@code
+         * CALL} whose procedure body {@code EMIT}s them (see {@link
+         * #nextResultSet}) — so the whole reply is already here and the
+         * connection was never held.
+         */
+        public boolean isStreamed() { return streamed; }
+
+        /**
+         * Advance to the next result set of a multi-set reply, as {@link
+         * ResultSet#nextResultSet} does: a {@code CALL} whose procedure body
+         * {@code EMIT}s result sets is answered with all of them in one
+         * frame, even to a stream request. The stream then describes that
+         * set ({@link #getColumnNames}, {@link #next}, {@link #getObject}).
+         * False when there is no further set — always, for a streamed result.
+         */
+        public boolean nextResultSet() {
+            if (moreSets.isEmpty()) return false;
+            ResultSet n = moreSets.remove(0);
+            columns = n.columns;
+            chunk = n.rows;
+            pos = 0;
+            current = null;
+            return true;
+        }
 
         /** Advance to the next row; false once the stream is exhausted. */
         public boolean next() {

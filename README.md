@@ -51,7 +51,7 @@ The artifact is published through [JitPack](https://jitpack.io/#porcupin26/skaid
 which builds it from the git tag on first request. Coordinates:
 
 ```
-com.github.porcupin26:skaidb-java:v1.3.0
+com.github.porcupin26:skaidb-java:v1.4.0
 ```
 
 > **Note:** `v1.0.0` is not resolvable through JitPack — its first build
@@ -76,7 +76,7 @@ GPG-signed artifacts, which this project does not have yet).
   <dependency>
     <groupId>com.github.porcupin26</groupId>
     <artifactId>skaidb-java</artifactId>
-    <version>v1.3.0</version>
+    <version>v1.4.0</version>
   </dependency>
 </dependencies>
 ```
@@ -90,7 +90,7 @@ repositories {
 }
 
 dependencies {
-    implementation("com.github.porcupin26:skaidb-java:v1.3.0")
+    implementation("com.github.porcupin26:skaidb-java:v1.4.0")
 }
 ```
 
@@ -103,7 +103,7 @@ repositories {
 }
 
 dependencies {
-    implementation 'com.github.porcupin26:skaidb-java:v1.3.0'
+    implementation 'com.github.porcupin26:skaidb-java:v1.4.0'
 }
 ```
 
@@ -375,6 +375,19 @@ come back as the raw mapped objects — there are no typed getters. A
 statement that returns no rows yields a stream with no columns:
 `getAffected()` is then its affected-row count (`-1` for DDL). The stream
 runs at the connection's consistency (`conn.setConsistency`).
+
+A `CALL` whose procedure body `EMIT`s result sets is answered with every set
+in one frame even when streamed. The stream then starts on the first set and
+walks the rest as `ResultSet` does; it never holds the connection
+(`isStreamed()` is `false`):
+
+```java
+try (Skaidb.RowStream s = conn.stream("CALL report()")) {
+    do {
+        while (s.next()) { /* ... */ }
+    } while (s.nextResultSet());
+}
+```
 
 ### Parameters
 

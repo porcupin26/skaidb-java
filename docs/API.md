@@ -8,7 +8,7 @@ is described in [JDBC.md](JDBC.md).
 ## `Skaidb`
 
 ```java
-public static final String VERSION;                  // the driver version, e.g. "1.3.0"
+public static final String VERSION;                  // the driver version, e.g. "1.4.0"
 public static String version();                      // same, as a method
 
 public static final int CONSISTENCY_ONE    = 0;
@@ -205,11 +205,16 @@ public boolean  next();                  // pulls the next chunk when needed; fa
 public Object   getObject(int i);        // 0-BASED
 public Object   getObject(String name);
 public long     getAffected();           // a non-row statement's affected count; -1 otherwise
+public boolean  nextResultSet();         // switch to the next EMITted set of a CALL; false if none
+public boolean  isStreamed();            // false when the server answered in one frame (no rows, a CALL's sets)
 public void     close();                 // drains the rest (≤ 8 MB) or marks the connection broken; idempotent
 ```
 
 Not thread-safe. Reading to the end releases the connection before
 `close()`; a server error mid-stream throws from `next()` after releasing.
+A `CALL` whose body `EMIT`s result sets is answered with all of them in one
+frame even when streamed: the stream starts on the first set,
+`nextResultSet()` walks the rest, and it never holds the connection.
 
 ## `Skaidb.Pool implements AutoCloseable`
 

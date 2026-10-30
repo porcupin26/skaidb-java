@@ -335,6 +335,16 @@ public final class ConformanceServer implements AutoCloseable {
         return b.toBytes();
     }
 
+    /**
+     * A ResultSets response (a CALL whose body EMITted): the set count, then
+     * each set laid out as a Rows body — these Rows responses minus their tag.
+     */
+    public static byte[] resultSetsResponse(byte[]... rowsResponses) {
+        Skaidb.Buf b = new Skaidb.Buf().u8(8).u32(rowsResponses.length);
+        for (byte[] rows : rowsResponses) b.raw(Arrays.copyOfRange(rows, 1, rows.length));
+        return b.toBytes();
+    }
+
     /** A Mutation response. */
     public static byte[] mutationResponse(long affected) {
         return new Skaidb.Buf().u8(1).i64(affected).toBytes();

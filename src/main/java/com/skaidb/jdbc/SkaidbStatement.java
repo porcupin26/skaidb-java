@@ -18,7 +18,9 @@ import java.util.List;
  * placeholder). With a fetch size above zero a statement is STREAMED
  * ({@code OP_QUERY_STREAM}): rows arrive a chunk at a time and the
  * connection is busy until the result set is read to the end or closed.
- * Otherwise the whole result arrives in one frame.
+ * Otherwise the whole result arrives in one frame — and so does a {@code
+ * CALL} whose procedure EMITs result sets, streamed or not: its sets come
+ * back through {@link #getMoreResults} either way.
  */
 public class SkaidbStatement implements Statement {
     final SkaidbConnection conn;
@@ -104,7 +106,34 @@ public class SkaidbStatement implements Statement {
             updateCount = Math.max(s.getAffected(), 0);
             return false;
         }
+        if (!s.isStreamed()) return acceptSets(s);
         current = new SkaidbResultSet(this, s, maxRows);
+        return true;
+    }
+
+    /**
+     * A stream request the server answered in one frame with result sets — a
+     * {@code CALL} whose procedure body EMITs them. Every set is already
+     * here, so each becomes a materialised result set exactly as {@link
+     * #accept} makes them from the buffered reply: the first current, the
+     * rest behind {@link #getMoreResults}.
+     */
+    private boolean acceptSets(Skaidb.RowStream s) {
+        boolean first = true;
+        do {
+            String[] cols = s.getColumnNames();
+            List<Object[]> rows = new ArrayList<>();
+            while (s.next()) {
+                if (maxRows > 0 && rows.size() >= maxRows) continue;
+                Object[] row = new Object[cols.length];
+                for (int i = 0; i < cols.length; i++) row[i] = s.getObject(i);
+                rows.add(row);
+            }
+            SkaidbResultSet out = new SkaidbResultSet(this, cols, rows);
+            if (first) current = out;
+            else more.add(out);
+            first = false;
+        } while (s.nextResultSet());
         return true;
     }
 
