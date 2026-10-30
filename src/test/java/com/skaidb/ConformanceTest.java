@@ -183,25 +183,33 @@ class ConformanceTest {
                     Object[] params = new Object[ps.size()];
                     for (int i = 0; i < params.length; i++) params[i] = nativeValue(ps.get(i));
                     try (Skaidb.RowStream s = conn.stream((String) call.get("sql"), params)) {
-                        String[] cols = s.getColumnNames();
-                        if (cols.length == 0) {
+                        if (s.getColumnNames().length == 0) {
                             return s.getAffected() >= 0 ? tag("affected", Long.toString(s.getAffected()))
                                                         : tag("ddl", true);
                         }
-                        List<Object[]> rows = new ArrayList<>();
-                        try {
-                            while (s.next()) {
-                                Object[] row = new Object[cols.length];
-                                for (int i = 0; i < cols.length; i++) row[i] = s.getObject(i);
-                                rows.add(row);
+                        // A CALL whose body EMITs is answered with every set in
+                        // one frame even to a stream request: walk them all, as
+                        // resultJson walks a buffered reply's. A real stream has
+                        // one set.
+                        List<Object> sets = new ArrayList<>();
+                        do {
+                            String[] cols = s.getColumnNames();
+                            List<Object[]> rows = new ArrayList<>();
+                            try {
+                                while (s.next()) {
+                                    Object[] row = new Object[cols.length];
+                                    for (int i = 0; i < cols.length; i++) row[i] = s.getObject(i);
+                                    rows.add(row);
+                                }
+                            } catch (Skaidb.SkaidbException e) {
+                                Map<String, Object> rte = new LinkedHashMap<>();
+                                rte.put("rows", rowsJson(cols, rows));
+                                rte.put("error", e.getMessage());
+                                return tag("rows_then_error", rte);
                             }
-                        } catch (Skaidb.SkaidbException e) {
-                            Map<String, Object> rte = new LinkedHashMap<>();
-                            rte.put("rows", rowsJson(cols, rows));
-                            rte.put("error", e.getMessage());
-                            return tag("rows_then_error", rte);
-                        }
-                        return tag("rows", rowsJson(cols, rows));
+                            sets.add(rowsJson(cols, rows));
+                        } while (s.nextResultSet());
+                        return sets.size() > 1 ? tag("result_sets", sets) : tag("rows", sets.get(0));
                     }
                 }
                 default:
