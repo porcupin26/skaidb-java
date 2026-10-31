@@ -19,6 +19,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -26,6 +27,11 @@ import java.util.Set;
 import java.util.TreeMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.function.Supplier;
+import java.util.logging.Handler;
+import java.util.logging.Level;
+import java.util.logging.LogRecord;
+import java.util.logging.Logger;
+import java.util.logging.SimpleFormatter;
 import javax.crypto.Mac;
 import javax.crypto.SecretKeyFactory;
 import javax.crypto.spec.PBEKeySpec;
@@ -424,6 +430,110 @@ class LoadBalancingTest {
         assertEquals("ready", state(p, b));
     }
 
+    /**
+     * Connections to each member outside the pool, by member name: stand-ins
+     * to feed the pool's latency measurements round trips of a chosen length.
+     */
+    private Map<String, Skaidb.Connection> standIns(Skaidb.Pool p, List<Member> ms) {
+        Map<String, Skaidb.Connection> out = new HashMap<>();
+        for (Member m : ms) {
+            Skaidb.Connection c = Skaidb.connect(connectTo(m));
+            cleanup.add(c);
+            synchronized (p) { c.poolEp = c.connectedEp; }
+            out.put(m.name, c);
+        }
+        return out;
+    }
+
+    /** The pool's WARNING lines logged while {@code body} runs. */
+    private static List<String> poolWarnings(Runnable body) {
+        Logger log = Logger.getLogger("com.skaidb.pool");
+        List<String> lines = new CopyOnWriteArrayList<>();
+        SimpleFormatter text = new SimpleFormatter();
+        Handler capture = new Handler() {
+            @Override public void publish(LogRecord r) {
+                if (r.getLevel().intValue() >= Level.WARNING.intValue()) lines.add(text.formatMessage(r));
+            }
+            @Override public void flush() {}
+            @Override public void close() {}
+        };
+        log.addHandler(capture);
+        try {
+            body.run();
+        } finally {
+            log.removeHandler(capture);
+        }
+        return lines;
+    }
+
+    @Test
+    void aSlowFirstRoundTripDoesNotEjectAMember() throws IOException {
+        // The first statements on b stall in the client — a CPU-bound
+        // application starting up holds the thread — and b answers fast from
+        // then on: the fastest of its first round trips seeds its average, so
+        // b stays in rotation. (Seeded by its first round trip alone, b's
+        // average still read 3.8 s when it was first compared with the
+        // others, and b was ejected.)
+        List<Member> ms = members("a", "b", "c");
+        Member b = ms.get(1);
+        Skaidb.Pool p = pool(ms, roundRobin().ejectLatencyFloor(Duration.ofMillis(50)));
+        Map<String, Skaidb.Connection> to = standIns(p, ms);
+        p.roundTrip(to.get("b"), 6_600_000_000L);
+        p.roundTrip(to.get("b"), 3_000_000_000L);
+        for (int i = 0; i < 12; i++) {
+            for (String name : new String[] { "a", "b", "c" }) p.roundTrip(to.get(name), 200_000);
+        }
+        assertEquals("ready", state(p, b));
+        assertEquals(0.2, row(p, b).latencyMs);
+    }
+
+    @Test
+    void aMemberSlowFromItsFirstRoundTripIsEjectedAndTheWarningNamesItsSlowest() throws IOException {
+        List<Member> ms = members("a", "b", "c");
+        Member b = ms.get(1);
+        Skaidb.Pool p = pool(ms, roundRobin().ejectLatencyFloor(Duration.ofMillis(50)).ejectBackoff(Duration.ofSeconds(30)));
+        Map<String, Skaidb.Connection> to = standIns(p, ms);
+        List<String> warnings = poolWarnings(() -> {
+            for (int i = 0; i < 12; i++) {
+                p.roundTrip(to.get("a"), 200_000);
+                p.roundTrip(to.get("c"), 200_000);
+                p.roundTrip(to.get("b"), i == 5 ? 900_000_000 : 500_000_000);
+            }
+        });
+        assertEquals("ejected", state(p, b));
+        List<String> ejected = new ArrayList<>();
+        for (String w : warnings) if (w.contains("ejecting")) ejected.add(w);
+        assertEquals(1, ejected.size(), warnings.toString());
+        assertTrue(ejected.get(0).matches(".*latency 5\\d\\d\\.\\d ms vs median 0\\.2 ms;.*"), ejected.get(0));
+        assertTrue(ejected.get(0).contains("slowest of the last 10 round trips 900.0 ms"), ejected.get(0));
+    }
+
+    @Test
+    void aReadmittedMemberIsSeededAfresh() throws Exception {
+        List<Member> ms = members("a", "b", "c");
+        Member b = ms.get(1);
+        Skaidb.Pool p = pool(ms, roundRobin().ejectErrors(1).ejectBackoff(Duration.ofMillis(100)));
+        Map<String, Skaidb.Connection> to = standIns(p, ms);
+        Skaidb.Pool.MemberState m = internal(p, b);
+        for (long t : new long[] { 4_000_000, 3_000_000, 2_000_000 }) p.roundTrip(to.get("b"), t);
+        assertEquals(2.0, row(p, b).latencyMs);
+        // Ejected, then re-admitted by the probe: measured afresh.
+        p.failed(b.endpoint);
+        assertEquals("ejected", state(p, b));
+        await("never re-admitted", () -> state(p, b).equals("ready"));
+        synchronized (p) {
+            assertFalse(m.seeded);
+            assertTrue(m.firsts.isEmpty(), m.firsts.toString());
+            assertTrue(m.recent.isEmpty(), m.recent.toString());
+            assertEquals(0, m.samples);
+        }
+        p.roundTrip(to.get("b"), 7_000_000);
+        assertNull(row(p, b).latencyMs, "not measured until its first three round trips");
+        p.roundTrip(to.get("b"), 9_000_000);
+        p.roundTrip(to.get("b"), 8_000_000);
+        assertEquals(7.0, row(p, b).latencyMs);
+    }
+
     @Test
     void theLastUsableMemberIsNeverEjected() throws IOException {
         List<Member> ms = members("a", "b", "c");
@@ -512,11 +622,17 @@ class LoadBalancingTest {
         Skaidb.Pool.MemberState m = internal(p, c);
         synchronized (p) {
             m.ewma = 9.9e9;
+            m.seeded = true;
+            m.recent.add(9_900_000_000L);
             m.samples = 50;
         }
         states.put(c.endpoint, "ready");
         relist(p);
-        synchronized (p) { assertEquals(0, m.samples); }
+        synchronized (p) {
+            assertEquals(0, m.samples);
+            assertFalse(m.seeded);
+            assertTrue(m.recent.isEmpty(), m.recent.toString());
+        }
         assertNull(row(p, c).latencyMs);
         assertTrue(serve(p, 6, null).contains("c"));
     }

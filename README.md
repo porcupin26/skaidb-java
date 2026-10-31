@@ -51,7 +51,7 @@ The artifact is published through [JitPack](https://jitpack.io/#porcupin26/skaid
 which builds it from the git tag on first request. Coordinates:
 
 ```
-com.github.porcupin26:skaidb-java:v1.4.0
+com.github.porcupin26:skaidb-java:v1.4.1
 ```
 
 > **Note:** `v1.0.0` is not resolvable through JitPack — its first build
@@ -76,7 +76,7 @@ GPG-signed artifacts, which this project does not have yet).
   <dependency>
     <groupId>com.github.porcupin26</groupId>
     <artifactId>skaidb-java</artifactId>
-    <version>v1.4.0</version>
+    <version>v1.4.1</version>
   </dependency>
 </dependencies>
 ```
@@ -90,7 +90,7 @@ repositories {
 }
 
 dependencies {
-    implementation("com.github.porcupin26:skaidb-java:v1.4.0")
+    implementation("com.github.porcupin26:skaidb-java:v1.4.1")
 }
 ```
 
@@ -103,7 +103,7 @@ repositories {
 }
 
 dependencies {
-    implementation 'com.github.porcupin26:skaidb-java:v1.4.0'
+    implementation 'com.github.porcupin26:skaidb-java:v1.4.1'
 }
 ```
 
@@ -526,7 +526,7 @@ Skaidb.Pool pool = new Skaidb.Pool(
 | `discover(boolean)` | `false` | Reads the members with `SHOW ENDPOINTS` (server ≥ 0.327; no privilege needed) on the first connection to each member and every `refreshInterval` after (every 5 s while a member is not ready). New members are added, members that left are dropped (seeds are kept, marked `unlisted`), and members the server reports `resyncing` or `unreachable` get no new connections until they are `ready`. An older or standalone server leaves the seeds as they are and discovery stops. |
 | `refreshInterval(Duration)` | 60 s | How often discovery re-reads the members. |
 | `ejectErrors(int)` | `3` | Consecutive transport failures (failed dial, I/O error or timeout mid-request, capacity refusal) that eject a member. Statement errors and refused logins do not count. |
-| `ejectLatencyFactor(double)`, `ejectLatencyFloor(Duration)` | `3.0`, 50 ms | A member whose round-trip average is above factor × the other members' median **and** more than the floor above it is ejected (after 10 samples on it and on another member). Factor `0` disables. |
+| `ejectLatencyFactor(double)`, `ejectLatencyFloor(Duration)` | `3.0`, 50 ms | A member whose round-trip average is above factor × the other members' median **and** more than the floor above it is ejected (after 10 samples on it and on another member). The fastest of a member's first three round trips seeds its average, so a statement that stalls in your own process — a CPU-bound start-up — cannot get a healthy member ejected; the warning names the average, the median and the slowest of the member's last 10 round trips. Factor `0` disables. |
 | `ejectBackoff(Duration)`, `ejectBackoffMax(Duration)` | 5 s, 60 s | How long an ejection lasts, doubling per repeat up to the maximum (a member healthy that long after re-admission starts over). Afterwards the pool's background thread probes the member and re-admits it. The last usable member is never ejected. |
 | `readYourWrites(Duration)` | zero (off) | How long after a write checkouts with the same affinity key go to the member that took the write. |
 

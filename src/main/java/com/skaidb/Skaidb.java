@@ -51,7 +51,7 @@ public final class Skaidb {
      */
     public static final String VERSION = detectVersion();
 
-    private static final String FALLBACK_VERSION = "1.4.0";
+    private static final String FALLBACK_VERSION = "1.4.1";
 
     private static String detectVersion() {
         try {
@@ -2102,7 +2102,11 @@ public final class Skaidb {
         /**
          * Eject a member whose round-trip average is above this many times
          * the other usable members' median and more than
-         * {@link #ejectLatencyFloor} above it (default 3; 0 disables).
+         * {@link #ejectLatencyFloor} above it (default 3; 0 disables). The
+         * fastest of a member's first three round trips seeds its average, so
+         * a statement that stalls in the application (a CPU-bound start-up)
+         * cannot get a healthy member ejected; the warning names the average,
+         * the median and the slowest of the member's last 10 round trips.
          */
         public PoolOptions ejectLatencyFactor(double factor) {
             if (!(factor >= 0)) throw new SkaidbException("eject_latency_factor must be >= 0");
@@ -2239,7 +2243,10 @@ public final class Skaidb {
             final boolean seed;         // configured: discovery never drops it
             String canonical;           // its own SHOW ENDPOINTS name
             String listed = "ready";    // ready | resyncing | unreachable | unlisted
-            double ewma;                // round-trip average, ns; meaningful once samples > 0
+            double ewma;                // round-trip average, ns; meaningful once seeded
+            boolean seeded;             // until then the member counts as not measured
+            final java.util.List<Long> firsts = new ArrayList<>();   // round trips before it is seeded, ns
+            final java.util.ArrayDeque<Long> recent = new java.util.ArrayDeque<>();   // the last RECENT_SAMPLES, ns
             int samples;
             long lastSample;            // System.nanoTime() of the latest sample
             int errors;                 // consecutive transport failures
@@ -2255,6 +2262,15 @@ public final class Skaidb {
                 this.endpoint = endpoint;
                 this.seed = seed;
             }
+
+            /** Measure the member afresh (a re-admission, back to ready). */
+            void resetLatency() {
+                ewma = 0;
+                seeded = false;
+                firsts.clear();
+                recent.clear();
+                samples = 0;
+            }
         }
 
         /** Where read-your-writes sends an affinity key's checkouts, and until when. */
@@ -2264,13 +2280,18 @@ public final class Skaidb {
             Affinity(String endpoint, long until) { this.endpoint = endpoint; this.until = until; }
         }
 
-        // Latency EWMA: each round trip moves a member's average 5% toward
-        // it, and no sample counts for more than 10x the larger of the current
-        // average and the ejection floor — one slow query does not eject a
-        // healthy member, a member that stays slow is ejected within a few
-        // dozen statements.
+        // Latency EWMA: the fastest of a member's first round trips seeds it
+        // (a round trip is only ever lengthened — by the member, the network
+        // or this process stalling — so a slow first statement cannot set
+        // it); then each round trip moves it 5% toward it, and no sample
+        // counts for more than 10x the larger of the current average and the
+        // ejection floor — one slow query does not eject a healthy member, a
+        // member that stays slow is ejected within a few dozen statements.
+        private static final int EWMA_SEED_SAMPLES = 3;
         private static final double EWMA_WEIGHT = 0.05;
         private static final double EWMA_CLAMP = 10.0;
+        /** Round trips a latency ejection's warning reports the slowest of. */
+        private static final int RECENT_SAMPLES = 10;
         /** Round trips a member (and at least one other) needs before its average can eject it. */
         private static final int EWMA_MIN_SAMPLES = 10;
         /**
@@ -2457,7 +2478,7 @@ public final class Skaidb {
             java.util.List<Member> out = new ArrayList<>(sorted.size());
             for (MemberState m : sorted) {
                 out.add(new Member(m.endpoint, m.canonical, m.ejected ? "ejected" : m.listed,
-                    m.samples == 0 ? null : m.ewma / 1e6, m.inUse, idleBy.getOrDefault(m.endpoint, 0), m.seed));
+                    m.seeded ? m.ewma / 1e6 : null, m.inUse, idleBy.getOrDefault(m.endpoint, 0), m.seed));
             }
             return java.util.Collections.unmodifiableList(out);
         }
@@ -2517,7 +2538,7 @@ public final class Skaidb {
         private static double score(MemberState m, long now) {
             // A member never measured, or not lately, scores 0: it is tried
             // and measured.
-            if (m.samples == 0 || now - m.lastSample > STALE_SAMPLE_NANOS) return 0.0;
+            if (!m.seeded || now - m.lastSample > STALE_SAMPLE_NANOS) return 0.0;
             return m.ewma * (m.inUse + 1);
         }
 
@@ -2591,8 +2612,15 @@ public final class Skaidb {
             MemberState m = members.get(ep);
             if (m == null) return;
             m.errors = 0;
-            if (m.samples == 0) {
-                m.ewma = elapsed;
+            if (m.recent.size() == RECENT_SAMPLES) m.recent.removeFirst();
+            m.recent.addLast(elapsed);
+            if (!m.seeded) {
+                m.firsts.add(elapsed);
+                if (m.firsts.size() >= EWMA_SEED_SAMPLES) {
+                    m.ewma = java.util.Collections.min(m.firsts);
+                    m.seeded = true;
+                    m.firsts.clear();
+                }
             } else {
                 double cap = EWMA_CLAMP * Math.max(m.ewma, ejectFloor);
                 m.ewma += EWMA_WEIGHT * (Math.min(elapsed, cap) - m.ewma);
@@ -2602,17 +2630,18 @@ public final class Skaidb {
             // Only a member still in rotation: round trips finishing on
             // connections checked out before an ejection must not eject it
             // again (and stretch its backoff).
-            if (usable(m) && m.samples >= EWMA_MIN_SAMPLES && ejectFactor > 0) {
+            if (usable(m) && m.seeded && m.samples >= EWMA_MIN_SAMPLES && ejectFactor > 0) {
                 java.util.List<Double> others = new ArrayList<>();
                 for (MemberState o : members.values()) {
-                    if (o != m && usable(o) && o.samples >= EWMA_MIN_SAMPLES) others.add(o.ewma);
+                    if (o != m && usable(o) && o.seeded && o.samples >= EWMA_MIN_SAMPLES) others.add(o.ewma);
                 }
                 if (!others.isEmpty()) {
                     java.util.Collections.sort(others);
                     double median = others.get((others.size() - 1) / 2);   // the lower middle when even
                     if (m.ewma > ejectFactor * median && m.ewma - median > ejectFloor) {
-                        eject(m, String.format(java.util.Locale.ROOT, "latency %.1f ms vs median %.1f ms",
-                            m.ewma / 1e6, median / 1e6));
+                        eject(m, String.format(java.util.Locale.ROOT,
+                            "latency %.1f ms vs median %.1f ms; slowest of the last %d round trips %.1f ms",
+                            m.ewma / 1e6, median / 1e6, m.recent.size(), java.util.Collections.max(m.recent) / 1e6));
                     }
                 }
             }
@@ -2739,8 +2768,7 @@ public final class Skaidb {
                 } else if (ok) {
                     m.ejected = false;
                     m.errors = 0;
-                    m.samples = 0;
-                    m.ewma = 0;
+                    m.resetLatency();
                     m.readmitted = true;
                     m.readmittedAt = System.nanoTime();
                     LOG.log(System.Logger.Level.WARNING, "skaidb pool: re-admitted {0}", m.endpoint);
@@ -2859,8 +2887,7 @@ public final class Skaidb {
                 if (!state.equals("resyncing") && !state.equals("unreachable")) state = "ready";
                 if (state.equals("ready") && !m.listed.equals("ready")) {
                     // Back in rotation: measured afresh, like a re-admission.
-                    m.ewma = 0;
-                    m.samples = 0;
+                    m.resetLatency();
                     m.errors = 0;
                 }
                 m.listed = state;
