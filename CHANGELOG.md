@@ -4,6 +4,41 @@ All notable changes to the skaidb Java driver. The driver has its own
 version series, independent of the skaidb server; see the README's
 compatibility section for which server versions each release speaks to.
 
+## 1.5.0 (2026-11-15)
+
+A retrying transaction helper and a typed error for a transaction conflict.
+
+- **`TransactionConflictException`**: a standalone server (0.346 or newer)
+  refuses a `COMMIT` when another writer changed a row the transaction
+  writes after the transaction began, with an error whose message starts
+  with `transaction conflict:`. The driver throws
+  `Skaidb.TransactionConflictException` for it wherever it throws a
+  server's error — `execute`, `query`, `executeRaw`, a `Query`, a batch, a
+  stream — with the server's message unchanged. It is a subclass of
+  `SkaidbException` (which is no longer `final`), so existing `catch`
+  blocks catch it as before. It is a statement error: the connection stays
+  usable and is not re-dialled, and a pool does not count it against the
+  member.
+- **`conn.transaction(body)`**: sends `BEGIN`, runs the body with the
+  connection, sends `COMMIT` and returns the body's value. A commit refused
+  for a conflict starts over from `BEGIN` and runs the body again, with no
+  pause, up to three runs; `transaction(body, attempts)` sets the number of
+  runs and `transaction(body, attempts, begin)` the opening statement
+  (`BEGIN ATOMIC` on a cluster), sent verbatim. A refused `BEGIN` is thrown
+  and nothing else is sent; a body that throws is rolled back and its
+  exception rethrown as it is (whatever the `ROLLBACK` answers is ignored),
+  never retried; any other `COMMIT` error is thrown with no retry and no
+  `ROLLBACK`. A transport failure is never retried, and `COMMIT` and
+  `ROLLBACK` are never sent on a re-dialled socket. The connection's
+  monitor is held for the whole transaction, so other threads' statements
+  on a shared connection wait for it.
+- **`pool.transaction(body)`** (same overloads): the helper on one
+  connection checked out for the whole transaction and returned after.
+- JDBC: a `commit()` refused for a conflict throws
+  `SQLTransactionRollbackException` with SQLState `40001` (it was a plain
+  `SQLException`, `HY000`), the `TransactionConflictException` as its
+  cause; the next statement opens a new transaction on the same connection.
+
 ## 1.4.1 (2026-10-31)
 
 One slow round trip at the start no longer gets a healthy pool member

@@ -202,6 +202,15 @@ If the connection breaks inside a transaction the server has discarded it:
 the next statement, or `commit()`, throws `SQLTransactionRollbackException`
 (SQLState `40003`) instead of running outside the transaction.
 
+A standalone server (0.346 or newer) refuses a `commit()` when another
+writer changed a row the transaction writes after the transaction began:
+`SQLTransactionRollbackException` with SQLState `40001`, the server's
+message (it starts with `transaction conflict:`) and the core driver's
+`Skaidb.TransactionConflictException` as its cause. Nothing was committed,
+the transaction is over and the connection stays usable, so the
+transaction can be run again; the next statement opens a new one. The JDBC
+layer does not retry by itself.
+
 ## Metadata
 
 `DatabaseMetaData` reports product `skaidb`, the driver version and JDBC
@@ -237,6 +246,8 @@ Every failure is an `SQLException` subclass with an SQLState:
 | Unique / not-null / foreign-key / check / exclusion violation | `SQLIntegrityConstraintViolationException` | `23505` / `23502` / `23503` / `23514` / `23P01` |
 | Parse error; unknown table, column or function; permission denied; already exists | `SQLSyntaxErrorException` | `42601`; `42P01`, `42703`, `42883`; `42501`; `42P07` |
 | Scan budget exceeded | `SQLNonTransientException` | `54000` |
+| Transaction conflict: a `commit()` refused because another writer changed a row the transaction writes | `SQLTransactionRollbackException` | `40001` |
+| The connection was lost inside a transaction | `SQLTransactionRollbackException` | `40003` |
 | Connection busy with an open streamed result set | `SQLException` | `HY010` |
 | A feature the driver does not implement | `SQLFeatureNotSupportedException` | `0A000` |
 | Anything else the server refused | `SQLException` | `HY000` |

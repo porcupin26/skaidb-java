@@ -36,6 +36,10 @@ import java.util.concurrent.Executor;
  * needs {@code transaction=atomic}. DDL is not transactional. If the
  * connection breaks mid-transaction the server has discarded it: the next
  * statement or {@code commit()} throws {@link SQLTransactionRollbackException}.
+ * A {@code commit()} the server refuses because another writer changed a row
+ * the transaction writes throws it too, with SQLState {@code 40001}: nothing
+ * was committed, the transaction is over and the connection is usable, so
+ * the transaction can be run again.
  */
 public final class SkaidbConnection implements Connection {
     private final Skaidb.Connection conn;

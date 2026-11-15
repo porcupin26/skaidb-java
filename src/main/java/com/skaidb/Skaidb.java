@@ -51,7 +51,7 @@ public final class Skaidb {
      */
     public static final String VERSION = detectVersion();
 
-    private static final String FALLBACK_VERSION = "1.4.1";
+    private static final String FALLBACK_VERSION = "1.5.0";
 
     private static String detectVersion() {
         try {
@@ -298,11 +298,79 @@ public final class Skaidb {
         }
     }
 
-    /** Thrown on connection, protocol, or statement errors. */
-    public static final class SkaidbException extends RuntimeException {
+    /**
+     * Thrown on connection, protocol, or statement errors. One statement
+     * error has a type of its own: {@link TransactionConflictException}.
+     */
+    public static class SkaidbException extends RuntimeException {
         private static final long serialVersionUID = 1L;
         public SkaidbException(String message) { super(message); }
         public SkaidbException(String message, Throwable cause) { super(message, cause); }
+    }
+
+    /**
+     * The server refused a {@code COMMIT} because another writer changed a
+     * row the transaction writes after the transaction began: the statement
+     * error whose message starts with {@code transaction conflict:}. The
+     * message is the server's, unchanged.
+     *
+     * <p>Nothing was committed, the transaction is over and the connection
+     * is back in autocommit and usable, so running the whole transaction
+     * again from {@code BEGIN} is safe — which is what {@link
+     * Connection#transaction(TransactionBody)} does. It is a statement error
+     * like any other: {@code catch (SkaidbException e)} still catches it,
+     * the connection is not re-dialled, and it does not count against a
+     * {@link Pool} member's health.
+     */
+    public static final class TransactionConflictException extends SkaidbException {
+        private static final long serialVersionUID = 1L;
+        public TransactionConflictException(String message) { super(message); }
+    }
+
+    /**
+     * What a transaction conflict's message starts with (PROTOCOL.md §6
+     * rule 6). Only the prefix is matched: the rest of the text may change.
+     */
+    static final String CONFLICT_PREFIX = "transaction conflict:";
+
+    /**
+     * The exception for a server {@code Error} response: the server's
+     * message, unchanged, as a {@link TransactionConflictException} when it
+     * is a transaction conflict.
+     */
+    static SkaidbException serverError(String message) {
+        return message.startsWith(CONFLICT_PREFIX)
+            ? new TransactionConflictException(message) : new SkaidbException(message);
+    }
+
+    /**
+     * The statements of one transaction, for {@link
+     * Connection#transaction(TransactionBody, int, String)} and {@link
+     * Pool#transaction(TransactionBody, int, String)}.
+     *
+     * <p>Run every statement on {@code conn}, the one connection the
+     * transaction is open on, and return the transaction's result ({@code
+     * null} when it has none). Throwing rolls the transaction back. The body
+     * runs again from the start when the commit is refused for a conflict,
+     * so it must be safe to run more than once and should do nothing outside
+     * the database that a second run would repeat. It does not send {@code
+     * BEGIN}, {@code COMMIT} or {@code ROLLBACK} itself.
+     */
+    @FunctionalInterface
+    public interface TransactionBody<T> {
+        T run(Connection conn) throws SkaidbException;
+    }
+
+    /** How many times {@code transaction(body)} runs the body at most. */
+    static final int TRANSACTION_ATTEMPTS = 3;
+    /** The statement {@code transaction(body)} opens the transaction with. */
+    static final String TRANSACTION_BEGIN = "BEGIN";
+
+    /** A transaction helper's arguments, refused before anything is sent. */
+    static void checkTransaction(TransactionBody<?> body, int attempts, String begin) {
+        if (body == null) throw new SkaidbException("transaction body must not be null");
+        if (attempts < 1) throw new SkaidbException("transaction attempts must be >= 1, got " + attempts);
+        if (begin == null) throw new SkaidbException("transaction begin statement must not be null");
     }
 
     // ---- Connection --------------------------------------------------------
@@ -529,6 +597,133 @@ public final class Skaidb {
             Object res = run(sql, true);
             if (res instanceof ResultSet) return new Result((ResultSet) res, -1L);
             return new Result(null, (Long) res);
+        }
+
+        /**
+         * Run {@code body} in a transaction opened with {@code BEGIN}, at
+         * most three times: {@link #transaction(TransactionBody, int, String)
+         * transaction(body, 3, "BEGIN")}.
+         */
+        public <T> T transaction(TransactionBody<T> body) {
+            return transaction(body, TRANSACTION_ATTEMPTS, TRANSACTION_BEGIN);
+        }
+
+        /**
+         * Run {@code body} in a transaction opened with {@code BEGIN}, at
+         * most {@code attempts} times: {@link #transaction(TransactionBody,
+         * int, String) transaction(body, attempts, "BEGIN")}.
+         */
+        public <T> T transaction(TransactionBody<T> body, int attempts) {
+            return transaction(body, attempts, TRANSACTION_BEGIN);
+        }
+
+        /**
+         * Run {@code body} in a transaction on this connection and return
+         * what it returned, running it again when the commit is refused for
+         * a conflict.
+         *
+         * <pre>{@code
+         * long left = conn.transaction(c -> {
+         *     c.execute("UPDATE stock SET n = n - 1 WHERE id = 7");
+         *     Skaidb.ResultSet rs = c.query("SELECT n FROM stock WHERE id = 7");
+         *     rs.next();
+         *     return rs.getLong("n");
+         * });
+         * }</pre>
+         *
+         * <p>{@code begin} is sent verbatim ({@code BEGIN} on a standalone
+         * server, {@code BEGIN ATOMIC} or {@code BEGIN ATOMIC PARTITION (col
+         * = literal)} on a cluster), then {@code body} runs with this
+         * connection, then {@code COMMIT} is sent:
+         * <ul>
+         * <li>{@code begin} is refused: its error is thrown. The body does
+         *     not run and nothing else is sent — its statements would
+         *     autocommit one by one.</li>
+         * <li>The body throws: {@code ROLLBACK} is sent, whatever answers it
+         *     is ignored, and the body's exception is thrown as it is. The
+         *     body is not run again, not even for a {@link
+         *     TransactionConflictException}.</li>
+         * <li>{@code COMMIT} succeeds: the body's value is returned.</li>
+         * <li>{@code COMMIT} is refused with a {@link
+         *     TransactionConflictException}: nothing was committed and the
+         *     transaction is over, so everything starts over from {@code
+         *     begin}, at once — the other writer has finished, and the next
+         *     run reads the rows as they are now. The conflict of run number
+         *     {@code attempts} is thrown.</li>
+         * <li>{@code COMMIT} fails for any other reason: that error is
+         *     thrown. No retry and no {@code ROLLBACK}: a failed commit has
+         *     ended the transaction.</li>
+         * </ul>
+         *
+         * <p>The body may run more than once, so it must be safe to repeat
+         * and should do nothing outside the database that a second run would
+         * repeat. It must end every {@link RowStream} it opens: while one
+         * owns the wire neither {@code COMMIT} nor {@code ROLLBACK} can be
+         * sent.
+         *
+         * <p>A transport failure is the usual {@link SkaidbException} and is
+         * never retried here. The server discards a transaction with its
+         * socket and this connection re-dials on its next statement, so
+         * {@code COMMIT} and {@code ROLLBACK} are only ever sent on the
+         * socket {@code begin} went out on: after a failure in the body
+         * nothing is rolled back (there is nothing left to), and a body that
+         * swallows one gets {@code the connection was lost during the
+         * transaction} instead of a commit.
+         *
+         * <p>The connection's monitor is held from {@code begin} to the end,
+         * so statements other threads send on a shared connection wait for
+         * the transaction instead of running inside it.
+         *
+         * @param attempts how many times the body may run; at least 1
+         * @param begin the statement that opens the transaction
+         * @throws SkaidbException {@code attempts} below 1, or a null {@code
+         *     body} or {@code begin}, before anything is sent
+         */
+        public synchronized <T> T transaction(TransactionBody<T> body, int attempts, String begin) {
+            checkTransaction(body, attempts, begin);
+            for (int attempt = 1; ; attempt++) {
+                // A refused BEGIN is thrown from here: going on would
+                // autocommit every statement of the body.
+                run(begin, true);
+                long session = reconnects;
+                T value;
+                try {
+                    value = body.run(this);
+                } catch (Throwable t) {
+                    rollbackQuietly(session);
+                    throw t;
+                }
+                if (broken || reconnects != session)
+                    throw new SkaidbException(
+                        "the connection was lost during the transaction; the server discarded it");
+                try {
+                    run("COMMIT", true);
+                    return value;
+                } catch (TransactionConflictException e) {
+                    // Nothing was committed and the transaction is over.
+                    // The other writer has finished, so the next run reads
+                    // the rows as they are now: no wait before it.
+                    if (attempt >= attempts) throw e;
+                }
+            }
+        }
+
+        /**
+         * Roll back after the body failed, never replacing the body's error:
+         * a server older than 0.347 answers a {@code ROLLBACK} with nothing
+         * open with an error, and the round trip itself can fail. Not sent
+         * once the socket of the transaction ({@code session}: the re-dial
+         * count at its BEGIN) is gone — the server discarded the transaction
+         * with it, and the statement would re-dial to roll back nothing —
+         * nor while a stream owns the wire.
+         */
+        private void rollbackQuietly(long session) {
+            if (!isUsable() || reconnects != session) return;
+            try {
+                run("ROLLBACK", true);
+            } catch (RuntimeException ignored) {
+                // clean-up only
+            }
         }
 
         /** One change captured by a stream. */
@@ -834,7 +1029,7 @@ public final class Skaidb {
                         throw new SkaidbException("server does not support "
                             + (bound ? "parameterised streaming (skaidb >= 0.330)" : "streaming") + ": " + msg);
                     }
-                    throw new SkaidbException(msg);
+                    throw serverError(msg);
                 }
                 if (tag != 1 && tag != 2 && tag != 5 && tag != 8) {
                     // The server answered a stream request with something a
@@ -994,7 +1189,7 @@ public final class Skaidb {
                 } else if (tag == 2) {     // Ddl
                     return -1L;
                 } else if (tag == 3) {     // Error
-                    throw new SkaidbException(r.text());
+                    throw serverError(r.text());
                 }
                 throw new SkaidbException("unknown response tag " + tag);
             } catch (IOException e) {
@@ -1197,7 +1392,7 @@ public final class Skaidb {
                     return false;
                 } else if (tag == 3) {             // failed partway; rows so far are valid
                     release(false);                // Error ends the stream too
-                    throw new SkaidbException(r.text());
+                    throw serverError(r.text());
                 } else {
                     release(true);
                     throw new SkaidbException("unexpected frame tag " + tag + " in stream");
@@ -2463,6 +2658,42 @@ public final class Skaidb {
             } finally {
                 release(c);
             }
+        }
+
+        /**
+         * Run {@code body} in a transaction opened with {@code BEGIN}, at
+         * most three times, on one checked-out connection: {@link
+         * #transaction(TransactionBody, int, String) transaction(body, 3,
+         * "BEGIN")}.
+         */
+        public <T> T transaction(TransactionBody<T> body) {
+            return transaction(body, TRANSACTION_ATTEMPTS, TRANSACTION_BEGIN);
+        }
+
+        /**
+         * Run {@code body} in a transaction opened with {@code BEGIN}, at
+         * most {@code attempts} times, on one checked-out connection: {@link
+         * #transaction(TransactionBody, int, String) transaction(body,
+         * attempts, "BEGIN")}.
+         */
+        public <T> T transaction(TransactionBody<T> body, int attempts) {
+            return transaction(body, attempts, TRANSACTION_BEGIN);
+        }
+
+        /**
+         * {@link Connection#transaction(TransactionBody, int, String)} on
+         * one connection checked out for the whole transaction — {@code
+         * begin}, every run of the body and {@code COMMIT} or {@code
+         * ROLLBACK} travel on that one socket — and returned to the pool
+         * after. The checkout is under the pool-wide affinity key; for a key
+         * of your own, {@code withConnection(key, c -> c.transaction(body))}.
+         *
+         * @throws SkaidbException {@code attempts} below 1, or a null {@code
+         *     body} or {@code begin}, before a connection is checked out
+         */
+        public <T> T transaction(TransactionBody<T> body, int attempts, String begin) {
+            checkTransaction(body, attempts, begin);
+            return withConnection(c -> c.transaction(body, attempts, begin));
         }
 
         /**

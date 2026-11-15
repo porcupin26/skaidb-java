@@ -12,6 +12,7 @@ import java.sql.SQLNonTransientException;
 import java.sql.SQLRecoverableException;
 import java.sql.SQLSyntaxErrorException;
 import java.sql.SQLTimeoutException;
+import java.sql.SQLTransactionRollbackException;
 import java.util.Locale;
 
 /** Maps the driver's messages onto SQLException subclasses and SQLStates. */
@@ -47,6 +48,9 @@ final class Errors {
 
     /** A statement the server (or the driver's own checks) refused. */
     private static SQLException server(String msg, String m, Throwable e) {
+        // A COMMIT refused because another writer changed a row the
+        // transaction writes: nothing was committed, running it again is safe.
+        if (e instanceof Skaidb.TransactionConflictException) return new SQLTransactionRollbackException(msg, "40001", e);
         if (m.startsWith("unique violation")) return new SQLIntegrityConstraintViolationException(msg, "23505", e);
         if (m.startsWith("not null violation")) return new SQLIntegrityConstraintViolationException(msg, "23502", e);
         if (m.startsWith("foreign key violation")) return new SQLIntegrityConstraintViolationException(msg, "23503", e);

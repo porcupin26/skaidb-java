@@ -33,7 +33,8 @@ finds it by itself, `jdbc:skaidb://host/db` URLs work in any JDBC tool, and
 - [Statements and parameters](#statements-and-parameters)
 - [Result sets](#result-sets)
 - [Streaming large results](#streaming-large-results)
-- [Batches, transactions and prepared statements](#batches-transactions-and-prepared-statements)
+- [Batches and prepared statements](#batches-and-prepared-statements)
+- [Transactions](#transactions)
 - [Connection pooling](#connection-pooling)
 - [Change streams (`subscribe`)](#change-streams-subscribe)
 - [JDBC](#jdbc)
@@ -51,7 +52,7 @@ The artifact is published through [JitPack](https://jitpack.io/#porcupin26/skaid
 which builds it from the git tag on first request. Coordinates:
 
 ```
-com.github.porcupin26:skaidb-java:v1.4.1
+com.github.porcupin26:skaidb-java:v1.5.0
 ```
 
 > **Note:** `v1.0.0` is not resolvable through JitPack — its first build
@@ -76,7 +77,7 @@ GPG-signed artifacts, which this project does not have yet).
   <dependency>
     <groupId>com.github.porcupin26</groupId>
     <artifactId>skaidb-java</artifactId>
-    <version>v1.4.1</version>
+    <version>v1.5.0</version>
   </dependency>
 </dependencies>
 ```
@@ -90,7 +91,7 @@ repositories {
 }
 
 dependencies {
-    implementation("com.github.porcupin26:skaidb-java:v1.4.1")
+    implementation("com.github.porcupin26:skaidb-java:v1.5.0")
 }
 ```
 
@@ -103,7 +104,7 @@ repositories {
 }
 
 dependencies {
-    implementation 'com.github.porcupin26:skaidb-java:v1.4.1'
+    implementation 'com.github.porcupin26:skaidb-java:v1.5.0'
 }
 ```
 
@@ -263,7 +264,7 @@ so it cannot delay unrelated statements.
 ## Statements and parameters
 
 Every statement auto-commits unless you open a transaction (see
-[Transactions](#batches-transactions-and-prepared-statements)).
+[Transactions](#transactions)).
 
 | Method | Use for | Returns |
 |--------|---------|---------|
@@ -272,6 +273,7 @@ Every statement auto-commits unless you open a transaction (see
 | `conn.executeRaw(sql)` | Any statement, SQL sent verbatim (`?` is not a placeholder). | `Result` |
 | `conn.prepare(sql)` | A statement with `?` placeholders. | `Query` |
 | `conn.stream(sql, params...)` | A large `SELECT`, read a chunk at a time; `?` placeholders bind the values after the SQL. | `RowStream` |
+| `conn.transaction(body)` | Several statements committed together, run again if the commit is refused for a conflict; see [Transactions](#transactions). | what the body returned |
 
 `Query` binds parameters JDBC-style — `?` placeholders, **1-based**
 setters, chainable:
@@ -435,7 +437,7 @@ unfinished stream leaves that connection unusable until it is closed.
 A stream that fails part-way throws from `next()`; the rows read so far
 are valid.
 
-## Batches, transactions and prepared statements
+## Batches and prepared statements
 
 **Batches.** `Query.executeBatch(List<Object[]> rows)` executes one prepared
 statement once per row in a **single round-trip** and returns the total
@@ -453,19 +455,106 @@ a retry is safe. Every row must carry exactly the statement's parameter count.
 A statement the server will not prepare (DDL, `USE`) runs row by row with
 client-side binding instead.
 
-**Transactions.** Transaction state is per connection: `conn.execute("BEGIN")`
-on a standalone server (`BEGIN ATOMIC` on a cluster, which refuses plain
-`BEGIN`), then the statements, then `COMMIT` or `ROLLBACK`. DDL is not
-transactional. A re-dial after a transport failure starts a fresh session
-without the transaction — the server has discarded it — so compare
-`conn.reconnects()` before and after the transaction's statements, or use
-the JDBC layer, which does that check for you. Outside a transaction every
-statement is atomic and auto-committed.
-
 **Prepared statements** are implicit: `conn.prepare(sql)` with parameters
 prepares server-side and caches the id on that connection, so reusing the
 same SQL text costs one round-trip per execution. There is no explicit
 `PreparedStatement` object to manage or close.
+
+## Transactions
+
+A transaction is ordinary SQL on **one connection**: `BEGIN`, the
+statements, then `COMMIT` or `ROLLBACK`. Plain `BEGIN` is for a standalone
+server; a cluster refuses it and opens a transaction with `BEGIN ATOMIC` (or
+`BEGIN ATOMIC PARTITION (col = literal)`) instead, everything else being the
+same. DDL is not transactional. Outside a transaction every statement is
+atomic and auto-committed.
+
+**The helper.** `conn.transaction(body)` sends `BEGIN`, runs the body with
+the connection, sends `COMMIT` and returns what the body returned:
+
+```java
+long balance = conn.transaction(c -> {
+    c.execute("UPDATE accounts SET balance = balance - 25 WHERE id = 1");
+    c.execute("UPDATE accounts SET balance = balance + 25 WHERE id = 2");
+    Skaidb.ResultSet rs = c.query("SELECT balance FROM accounts WHERE id = 1");
+    rs.next();
+    return rs.getLong("balance");
+});
+```
+
+- If `BEGIN` is refused, its error is thrown: the body does not run and
+  nothing else is sent.
+- If the body throws, the helper sends `ROLLBACK` and rethrows the body's
+  exception as it is; whatever the `ROLLBACK` answers is ignored.
+- If `COMMIT` is refused for a **conflict** (below), the helper starts over
+  from `BEGIN` and runs the body again, at once, up to three runs in all;
+  the third run's conflict is thrown. So the body must be safe to run more
+  than once, and should do nothing outside the database that a second run
+  would repeat (send a mail, call another service).
+- Any other `COMMIT` error is thrown as it is: no retry, and no `ROLLBACK`,
+  because a failed commit has ended the transaction.
+
+`transaction(body, attempts)` sets how many times the body may run (at
+least 1) and `transaction(body, attempts, begin)` the opening statement,
+sent verbatim — `conn.transaction(body, 3, "BEGIN ATOMIC")` on a cluster. A
+body with nothing to return ends with `return null;`, and it closes every
+`RowStream` it opens before it ends: a stream that still owns the wire
+keeps `COMMIT` and `ROLLBACK` from being sent.
+
+**Conflicts.** A standalone server (0.346 or newer) refuses a `COMMIT` when
+another writer changed a row the transaction writes after the transaction
+began. The driver throws `Skaidb.TransactionConflictException` for it — a
+subclass of `SkaidbException`, so a `catch (SkaidbException e)` still
+catches it — with the server's message, which starts with `transaction
+conflict:`. Nothing was committed, the transaction is over, and the
+connection is back in autocommit and usable: running the whole transaction
+again from `BEGIN` is safe. It is thrown wherever the server answers that
+error, not only inside the helper.
+
+**By hand**, the same sequence is:
+
+```java
+conn.execute("BEGIN");                    // refused: it throws, and nothing below runs
+try {
+    conn.execute("UPDATE accounts SET balance = balance - 25 WHERE id = 1");
+    conn.execute("UPDATE accounts SET balance = balance + 25 WHERE id = 2");
+} catch (RuntimeException e) {
+    try {
+        conn.execute("ROLLBACK");
+    } catch (Skaidb.SkaidbException ignored) {
+        // the clean-up must not replace the error it cleans up after
+    }
+    throw e;
+}
+try {
+    conn.execute("COMMIT");
+} catch (Skaidb.TransactionConflictException e) {
+    // nothing was committed and nothing is open: run it all again from BEGIN, or give up
+    throw e;
+}
+```
+
+Two rules hold however the transaction is written:
+
+- **One connection for the whole transaction.** Transaction state lives on
+  the connection, so with a `Pool` one connection is checked out for all of
+  it: `pool.transaction(body)` does that (so does
+  `pool.withConnection(key, c -> c.transaction(body))`, under an affinity
+  key) — never one checkout per statement.
+- **Stop if `BEGIN` fails.** Nothing is open then, so every statement sent
+  after it would be committed on its own.
+
+A `ROLLBACK` with nothing open is answered with success by a server ≥ 0.347
+and with an error (`no transaction in progress`) by an older one, which is
+why the clean-up above ignores what it returns.
+
+A re-dial after a transport failure starts a fresh session without the
+transaction — the server has discarded it. The helper never retries a
+transport failure and never sends `COMMIT` or `ROLLBACK` on a re-dialled
+socket (a body that swallows the failure gets `the connection was lost
+during the transaction` instead of a commit); by hand, compare
+`conn.reconnects()` before and after the transaction's statements. The JDBC
+layer does that check for you.
 
 ## Connection pooling
 
@@ -496,6 +585,9 @@ try (Skaidb.Pool pool = new Skaidb.Pool("skaidb://u:p@h1:7000,h2:7000/app", 8)) 
   members first, the one it lost last.
 - `acquire()` returns only connections that pass `isUsable()`; `release()`
   closes a broken or still-streaming connection instead of parking it.
+- `pool.transaction(body)` runs a [transaction](#transactions) on one
+  connection, checked out for all of it and returned after; it takes the
+  same `attempts` and `begin` arguments as `conn.transaction`.
 - `close()` closes the pool and every idle connection and stops its
   background thread; a later `acquire()` throws `pool is closed`.
 
@@ -620,7 +712,9 @@ Arrays and documents nest freely. Any other Java type throws
 
 Everything throws `Skaidb.SkaidbException`, an **unchecked**
 `RuntimeException` with a message and, for transport failures, a cause.
-It is one class; branch on the message if you must:
+One statement error has a subclass of its own,
+`Skaidb.TransactionConflictException` (see [Transactions](#transactions));
+for the rest, branch on the message if you must:
 
 | Situation | Message starts with | Connection afterwards |
 |-----------|---------------------|-----------------------|
@@ -632,6 +726,8 @@ It is one class; branch on the message if you must:
 | Unreadable client key | `tls_client_key ... is encrypted`, `... holds a EC PRIVATE KEY; convert it to PKCS#8`, `no PEM private key found` | never opened |
 | TLS setup problem | `TLS setup failed:` | never opened |
 | The server rejected a statement | the server's own text, e.g. a syntax or constraint error | **usable** |
+| A `COMMIT` refused because another writer changed a row the transaction writes (`TransactionConflictException`) | `transaction conflict:` | **usable**, the transaction is over: run it again |
+| The connection was lost inside `transaction(body)` and the body carried on | `the connection was lost during the transaction` | broken, or already re-dialled |
 | Parameter misuse | `parameter index ... out of range`, `statement expects N parameters`, `cannot bind ...` | usable |
 | A `NULL` read through a typed getter | `column x is NULL` | usable |
 | Another statement while streaming | `connection is busy streaming` | usable once the stream ends |
@@ -690,7 +786,9 @@ them, a `PreparedStatement` query's parameters included (server ≥ 0.330).
 `setAutoCommit(false)` opens a transaction (`BEGIN`, or `BEGIN ATOMIC`
 with `transaction=atomic` on a cluster). Errors are `SQLException`
 subclasses with SQLStates (`23505` for a unique violation, `42P01` for an
-unknown table, `28000` for a refused login, ...). Features skaidb or the
+unknown table, `28000` for a refused login, `40001` — an
+`SQLTransactionRollbackException` — for a `commit()` refused for a
+transaction conflict, ...). Features skaidb or the
 driver lacks — scrollable cursors, savepoints, `CallableStatement`,
 generated keys — throw `SQLFeatureNotSupportedException`. The full
 reference, including the type mapping and the metadata sources, is
@@ -702,6 +800,11 @@ reference, including the type mapping and the metadata sources, is
   its monitor, one at a time. For parallelism use a `Pool`.
 - `setConsistency` on the connection is a shared field; prefer
   `Query.setConsistency` from shared connections.
+- `conn.transaction(body)` holds the connection's monitor from `BEGIN` to
+  `COMMIT` or `ROLLBACK`, so other threads' statements on a shared
+  connection wait for the transaction instead of running inside it. A
+  transaction written by hand has no such guard: give it a connection of
+  its own.
 - A `RowStream` is not thread-safe: one stream, one reader. It may be
   closed from another thread.
 - `Pool` is thread-safe. Its probe and discovery refresh run on one daemon
@@ -727,6 +830,9 @@ reference, including the type mapping and the metadata sources, is
   an older one is refused with `server does not support parameterised
   streaming`. A JDBC `PreparedStatement` with a fetch size runs prepared
   there instead, its result in one frame.
+- A transaction conflict is answered by a standalone server ≥ 0.346.
+  Against a server that never answers one, `transaction(body)` runs its
+  body once.
 - Pool discovery (`PoolOptions.discover(true)`) uses `SHOW ENDPOINTS`,
   server ≥ 0.327; an older server answers it with an error and the pool
   keeps its seeds.
@@ -752,7 +858,10 @@ the Hello frame, prepared statements, batches, multiple result sets,
 streaming, the abandon/drain rule, reconnection and the pool,
 `LoadBalancingTest` drives the pool's balancing (policies, idle order,
 ejection and re-admission, discovery, read-your-writes) against fake
-members that each serve many connections, `ConformanceTest` runs the shared conformance suite (below),
+members that each serve many connections, `TransactionTest` scripts the
+fake server statement by statement for the typed conflict error and the
+`transaction` helper (retry, rollback, refused `BEGIN`),
+`ConformanceTest` runs the shared conformance suite (below),
 `CertificateAuthTest` runs certificate login against a real TLS listener
 that requires a client certificate (a throwaway test CA lives in
 `src/test/resources/tls`), and `JdbcTest` drives the JDBC layer through

@@ -8,7 +8,7 @@ is described in [JDBC.md](JDBC.md).
 ## `Skaidb`
 
 ```java
-public static final String VERSION;                  // the driver version, e.g. "1.4.1"
+public static final String VERSION;                  // the driver version, e.g. "1.5.0"
 public static String version();                      // same, as a method
 
 public static final int CONSISTENCY_ONE    = 0;
@@ -67,8 +67,39 @@ public SkaidbException(String message);
 public SkaidbException(String message, Throwable cause);
 ```
 
-The one exception type. Unchecked. Transport failures carry the underlying
-`IOException` as cause.
+The driver's exception type. Unchecked. Transport failures carry the
+underlying `IOException` as cause.
+
+### `Skaidb.TransactionConflictException extends SkaidbException`
+
+```java
+public TransactionConflictException(String message);
+```
+
+Thrown for a server error whose message starts with `transaction conflict:`
+(only the prefix is matched; the message is the server's, unchanged): a
+`COMMIT` refused because another writer changed a row the transaction
+writes after the transaction began. Nothing was committed, the transaction
+is over and the connection is back in autocommit and usable, so the whole
+transaction can be run again from `BEGIN`. It is a statement error: every
+path that throws the server's error text throws this type for that prefix
+(`execute`, `query`, `executeRaw`, a `Query`, a batch, a stream), the
+connection is not marked broken or re-dialled, and a `Pool` does not count
+it against the member.
+
+## `Skaidb.TransactionBody<T>`
+
+```java
+@FunctionalInterface
+public interface TransactionBody<T> { T run(Connection conn) throws SkaidbException; }
+```
+
+The statements of one transaction, for `Connection.transaction` and
+`Pool.transaction`: run them on `conn` and return the transaction's result
+(`null` for none). Throwing rolls the transaction back. The body runs again
+after a conflict, so it must be safe to run more than once and should do
+nothing outside the database that a second run would repeat; it does not
+send `BEGIN`, `COMMIT` or `ROLLBACK` itself.
 
 ## `Skaidb.Connection implements AutoCloseable`
 
@@ -80,6 +111,9 @@ public ResultSet  query(String sql);                  // a SELECT/CALL with no p
 public Result     executeRaw(String sql);             // SQL verbatim ('?' is not a placeholder); any answer
 public RowStream  stream(String sql);                 // chunked result; owns the connection until done
 public RowStream  stream(String sql, Object... params); // the same, '?' bound to params (server >= 0.330)
+public <T> T      transaction(TransactionBody<T> body);                            // 3 attempts, "BEGIN"
+public <T> T      transaction(TransactionBody<T> body, int attempts);              // "BEGIN"
+public <T> T      transaction(TransactionBody<T> body, int attempts, String begin);
 public void       subscribe(String stream, String after, EventHandler handler);
 public boolean    isUsable();                         // !closed && !broken && !streaming
 public long       reconnects();                       // re-dials so far (session state does not survive one)
@@ -109,6 +143,22 @@ Semantics:
   `Object[]` passed alone is the parameter list; a `List` binds as one
   array value. A value that cannot be bound throws before anything is
   sent. A stream runs at the connection's consistency level.
+- `transaction(body, attempts, begin)` sends `begin` verbatim, runs
+  `body` with this connection, sends `COMMIT` and returns the body's value.
+  `attempts` below 1 (or a null `body` or `begin`) throws before anything
+  is sent. A refused `begin` is thrown; the body does not run and nothing
+  else is sent. If the body throws, `ROLLBACK` is sent, whatever answers it
+  is ignored, and the body's exception is rethrown as it is — never
+  retried, even when it is a `TransactionConflictException`. A `COMMIT`
+  refused with a `TransactionConflictException` starts over from `begin`,
+  with no pause, until the body has run `attempts` times; the last run's
+  conflict is thrown. Any other `COMMIT` error is thrown, with no retry and
+  no `ROLLBACK`. A transport failure is never retried, and `COMMIT` and
+  `ROLLBACK` are only sent on the socket `begin` went out on: after a
+  failure in the body no `ROLLBACK` follows, and a body that swallows one
+  gets `the connection was lost during the transaction` instead of a
+  `COMMIT`. The connection's monitor is held throughout, so other threads'
+  statements wait. The body ends every `RowStream` it opens.
 - A read that exceeds `setReadTimeout` throws and marks the connection
   broken, like any transport error.
 - A transport error marks the connection broken; the next statement
@@ -232,12 +282,18 @@ public Connection acquire(Object affinity);               // idle to the picked 
 public void       release(Connection c);                  // parks it if usable, its member usable and room remains; else closes it
 public <T> T      withConnection(Work<T> work);
 public <T> T      withConnection(Object affinity, Work<T> work);
+public <T> T      transaction(TransactionBody<T> body);                            // 3 attempts, "BEGIN"
+public <T> T      transaction(TransactionBody<T> body, int attempts);              // "BEGIN"
+public <T> T      transaction(TransactionBody<T> body, int attempts, String begin);
 public List<Member> members();                            // snapshot per member, ordered by endpoint
 public void       close();                                // closes every idle connection, stops the background thread
 ```
 
 Thread-safe. A malformed DSN throws from the constructor. The probe and
 discovery refresh run on one daemon thread per pool, started on first need.
+`transaction` is `Connection.transaction` on one connection checked out
+(under the pool-wide affinity key) for the whole transaction and returned
+after; its arguments are checked before the checkout.
 Balancing follows
 [PROTOCOL.md §6.1](https://skaidb.org/docs/PROTOCOL.html#61-balancing-a-pool-across-members);
 the README's [Balancing across members](../README.md#balancing-across-members)

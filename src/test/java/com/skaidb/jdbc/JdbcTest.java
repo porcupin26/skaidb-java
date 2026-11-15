@@ -27,6 +27,7 @@ import java.sql.SQLIntegrityConstraintViolationException;
 import java.sql.SQLInvalidAuthorizationSpecException;
 import java.sql.SQLNonTransientConnectionException;
 import java.sql.SQLSyntaxErrorException;
+import java.sql.SQLTransactionRollbackException;
 import java.sql.Statement;
 import java.sql.Timestamp;
 import java.sql.Types;
@@ -552,6 +553,9 @@ class JdbcTest {
         SQLException broken = Errors.map(new Skaidb.SkaidbException("query failed: reset", new java.io.IOException("reset")));
         assertInstanceOf(java.sql.SQLRecoverableException.class, broken);
         assertEquals("08006", broken.getSQLState());
+        SQLException conflict = Errors.map(new Skaidb.TransactionConflictException("transaction conflict: a row of table t"));
+        assertEquals(SQLTransactionRollbackException.class, conflict.getClass());
+        assertEquals("40001", conflict.getSQLState());
     }
 
     // ---- transactions, DataSource, metadata ------------------------------------------------
@@ -594,6 +598,35 @@ class JdbcTest {
             c.setAutoCommit(true);   // commits
         }
         finish(atomic);
+    }
+
+    @Test
+    void aCommitConflictIsATransactionRollbackAndTheConnectionGoesOn() throws Exception {
+        String conflict = "transaction conflict: a row of table t was changed by another writer "
+            + "after the transaction began — nothing was committed; run the transaction again";
+        ConformanceServer server = new ConformanceServer("ok", List.of(
+            query("BEGIN", ConformanceServer.ddlResponse()),
+            query("UPDATE t SET n = n + 1 WHERE id = 1", ConformanceServer.mutationResponse(1)),
+            query("COMMIT", ConformanceServer.errorResponse(conflict)),
+            query("BEGIN", ConformanceServer.ddlResponse()),
+            query("UPDATE t SET n = n + 1 WHERE id = 1", ConformanceServer.mutationResponse(1)),
+            query("COMMIT", ConformanceServer.ddlResponse())));
+        try (Connection c = DriverManager.getConnection(url(server, ""), creds())) {
+            c.setAutoCommit(false);
+            Statement st = c.createStatement();
+            assertEquals(1, st.executeUpdate("UPDATE t SET n = n + 1 WHERE id = 1"));
+            SQLException e = assertThrows(SQLException.class, c::commit);
+            assertEquals(SQLTransactionRollbackException.class, e.getClass());
+            assertEquals("40001", e.getSQLState());
+            assertEquals(conflict, e.getMessage());
+            assertInstanceOf(Skaidb.TransactionConflictException.class, e.getCause());
+            // The refused commit ended the transaction: the same connection
+            // opens the next one, and running it again goes through.
+            assertEquals(1, st.executeUpdate("UPDATE t SET n = n + 1 WHERE id = 1"));
+            c.commit();
+            assertEquals(0, c.unwrap(Skaidb.Connection.class).reconnects(), "never re-dialled");
+        }
+        finish(server);
     }
 
     @Test
