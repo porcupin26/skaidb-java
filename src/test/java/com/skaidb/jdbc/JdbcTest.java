@@ -872,6 +872,7 @@ class JdbcTest {
                 scripts.get(name)));
             try (Connection c = DriverManager.getConnection(url(server, ""), creds());
                  Statement st = c.createStatement()) {
+                assertTrue(server.awaitHalfClosed(1, 5_000), name);
                 Thread.sleep(ARRIVES);
                 step.getValue().run(c, st);
                 assertEquals(1, c.unwrap(Skaidb.Connection.class).reconnects(), name);
@@ -911,6 +912,7 @@ class JdbcTest {
                 c.setAutoCommit(false);
                 Statement st = c.createStatement();
                 assertEquals(1, st.executeUpdate(update));
+                assertTrue(server.awaitHalfClosed(1, 5_000), name);
                 Thread.sleep(ARRIVES);
                 // Found gone before anything is sent: not replaced — a new
                 // session would run this outside the transaction.
@@ -940,6 +942,7 @@ class JdbcTest {
             c.setAutoCommit(false);
             Statement st = c.createStatement();
             assertEquals(1, st.executeUpdate(update));
+            assertTrue(server.awaitHalfClosed(1, 5_000));
             Thread.sleep(ARRIVES);
             c.rollback();
             assertEquals(1, server.connections());

@@ -41,6 +41,16 @@ class IdleConnectionTest {
     /** How long the tests give the server's close to reach the client. */
     static final long ARRIVES = 100;
 
+    /** The server has half-closed its first connection, and the client has had the time to see it. */
+    static void halfClosed(ConformanceServer server) {
+        try {
+            assertTrue(server.awaitHalfClosed(1, 5_000), "the server did not half-close");
+            Thread.sleep(ARRIVES);
+        } catch (InterruptedException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
     static Skaidb.ConnectOptions options(ConformanceServer s) { return TransactionTest.options(s); }
     static ConformanceServer.Exchange q(String sql, byte[]... responses) { return TransactionTest.q(sql, responses); }
     static ConformanceServer.Exchange ex(byte[] request, byte[]... responses) { return TransactionTest.ex(request, responses); }
@@ -111,7 +121,7 @@ class IdleConnectionTest {
                 List.of(ConformanceServer.idle().thenHalfClose()),
                 way.getValue().script));
             try (Skaidb.Connection c = Skaidb.connect(options(server))) {
-                Thread.sleep(ARRIVES);
+                halfClosed(server);
                 // No error reaches the application: nothing was sent on the dead connection.
                 way.getValue().run.accept(c);
                 assertEquals(1, c.reconnects(), name);
@@ -139,7 +149,8 @@ class IdleConnectionTest {
                 List.of(q(INSERT, changed(1)), q(COUNT, counted(4)))));
             try (Skaidb.Connection c = Skaidb.connect(options(server))) {
                 if (name.contains("after a statement")) assertEquals(1, c.query(COUNT).getRowCount(), name);
-                assertTrue(server.awaitEnded(name.contains("half") ? 0 : 1, 2_000), name);
+                if (name.contains("half")) assertTrue(server.awaitHalfClosed(1, 5_000), name);
+                else assertTrue(server.awaitEnded(1, 5_000), name);
                 Thread.sleep(ARRIVES);
                 assertEquals(1, c.execute(INSERT), name);
                 assertEquals(1, c.query(COUNT).getRowCount(), name);
@@ -165,7 +176,7 @@ class IdleConnectionTest {
         try (Skaidb.Connection c = Skaidb.connect(options(server).database("app"))) {
             Skaidb.Query insert = c.prepare(PREPARED);
             assertEquals(1, insert.setLong(1, 1L).setString(2, "one").executeUpdate());
-            Thread.sleep(ARRIVES);
+            halfClosed(server);
             assertEquals(1, insert.setLong(1, 2L).setString(2, "two").executeUpdate());
             assertEquals(1, c.reconnects());
         }
@@ -199,7 +210,7 @@ class IdleConnectionTest {
             List.of(ConformanceServer.idle().thenHangUp()),
             List.of(q("USE \"app\"", ok()), q(COUNT, counted(3)))));
         try (Skaidb.Connection c = Skaidb.connect(options(server).database("app"))) {
-            Thread.sleep(ARRIVES);
+            halfClosed(server);
             // One dial for the statement, and its failure is the statement's.
             Skaidb.SkaidbException e = assertThrows(Skaidb.SkaidbException.class, () -> c.query(COUNT));
             assertInstanceOf(IOException.class, e.getCause(), e.getMessage());
@@ -234,6 +245,8 @@ class IdleConnectionTest {
                 // Back in the pool and healthy; the server closes it while it sits there.
                 assertEquals(1, pool.members().get(0).idle, name);
                 server.endNow();
+                if (name.equals("half-closed")) assertTrue(server.awaitHalfClosed(1, 5_000), name);
+                else assertTrue(server.awaitEnded(1, 5_000), name);
                 Thread.sleep(ARRIVES);
                 // The checkout gives a working connection, and a statement on it succeeds.
                 Skaidb.Connection c = pool.acquire();
@@ -266,7 +279,7 @@ class IdleConnectionTest {
         try (Skaidb.Connection c = Skaidb.connect(options(server))) {
             Skaidb.SkaidbException reported = assertThrows(Skaidb.SkaidbException.class, () -> c.transaction(conn -> {
                 conn.execute(INSERT);
-                sleep(ARRIVES);
+                halfClosed(server);
                 for (String sql : new String[] { "INSERT INTO notes (id) VALUES (5)", "INSERT INTO notes (id) VALUES (6)" }) {
                     try {
                         conn.execute(sql);
@@ -300,7 +313,7 @@ class IdleConnectionTest {
             try (Skaidb.Connection c = Skaidb.connect(options(server))) {
                 c.execute("BEGIN");
                 c.execute(INSERT);
-                Thread.sleep(ARRIVES);
+                halfClosed(server);
                 if (end.equals("COMMIT")) {
                     // The loss is found before the COMMIT is written, not under it: nothing was committed.
                     Skaidb.SkaidbException e = HandWrittenTransactionTest.assertLost(
@@ -400,6 +413,8 @@ class IdleConnectionTest {
                 List.of(q(INSERT, changed(1)), q(COUNT, counted(4)))));
             try (Skaidb.Connection c = Skaidb.connect(tlsOptions(server))) {
                 if (!name.contains("Hello")) assertEquals(1, c.query(COUNT).getRowCount(), name);
+                if (name.startsWith("half")) assertTrue(server.awaitHalfClosed(1, 5_000), name);
+                else assertTrue(server.awaitEnded(1, 5_000), name);
                 Thread.sleep(ARRIVES);
                 assertEquals(1, c.execute(INSERT), name);
                 assertEquals(1, c.query(COUNT).getRowCount(), name);

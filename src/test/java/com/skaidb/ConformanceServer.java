@@ -126,6 +126,8 @@ public final class ConformanceServer implements AutoCloseable {
     private final java.util.concurrent.Semaphore told = new java.util.concurrent.Semaphore(0);
     /** Connections that have ended; guarded by this. */
     private int ended = 0;
+    /** Connections the server has half-closed; guarded by this. */
+    private int halfClosed = 0;
     private volatile String error;
     private volatile String authStartUser;
 
@@ -230,6 +232,20 @@ public final class ConformanceServer implements AutoCloseable {
         }
         return true;
     }
+    /**
+     * Wait until the server has half-closed {@code n} connections ({@link
+     * Exchange#thenHalfClose}). False when {@code millis} pass first.
+     */
+    public synchronized boolean awaitHalfClosed(int n, long millis) throws InterruptedException {
+        long deadline = System.nanoTime() + millis * 1_000_000L;
+        while (halfClosed < n) {
+            long left = (deadline - System.nanoTime()) / 1_000_000L;
+            if (left <= 0) return false;
+            wait(left);
+        }
+        return true;
+    }
+
     /** Let the connection that waits for it ({@link Exchange#whenTold}) end now. */
     public void endNow() { told.release(); }
 
@@ -304,6 +320,10 @@ public final class ConformanceServer implements AutoCloseable {
             s.setSoLinger(true, 0);
         } else if (ex.end == End.HALF_CLOSE) {
             s.shutdownOutput();
+            synchronized (this) {
+                halfClosed++;
+                notifyAll();
+            }
             java.util.concurrent.atomic.AtomicLong count = afterHalfClose.get(afterHalfClose.size() - 1);
             byte[] sink = new byte[4096];
             try {
