@@ -161,9 +161,12 @@ Semantics:
   statements wait. The body ends every `RowStream` it opens.
 - A read that exceeds `setReadTimeout` throws and marks the connection
   broken, like any transport error.
-- A transport error marks the connection broken; the next statement
-  re-dials (seed failover, handshake, Hello, `USE`), clears the prepared
-  cache, and only then runs. The failed statement is not retried.
+- A transport error marks the connection broken and closes its socket at
+  once, so the server drops the session (and a transaction open on it)
+  without waiting for the connection's next use; so does a stream that
+  loses its place on the wire. The next statement re-dials (seed failover,
+  handshake, Hello, `USE`), clears the prepared cache, and only then runs.
+  The failed statement is not retried.
 - `subscribe` blocks until the handler returns `false` or the thread is
   interrupted. It polls `_stream_<name>` in pages of 500 with a 500 ms idle
   sleep.

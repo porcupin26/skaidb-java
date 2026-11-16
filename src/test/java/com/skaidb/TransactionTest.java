@@ -34,6 +34,7 @@ class TransactionTest {
         + "after the transaction began — nothing was committed; run the transaction again";
 
     static final String UPDATE = "UPDATE accounts SET balance = balance - 25 WHERE id = 1";
+    static final String PREPARED = "INSERT INTO ledger (id, amount) VALUES (?, ?)";
 
     static ConformanceServer server(ConformanceServer.Exchange... script) throws IOException {
         return new ConformanceServer("ok", List.of(script));
@@ -419,6 +420,82 @@ class TransactionTest {
         }
         assertNull(server.finish());
         assertEquals(List.of("BEGIN", UPDATE), sent(server));
+    }
+
+    // ---- a broken connection closes its socket at once ------------------------------
+
+    /** How long the fake server waits to see the driver's socket close. */
+    static final long SOON = 2_000;
+
+    @Test
+    void aReadTimeoutInsideATransactionClosesTheSocketAtOnce() throws Exception {
+        // The server never answers the body's statement: the read times out.
+        ConformanceServer server = server(q("BEGIN", ok()), q(UPDATE));
+        try (Skaidb.Connection c = connect(server)) {
+            c.setReadTimeout(200);
+            Skaidb.SkaidbException e = assertThrows(Skaidb.SkaidbException.class,
+                () -> c.transaction(conn -> conn.execute(UPDATE)));
+            assertInstanceOf(java.net.SocketTimeoutException.class, e.getCause());
+            assertFalse(c.isUsable());
+            // Nothing more is asked of the connection — no statement, no
+            // close() — and the server already sees the socket go: it drops
+            // the session, and the transaction left open on it, now.
+            assertTrue(server.awaitEnded(1, SOON), "the dead socket stayed open, and the transaction with it");
+            assertEquals(0, c.reconnects());
+        }
+        assertNull(server.finish());
+        assertEquals(List.of("BEGIN", UPDATE), sent(server));
+    }
+
+    /** One way of breaking a connection: the script, and the call that fails on it. */
+    static final class Break {
+        final String name;
+        final List<ConformanceServer.Exchange> script;
+        final java.util.function.Consumer<Skaidb.Connection> call;
+        final boolean raises;
+        Break(String name, java.util.function.Consumer<Skaidb.Connection> call, boolean raises,
+              ConformanceServer.Exchange... script) {
+            this.name = name;
+            this.script = List.of(script);
+            this.call = call;
+            this.raises = raises;
+        }
+    }
+
+    @Test
+    void howeverAConnectionBreaksItsSocketIsClosedAtOnce() throws Exception {
+        String select = "SELECT id FROM accounts";
+        byte[] stream = ConformanceServer.streamRequest(select, QUORUM);
+        byte[] header = ConformanceServer.rowsHeaderResponse("id");
+        byte[] chunk = ConformanceServer.rowsChunkResponse(new Object[] { 1L });
+        List<Break> breaks = List.of(
+            new Break("a statement's answer times out", c -> c.query("SELECT 1"), true, q("SELECT 1")),
+            new Break("a prepare's answer times out", c -> c.prepare(PREPARED).setLong(1, 7L).setLong(2, 25L).executeUpdate(),
+                true, ex(ConformanceServer.prepareRequest(PREPARED))),
+            new Break("a stream's first frame times out", c -> c.stream(select), true, ex(stream)),
+            new Break("a stream's next frame times out", c -> c.stream(select).next(), true, ex(stream, header)),
+            // The socket is healthy in the next two: only the position on it is lost.
+            new Break("a stream request is answered with a frame no stream starts with", c -> c.stream(select),
+                true, ex(stream, ConformanceServer.preparedResponse(1, 0))),
+            new Break("a frame that is not the stream's arrives in it", c -> c.stream(select).next(),
+                true, ex(stream, header, ok())),
+            new Break("an abandoned stream cannot be drained", c -> {
+                Skaidb.RowStream rows = c.stream(select);
+                assertTrue(rows.next());
+                rows.close();   // never throws; the rest of the stream does not arrive
+            }, false, ex(stream, header, chunk)));
+        for (Break b : breaks) {
+            ConformanceServer server = new ConformanceServer("ok", b.script);
+            try (Skaidb.Connection c = connect(server)) {
+                c.setReadTimeout(200);
+                if (b.raises) assertThrows(Skaidb.SkaidbException.class, () -> b.call.accept(c), b.name);
+                else b.call.accept(c);
+                assertFalse(c.isUsable(), b.name);
+                assertTrue(server.awaitEnded(1, SOON), b.name + ": the socket stayed open");
+                assertEquals(0, c.reconnects(), b.name);
+            }
+            assertNull(server.finish(), b.name);
+        }
     }
 
     // ---- threads and pools ---------------------------------------------------------

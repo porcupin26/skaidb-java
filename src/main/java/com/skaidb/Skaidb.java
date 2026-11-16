@@ -377,7 +377,8 @@ public final class Skaidb {
 
     public static final class Connection implements AutoCloseable {
         private static int nonceCounter = 0;
-        private Socket socket;
+        /** Volatile: markBroken() closes it from a stream's reader, outside the monitor. */
+        private volatile Socket socket;
         private DataInputStream in;
         private OutputStream out;
         private int consistency;
@@ -388,8 +389,9 @@ public final class Skaidb {
         // to be atomic (see stream()).
         private volatile boolean closed = false;
         /**
-         * Transport died, or a stream left the wire at an unknown position;
-         * the next statement re-dials (see ensureLive).
+         * Transport died, or a stream left the wire at an unknown position:
+         * the socket is closed (see markBroken) and the next statement
+         * re-dials (see ensureLive).
          */
         private volatile boolean broken = false;
         /** A RowStream owns the wire until it ends; see requireIdle(). */
@@ -809,8 +811,8 @@ public final class Skaidb {
          * Bound every read on this connection to {@code millis} (0 = wait
          * forever, the default). A read that times out throws and marks the
          * connection broken — the server may still be running the statement
-         * and its answer would arrive out of turn — so the next statement
-         * re-dials. Applies to later re-dials too.
+         * and its answer would arrive out of turn — so the socket is closed
+         * and the next statement re-dials. Applies to later re-dials too.
          */
         public synchronized void setReadTimeout(int millis) {
             if (millis < 0) throw new SkaidbException("read timeout must be >= 0");
@@ -818,7 +820,7 @@ public final class Skaidb {
             try {
                 if (socket != null) socket.setSoTimeout(millis);
             } catch (IOException e) {
-                broken = true;
+                markBroken();
             }
         }
 
@@ -1035,7 +1037,7 @@ public final class Skaidb {
                     // The server answered a stream request with something a
                     // stream cannot start with; whatever follows is not ours
                     // to interpret, so do not reuse this socket.
-                    broken = true;
+                    markBroken();
                     throw new SkaidbException("unexpected response tag " + tag + " to stream request");
                 }
                 noteStatement(sql);
@@ -1056,7 +1058,7 @@ public final class Skaidb {
                 return new RowStream(this, cols, true, -1L);
             } catch (IOException e) {
                 // Half a request may be on the wire, or half a header off it.
-                broken = true;
+                markBroken();
                 observeFailure();
                 throw new SkaidbException("stream failed: " + e.getMessage(), e);
             }
@@ -1075,20 +1077,37 @@ public final class Skaidb {
             try {
                 return readFrame();
             } catch (IOException e) {
-                broken = true;   // socket gone; the next statement re-dials
+                markBroken();   // socket gone; the next statement re-dials
                 observeFailure();
                 throw new SkaidbException("stream read failed: " + e.getMessage(), e);
             }
         }
 
         /**
-         * Called by RowStream when it can no longer say where the next frame
-         * starts. The connection then fails isUsable() — so a Pool drops it
-         * rather than handing the desync to the next borrower — and ensureLive
-         * re-dials before the next statement instead of reading leftover
-         * stream frames as that statement's answer.
+         * The transport died, or — called by RowStream — nobody can say any
+         * more where the next frame starts. The connection then fails
+         * isUsable() — so a Pool drops it rather than handing the desync to
+         * the next borrower — and ensureLive re-dials before the next
+         * statement instead of reading leftover stream frames as that
+         * statement's answer.
+         *
+         * <p>The socket is closed here and now, not at that next statement
+         * or at close(): the server drops a session with its socket, so a
+         * transaction left open on this one — and the rows it holds — ends
+         * with the failure instead of outliving it for as long as the
+         * application leaves the connection alone. Takes no lock: a stream's
+         * reader gets here without the connection's monitor.
          */
-        void markBroken() { broken = true; }
+        void markBroken() {
+            broken = true;
+            Socket s = socket;
+            if (s == null) return;
+            try {
+                s.close();
+            } catch (IOException ignored) {
+                // already gone
+            }
+        }
 
         /** Give the wire back; the connection accepts statements again. */
         void endStream() { streaming = false; }
@@ -1127,7 +1146,7 @@ public final class Skaidb {
             } catch (IOException e) {
                 // As in roundtrip: the wire position is unknown, so the next
                 // statement re-dials instead of reusing this socket.
-                broken = true;
+                markBroken();
                 observeFailure();
                 throw new SkaidbException("prepare failed: " + e.getMessage(), e);
             }
@@ -1197,7 +1216,7 @@ public final class Skaidb {
                 // retried here — an ambiguous write must never be repeated
                 // silently. The connection is marked broken; the next
                 // statement re-dials through ensureLive.
-                broken = true;
+                markBroken();
                 observeFailure();
                 throw new SkaidbException("query failed: " + e.getMessage(), e);
             }
@@ -1263,7 +1282,7 @@ public final class Skaidb {
                 Pool owner = pool;
                 dial(owner == null ? null : owner.dialOrder(connectedEp));
             } catch (RuntimeException e) {
-                broken = true;   // still down; the next statement retries
+                markBroken();   // still down; the next statement retries
                 throw e;
             }
         }

@@ -27,6 +27,10 @@ import javax.crypto.spec.SecretKeySpec;
  * SCRAM handshake verified independently of the driver (JCE PBKDF2 + HMAC,
  * never the driver's own code), then the given exchanges replayed byte for
  * byte. Any deviation is kept in {@link #error()}.
+ *
+ * <p>{@link #sessions} scripts several connections, served one after the
+ * other — what a driver that re-dials talks to — and an exchange {@link
+ * Exchange#thenHangUp() can end} its connection from the server's side.
  */
 public final class ConformanceServer implements AutoCloseable {
 
@@ -46,26 +50,58 @@ public final class ConformanceServer implements AutoCloseable {
     public static final class Exchange {
         final byte[] request;
         final List<byte[]> responses;
+        /** The server closes the socket once the responses are out. */
+        final boolean hangUp;
         public Exchange(byte[] request, List<byte[]> responses) {
+            this(request, responses, false);
+        }
+        private Exchange(byte[] request, List<byte[]> responses, boolean hangUp) {
             this.request = request;
             this.responses = responses;
+            this.hangUp = hangUp;
         }
+        /**
+         * This exchange, after which the server closes the socket: the
+         * connection is lost — under this request when it has no responses,
+         * otherwise while the client sits idle after them. The last
+         * exchange of its connection's script.
+         */
+        public Exchange thenHangUp() { return new Exchange(request, responses, true); }
     }
 
     private final ServerSocket listener;
     private final Thread thread;
     private final String outcome;
-    private final List<Exchange> pending;
+    /** One script per connection, in the order the connections are accepted. */
+    private final List<List<Exchange>> scripts;
     private final List<byte[]> requests = new CopyOnWriteArrayList<>();
+    /** The requests of each accepted connection. */
+    private final List<List<byte[]>> received = new CopyOnWriteArrayList<>();
+    /** Connections that have ended; guarded by this. */
+    private int ended = 0;
     private volatile String error;
     private volatile String authStartUser;
 
     /** {@code outcome} is one of auth.outcomes' names: ok, bad_server_signature, denied. */
     public ConformanceServer(String outcome, List<Exchange> exchanges) throws IOException {
+        this(outcome, List.of(exchanges), 1);
+    }
+
+    /**
+     * A server for several connections, one after the other, each replaying
+     * the script of its turn; every login is accepted. A connection ends
+     * when the client closes its socket or its script hangs up, and once
+     * the last one has ended nothing listens any more.
+     */
+    public static ConformanceServer sessions(List<List<Exchange>> scripts) throws IOException {
+        return new ConformanceServer("ok", scripts, scripts.size());
+    }
+
+    private ConformanceServer(String outcome, List<List<Exchange>> scripts, int backlog) throws IOException {
         this.outcome = outcome;
-        this.pending = new ArrayList<>(exchanges);
+        this.scripts = new ArrayList<>(scripts);
         listener = new ServerSocket();
-        listener.bind(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0), 1);
+        listener.bind(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0), backlog);
         thread = new Thread(this::run, "conformance-server");
         thread.setDaemon(true);
         thread.start();
@@ -98,6 +134,24 @@ public final class ConformanceServer implements AutoCloseable {
     public String error() { return error; }
     /** The non-ignorable requests received, in order. */
     public List<byte[]> requests() { return requests; }
+    /** How many connections were accepted. */
+    public int connections() { return received.size(); }
+    /** The non-ignorable requests connection {@code n} (the first is 0) sent, in order. */
+    public List<byte[]> requests(int n) { return received.get(n); }
+
+    /**
+     * Wait until {@code n} connections have ended — the client closed its
+     * socket, or the script hung up. False when {@code millis} pass first.
+     */
+    public synchronized boolean awaitEnded(int n, long millis) throws InterruptedException {
+        long deadline = System.nanoTime() + millis * 1_000_000L;
+        while (ended < n) {
+            long left = (deadline - System.nanoTime()) / 1_000_000L;
+            if (left <= 0) return false;
+            wait(left);
+        }
+        return true;
+    }
     /** The username the client put in AuthStart. */
     public String authStartUser() { return authStartUser; }
 
@@ -116,14 +170,30 @@ public final class ConformanceServer implements AutoCloseable {
     private static Map<String, Object> auth() { return Json.obj(V.get("auth")); }
 
     private void run() {
-        try (Socket s = listener.accept()) {
-            serve(new DataInputStream(s.getInputStream()), s.getOutputStream());
-        } catch (Exception e) {
-            if (error == null) error = e.getClass().getSimpleName() + ": " + e.getMessage();
+        try {
+            for (List<Exchange> script : scripts) {
+                try (Socket s = listener.accept()) {
+                    List<byte[]> got = new CopyOnWriteArrayList<>();
+                    received.add(got);
+                    serve(new DataInputStream(s.getInputStream()), s.getOutputStream(), new ArrayList<>(script), got);
+                } catch (Exception e) {
+                    if (error == null) error = e.getClass().getSimpleName() + ": " + e.getMessage();
+                }
+                synchronized (this) {
+                    ended++;
+                    notifyAll();
+                }
+                if (error != null) return;
+            }
+        } finally {
+            // Nothing is scripted past this point: a further dial is refused
+            // at once instead of waiting for a handshake that never comes.
+            close();
         }
     }
 
-    private void serve(DataInputStream in, OutputStream out) throws Exception {
+    private void serve(DataInputStream in, OutputStream out, List<Exchange> pending, List<byte[]> got)
+            throws Exception {
         Map<String, Object> challenge = Json.obj(auth().get("challenge"));
         byte[] start = readFrame(in);
         if (start == null || start[0] != 10) throw new IllegalStateException("expected AuthStart");
@@ -181,6 +251,7 @@ public final class ConformanceServer implements AutoCloseable {
                 continue;
             }
             requests.add(req);
+            got.add(req);
             if (pending.isEmpty()) {
                 error = "unexpected extra request " + hex(req);
                 return;
@@ -191,6 +262,10 @@ public final class ConformanceServer implements AutoCloseable {
                 return;
             }
             for (byte[] resp : ex.responses) writeFrame(out, resp);
+            if (ex.hangUp) {
+                if (!pending.isEmpty()) error = "the script goes on after a hang-up";
+                return;
+            }
         }
     }
 

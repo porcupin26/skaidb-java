@@ -257,9 +257,9 @@ Connecting to a seed times out after 10 seconds. By default there is **no
 read timeout**: a statement blocks for as long as the server takes, which
 is the JDBC default too. `conn.setReadTimeout(millis)` bounds every read on
 the connection; a read that times out throws and marks the connection
-broken (the server may still answer later, out of turn), so the next
-statement re-dials. Put long-running work on its own connection (or pool)
-so it cannot delay unrelated statements.
+broken (the server may still answer later, out of turn): its socket is
+closed at once and the next statement re-dials. Put long-running work on
+its own connection (or pool) so it cannot delay unrelated statements.
 
 ## Statements and parameters
 
@@ -736,9 +736,12 @@ for the rest, branch on the message if you must:
 | Used after `close()` | `connection is closed` | closed |
 
 A statement error never damages the connection. A transport error marks it
-broken: the next statement re-dials through the seed list, re-authenticates,
-re-enters the session database and clears the prepared-statement cache —
-a recovered connection is indistinguishable from a fresh one. The failed
+broken and closes its socket at once: the server drops the session, and a
+transaction left open on it, with the socket rather than when the
+connection is next used. The next statement re-dials through the seed
+list, re-authenticates, re-enters the session database and clears the
+prepared-statement cache — a recovered connection is indistinguishable
+from a fresh one. The failed
 statement itself is **not retried**: it may already have executed, and an
 ambiguous write must never be repeated silently. Retry at the call site
 where you know whether that is safe. `isUsable()` tells a pool (or you)
