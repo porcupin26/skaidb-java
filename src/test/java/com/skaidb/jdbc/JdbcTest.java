@@ -1184,6 +1184,52 @@ class JdbcTest {
         finish(none);
     }
 
+    @Test
+    void sessionSettingsSurviveAReDial() throws Exception {
+        String budget = "SET SCAN BUDGET ROWS 1";
+        String all = "SET CONSISTENCY ALL";
+        String scan = "SELECT id FROM notes";
+        String refused = "resource limit: scan budget exceeded (2 rows examined)";
+        byte[] ok = ConformanceServer.ddlResponse();
+        Map<String, TransactionStep> ways = new java.util.LinkedHashMap<>();
+        ways.put("a Statement", (c, st) -> {
+            st.execute(budget);
+            st.execute(all);
+        });
+        ways.put("a PreparedStatement", (c, st) -> {
+            c.prepareStatement(budget).execute();
+            c.prepareStatement(all).executeUpdate();
+        });
+        for (Map.Entry<String, TransactionStep> way : ways.entrySet()) {
+            String name = way.getKey();
+            ConformanceServer server = ConformanceServer.sessions(List.of(
+                List.of(query("USE \"app\"", ok), query(budget, ok), query(all, ok).thenHangUp()),
+                // The new session: its database, the consistency override, the scan budget — then the statement.
+                List.of(query("USE \"app\"", ok), query(all, ok), query(budget, ok),
+                    query(scan, ConformanceServer.errorResponse(refused)),
+                    query("SET SCAN BUDGET DEFAULT", ok), query("SET CONSISTENCY DEFAULT", ok).thenHangUp()),
+                // Put back to their defaults, they are not sent again.
+                List.of(query("USE \"app\"", ok),
+                    query(scan, ConformanceServer.rowsResponse(new String[] { "id" }, new Object[] { 1L })))));
+            try (Connection c = DriverManager.getConnection(url(server, "/app"), creds());
+                 Statement st = c.createStatement()) {
+                way.getValue().run(c, st);
+                assertTrue(server.awaitEnded(1, 2_000), name);
+                assertTrue(ConformanceServer.awaitSeenClosed(c.unwrap(Skaidb.Connection.class), 2_000), name);
+                // The limit the application set still holds on the new session.
+                SQLException e = assertThrows(SQLException.class, () -> st.executeQuery(scan), name);
+                assertEquals(refused, e.getMessage(), name);
+                st.execute("SET SCAN BUDGET DEFAULT");
+                st.execute("SET CONSISTENCY DEFAULT");
+                assertTrue(server.awaitEnded(2, 2_000), name);
+                assertTrue(ConformanceServer.awaitSeenClosed(c.unwrap(Skaidb.Connection.class), 2_000), name);
+                assertTrue(st.executeQuery(scan).next(), name);
+                assertEquals(2, c.unwrap(Skaidb.Connection.class).reconnects(), name);
+            }
+            assertNull(server.finish(), name);
+        }
+    }
+
     // ---- the statements a connection holds on the server --------------------------------
 
     @Test

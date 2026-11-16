@@ -23,7 +23,8 @@ The port defaults to 7000. The path is the session database (entered with
 `USE` after every connect and reconnect); `setCatalog`, or a `USE` sent
 through a statement, changes it, and a reconnect then enters the database
 the connection was last in. `getCatalog()` is that database, however it
-was entered. Values are percent-decoded (`%40`
+was entered. A `SET CONSISTENCY ...` or `SET SCAN BUDGET ...` sent through
+a statement is kept across a reconnect too. Values are percent-decoded (`%40`
 is `@`; a `+` stays a `+`). Keys given as `Properties` (including the
 `user`/`password` of `DriverManager.getConnection(url, user, password)`)
 override the URL's. An unknown key in the URL is an error; unknown

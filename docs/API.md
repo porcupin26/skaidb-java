@@ -199,7 +199,8 @@ Semantics:
   once, so the server drops the session (and a transaction open on it)
   without waiting for the connection's next use; so does a stream that
   loses its place on the wire. The next statement re-dials (seed failover,
-  handshake, Hello, `USE`), clears the prepared cache, and only then runs.
+  handshake, Hello, `USE`, the session's settings), clears the prepared
+  cache, and only then runs.
   The failed statement is not retried.
 - The session database is the `database` option until a `USE` statement
   the server accepts enters another (`USE [DATABASE] name [;]`, the name
@@ -208,7 +209,12 @@ Semantics:
   chosen (the session is then in the server's `default`). Every re-dial
   enters the current one before the statement that caused it is sent; if
   that `USE` is refused the statement throws its error, the connection
-  stays broken and the next statement dials again. `Pool.release` closes a
+  stays broken and the next statement dials again. The session's `SET
+  CONSISTENCY ...` and `SET SCAN BUDGET ...` — the last of each the server
+  accepted, sent as a statement on any path — are noted likewise and sent
+  again after the `USE`, in that order, unless `... DEFAULT` has cleared
+  them; a setting refused on the new connection fails the statement the
+  same way. `Pool.release` closes a
   connection whose session database is no longer the pool's own (a pool
   without a `database` option keeps it).
 - `subscribe` blocks until the handler returns `false` or the thread is

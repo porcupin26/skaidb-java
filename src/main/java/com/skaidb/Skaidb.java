@@ -504,6 +504,15 @@ public final class Skaidb {
          * dial enters it before anything else is sent (see dial).
          */
         private volatile String database;
+        /**
+         * The session's consistency override and its scan budget: the
+         * {@code SET CONSISTENCY ...} and {@code SET SCAN BUDGET ...}
+         * statement the server accepted last, each null while its setting
+         * is at the server's default. State of the server-side session
+         * like the database, so every dial sends them again (see dial).
+         */
+        private volatile String consistencySetting;
+        private volatile String scanBudgetSetting;
         /** SO_TIMEOUT for every read, 0 = none; re-applied on each re-dial. */
         private volatile int readTimeoutMs = 0;
         /** How many times ensureLive re-dialled; see {@link #reconnects()}. */
@@ -613,17 +622,22 @@ public final class Skaidb {
                 // have changed it since. A statement must never run in
                 // another database than the one the application chose, so
                 // a refusal here fails the dial, and the statement with it.
+                // So are the session's settings: its consistency override,
+                // then its scan budget. A statement must not run under
+                // other settings than the application set either.
                 String db = database;
-                if (!db.isEmpty()) {
-                    try {
-                        restore("USE \"" + db.replace("\"", "\"\"") + "\"");
-                    } catch (RuntimeException e) {
-                        // No connection comes of this dial, so nothing would
-                        // close its socket later: the session the server
-                        // opened for it must not outlive the refusal.
-                        try { s.close(); } catch (IOException ignored) {}
-                        throw e;
-                    }
+                try {
+                    if (!db.isEmpty()) restore("USE \"" + db.replace("\"", "\"\"") + "\"");
+                    String setting = consistencySetting;
+                    if (setting != null) restore(setting);
+                    setting = scanBudgetSetting;
+                    if (setting != null) restore(setting);
+                } catch (RuntimeException e) {
+                    // No connection comes of this dial, so nothing would
+                    // close its socket later: the session the server
+                    // opened for it must not outlive the refusal.
+                    closeSocket();
+                    throw e;
                 }
                 return;
             }
@@ -640,7 +654,7 @@ public final class Skaidb {
         private void restore(String sql) {
             byte[] body = sql.getBytes(StandardCharsets.UTF_8);
             roundtrip(new Buf().u8(1).u8(consistency).u32(body.length).raw(body).toBytes());
-            noteStatement(sql);
+            noteSession(sql);
         }
 
         /**
@@ -1086,10 +1100,11 @@ public final class Skaidb {
 
         /**
          * How many times this connection has re-dialled after a transport
-         * failure. Session state the driver does not restore ({@code SET}
-         * variables other than the session database) does not survive a
-         * re-dial, so a caller holding such state compares this before and
-         * after its statements. A transaction is never re-dialled out of:
+         * failure. A re-dial puts the session back where it was: its
+         * database, its {@code SET CONSISTENCY} override and its {@code
+         * SET SCAN BUDGET} are sent again, and its prepared statements
+         * are prepared again when they are next used. A transaction is
+         * never re-dialled out of:
          * from the answer to its {@code BEGIN} — the helper's, or one the
          * application sent itself — to its {@code COMMIT} or {@code
          * ROLLBACK} a lost connection is reported, not replaced.
@@ -1142,18 +1157,47 @@ public final class Skaidb {
         }
 
         /**
-         * A statement succeeded: a USE has moved the session to another
-         * database, which a re-dial has to enter again; a BEGIN of the
-         * application's has opened a transaction, which no re-dial may
-         * leave behind; and a pool with read-your-writes on remembers
+         * A statement succeeded: the session may have changed with it (see
+         * noteSession), and a pool with read-your-writes on remembers
          * which member took a write.
          */
         void noteStatement(String sql) {
-            String entered = usedDatabase(sql);
-            if (entered != null) database = entered;
-            if (!helping && beginsTransaction(sql)) noted = true;
+            noteSession(sql);
             Pool owner = pool;
             if (owner != null && isWrite(sql)) owner.wrote(this);
+        }
+
+        /**
+         * What a statement the server accepted has changed in the session,
+         * and a new connection has to be given again: a USE its database,
+         * a SET CONSISTENCY or SET SCAN BUDGET that setting — or, with
+         * DEFAULT, nothing any more. And a BEGIN of the application's has
+         * opened a transaction.
+         */
+        private void noteSession(String sql) {
+            String entered = usedDatabase(sql);
+            if (entered != null) database = entered;
+            String[] set = sessionSetting(sql);
+            if (set != null) {
+                if (set[0].equals("consistency")) consistencySetting = set[1];
+                else scanBudgetSetting = set[1];
+            }
+            if (!helping && beginsTransaction(sql)) noted = true;
+        }
+
+        /**
+         * What to note for a statement that ran prepared, its values sent
+         * beside it: the statement itself — or, for a session setting, the
+         * statement with its values written into it, which is what a new
+         * connection has to be sent.
+         */
+        String withValues(String sql, Object[] params) {
+            if (params.length == 0 || sessionSetting(sql) == null) return sql;
+            try {
+                return bind(sql, params);
+            } catch (SkaidbException e) {
+                return sql;   // a value with no literal form: no setting takes one
+            }
         }
 
         /**
@@ -2033,7 +2077,7 @@ public final class Skaidb {
                         throw new SkaidbException(
                             "statement expects " + p[1] + " parameters, got " + params.length);
                     Object res = conn.execPrepared(p[0], params, level());
-                    conn.noteStatement(sql);
+                    conn.noteStatement(conn.withValues(sql, params));
                     return res;
                 }
             } catch (Unpreparable e) {
@@ -2074,7 +2118,7 @@ public final class Skaidb {
                             "batch row expects " + p[1] + " parameters, got " + r.length);
                 }
                 Object res = conn.execBatch(p[0], rows, level());
-                conn.noteStatement(sql);
+                conn.noteStatement(conn.withValues(sql, rows.get(rows.size() - 1)));
                 return res instanceof Long ? (Long) res : 0L;
             }
         }
@@ -2717,6 +2761,36 @@ public final class Skaidb {
         if (words[0].equalsIgnoreCase("COMMIT")) return ENDS_COMMIT;
         if (words[0].equalsIgnoreCase("ROLLBACK")) return ENDS_ROLLBACK;
         return 0;
+    }
+
+    /**
+     * The session setting {@code sql} makes, when it is exactly one {@code
+     * SET CONSISTENCY ...} or {@code SET SCAN BUDGET ...} statement: its
+     * kind ({@code consistency} or {@code scan budget}), then the statement
+     * to send again on a new connection — as written, less its comments
+     * and its semicolon — or null when it puts the setting back ({@code
+     * ... DEFAULT}), so that nothing is to be sent again. Null for
+     * everything else. The driver reads no further than the kind: what
+     * the setting is, is between the application and the server.
+     */
+    static String[] sessionSetting(String sql) {
+        String s = oneStatement(sql);
+        if (s == null) return null;
+        String[] words = s.split("\\s+");
+        if (words.length < 2 || !words[0].equalsIgnoreCase("SET")) return null;
+        String kind;
+        int value;
+        if (words[1].equalsIgnoreCase("CONSISTENCY")) {
+            kind = "consistency";
+            value = 2;
+        } else if (words.length > 2 && words[1].equalsIgnoreCase("SCAN") && words[2].equalsIgnoreCase("BUDGET")) {
+            kind = "scan budget";
+            value = 3;
+        } else {
+            return null;
+        }
+        boolean back = words.length > value && words[value].equalsIgnoreCase("DEFAULT");
+        return new String[] { kind, back ? null : s };
     }
 
     private static int skipSpace(String sql, int i) {

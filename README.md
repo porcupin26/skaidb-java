@@ -780,9 +780,10 @@ A statement error never damages the connection. A transport error marks it
 broken and closes its socket at once: the server drops the session, and a
 transaction left open on it, with the socket rather than when the
 connection is next used. The next statement re-dials through the seed
-list, re-authenticates, re-enters the session database and clears the
-prepared-statement cache — a recovered connection is indistinguishable
-from a fresh one. The failed statement itself is **not retried**: it may
+list, re-authenticates, re-enters the session database, sets the session's
+consistency override and scan budget again and clears the
+prepared-statement cache — a recovered connection is the session the
+broken one was. The failed statement itself is **not retried**: it may
 already have executed, and an ambiguous write must never be repeated
 silently. Retry at the call site where you know whether that is safe.
 `isUsable()` tells a pool (or you) whether a connection is closed, broken
@@ -812,6 +813,15 @@ the name bare or in double quotes, with nothing after it but an optional
 that database on the new socket before it sends anything
 else, and if the server refuses it there the statement fails with that
 error instead of running in another database.
+
+The session's settings are restored the same way. A `SET CONSISTENCY ...`
+and a `SET SCAN BUDGET ...` statement the server accepted are noted, the
+last of each kind, and sent again on the new socket — after the session
+database, the consistency override first — before the statement that
+caused the re-dial; `SET CONSISTENCY DEFAULT` and `SET SCAN BUDGET DEFAULT`
+clear the note, so nothing is sent for a setting that is back at its
+default. If the server refuses a setting there, the statement fails with
+that error: it never runs under other settings than the ones you set.
 
 ## JDBC
 
