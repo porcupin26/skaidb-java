@@ -26,6 +26,7 @@ import java.sql.SQLFeatureNotSupportedException;
 import java.sql.SQLIntegrityConstraintViolationException;
 import java.sql.SQLInvalidAuthorizationSpecException;
 import java.sql.SQLNonTransientConnectionException;
+import java.sql.SQLRecoverableException;
 import java.sql.SQLSyntaxErrorException;
 import java.sql.SQLTransactionRollbackException;
 import java.sql.Statement;
@@ -627,6 +628,90 @@ class JdbcTest {
             assertEquals(0, c.unwrap(Skaidb.Connection.class).reconnects(), "never re-dialled");
         }
         finish(server);
+    }
+
+    /** A statement of a transaction, in one of the forms JDBC runs one. */
+    interface TransactionStep {
+        void run(Connection c, Statement st) throws SQLException;
+    }
+
+    @Test
+    void noStatementOfATransactionRunsOnANewSessionAfterTheConnectionIsLost() throws Exception {
+        String update = "UPDATE t SET n = n + 1 WHERE id = 1";
+        String insert = "INSERT INTO t (id) VALUES (2)";
+        String prepared = "INSERT INTO t (id) VALUES (?)";
+        Map<String, TransactionStep> steps = new java.util.LinkedHashMap<>();
+        steps.put("a Statement", (c, st) -> st.executeUpdate(insert));
+        steps.put("a query", (c, st) -> st.executeQuery("SELECT id FROM t"));
+        steps.put("a PreparedStatement", (c, st) -> {
+            PreparedStatement ps = c.prepareStatement(prepared);
+            ps.setInt(1, 2);
+            ps.executeUpdate();
+        });
+        steps.put("a Statement batch", (c, st) -> {
+            st.addBatch(insert);
+            st.addBatch("INSERT INTO t (id) VALUES (3)");
+            st.executeBatch();
+        });
+        steps.put("a PreparedStatement batch", (c, st) -> {
+            PreparedStatement ps = c.prepareStatement(prepared);
+            ps.setInt(1, 2);
+            ps.addBatch();
+            ps.setInt(1, 3);
+            ps.addBatch();
+            ps.executeBatch();
+        });
+        steps.put("a streamed Statement", (c, st) -> {
+            st.setFetchSize(100);
+            st.executeQuery("SELECT id FROM t");
+        });
+        steps.put("a streamed PreparedStatement", (c, st) -> {
+            PreparedStatement ps = c.prepareStatement("SELECT id FROM t WHERE id > ?");
+            ps.setFetchSize(100);
+            ps.setInt(1, 0);
+            ps.executeQuery();
+        });
+        steps.put("commit()", (c, st) -> c.commit());
+        steps.put("setAutoCommit(true)", (c, st) -> c.setAutoCommit(true));
+        for (Map.Entry<String, TransactionStep> step : steps.entrySet()) {
+            String name = step.getKey();
+            ConformanceServer server = ConformanceServer.sessions(List.of(
+                // The server goes away under the transaction's second statement ...
+                List.of(query("BEGIN", ConformanceServer.ddlResponse()),
+                    query(update, ConformanceServer.mutationResponse(1)),
+                    query(insert).thenHangUp()),
+                // ... and whoever dials next finds a session with no transaction open.
+                List.of(query("BEGIN", ConformanceServer.ddlResponse()),
+                    query("SELECT 1", ConformanceServer.rowsResponse(new String[] { "x" }, new Object[] { 1L })),
+                    query("ROLLBACK", ConformanceServer.ddlResponse()))));
+            try (Connection c = DriverManager.getConnection(url(server, ""), creds())) {
+                c.setAutoCommit(false);
+                Statement st = c.createStatement();
+                assertEquals(1, st.executeUpdate(update));
+                SQLException broke = assertThrows(SQLException.class, () -> st.executeUpdate(insert), name);
+                assertEquals(SQLRecoverableException.class, broke.getClass(), name);
+                assertEquals("08006", broke.getSQLState(), name);
+
+                // The application carries on: the statement is refused, not
+                // sent on a re-dialled session, where it would be committed
+                // on its own.
+                SQLException lost = assertThrows(SQLException.class, () -> step.getValue().run(c, st), name);
+                assertEquals(SQLTransactionRollbackException.class, lost.getClass(), name + ": " + lost);
+                assertEquals("40003", lost.getSQLState(), name);
+                assertEquals(1, server.connections(), name + " re-dialled");
+                c.rollback();   // nothing left to roll back: no round trip
+                assertEquals(1, server.connections(), name + ": rollback() re-dialled");
+
+                // The connection goes on: its next statement opens a new
+                // transaction on a new session.
+                c.setAutoCommit(false);
+                assertTrue(c.createStatement().executeQuery("SELECT 1").next(), name);
+                assertEquals(1, c.unwrap(Skaidb.Connection.class).reconnects(), name);
+            }   // close() rolls the new transaction back
+            assertNull(server.finish(), name);
+            assertEquals(3, server.requests(0).size(), name + ": BEGIN and the two statements, nothing else");
+            assertEquals(3, server.requests(1).size(), name + ": the next transaction only");
+        }
     }
 
     @Test
