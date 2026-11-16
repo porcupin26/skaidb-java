@@ -569,6 +569,119 @@ class TransactionTest {
         assertEquals(List.of("SELECT 1"), sent(server, 1));
     }
 
+    // ---- a stream the body leaves open -----------------------------------------------
+
+    static final String SELECT = "SELECT id FROM accounts";
+    static final String BUSY = "connection is busy streaming";
+
+    /** The whole answer to a stream of {@link #SELECT}: two chunks of one row. */
+    static ConformanceServer.Exchange streamed() {
+        return ex(ConformanceServer.streamRequest(SELECT, QUORUM),
+            ConformanceServer.rowsHeaderResponse("id"),
+            ConformanceServer.rowsChunkResponse(new Object[] { 1L }),
+            ConformanceServer.rowsChunkResponse(new Object[] { 2L }),
+            ConformanceServer.rowsEndResponse());
+    }
+
+    @Test
+    void aStreamTheBodyLeavesOpenIsEndedAndTheTransactionRolledBack() throws Exception {
+        ConformanceServer server = server(
+            // the body returns with its stream open
+            q("BEGIN", ok()), q(UPDATE, changed(1)), streamed(), q("ROLLBACK", ok()),
+            // ... or throws with it open
+            q("BEGIN", ok()), streamed(), q("ROLLBACK", error("no transaction in progress")),
+            // what follows runs in autocommit, on the same socket
+            q("SELECT 1", oneRow("x", 1L)));
+        List<Skaidb.RowStream> left = new ArrayList<>();
+        try (Skaidb.Connection c = connect(server)) {
+            Skaidb.SkaidbException busy = assertThrows(Skaidb.SkaidbException.class, () -> c.transaction(conn -> {
+                conn.execute(UPDATE);
+                Skaidb.RowStream rows = conn.stream(SELECT);
+                left.add(rows);
+                assertTrue(rows.next());
+                return rows;   // the stream outlives the body
+            }));
+            assertEquals(Skaidb.SkaidbException.class, busy.getClass());
+            assertTrue(busy.getMessage().startsWith(BUSY), busy.getMessage());
+            // The server-side transaction is not left open for later statements to join.
+            assertEquals(List.of("BEGIN", UPDATE, "STREAM " + SELECT, "ROLLBACK"), sent(server));
+            assertTrue(c.isUsable());
+
+            IllegalStateException mine = new IllegalStateException("not enough funds");
+            assertSame(mine, assertThrows(IllegalStateException.class, () -> c.transaction(conn -> {
+                left.add(conn.stream(SELECT));
+                throw mine;
+            })), "the body's own error, whatever the clean-up meets");
+            assertTrue(c.isUsable());
+
+            // The streams the application still holds are over, and closing them touches nothing.
+            for (Skaidb.RowStream rows : left) {
+                assertFalse(rows.next());
+                rows.close();
+            }
+            assertEquals(1, c.query("SELECT 1").getRowCount());
+            assertEquals(0, c.reconnects());
+        }
+        assertNull(server.finish());
+        assertEquals(List.of(
+            "BEGIN", UPDATE, "STREAM " + SELECT, "ROLLBACK",
+            "BEGIN", "STREAM " + SELECT, "ROLLBACK",
+            "SELECT 1"), sent(server));
+    }
+
+    @Test
+    void aLeftStreamThatCannotBeDrainedCostsTheConnectionAndTheTransactionWithIt() throws Exception {
+        ConformanceServer server = ConformanceServer.sessions(List.of(
+            // The rest of the stream never arrives.
+            List.of(q("BEGIN", ok()), q(UPDATE, changed(1)),
+                ex(ConformanceServer.streamRequest(SELECT, QUORUM), ConformanceServer.rowsHeaderResponse("id"),
+                    ConformanceServer.rowsChunkResponse(new Object[] { 1L }))),
+            List.of(q("SELECT 1", oneRow("x", 1L)))));
+        try (Skaidb.Connection c = connect(server)) {
+            c.setReadTimeout(200);
+            Skaidb.SkaidbException busy = assertThrows(Skaidb.SkaidbException.class, () -> c.transaction(conn -> {
+                conn.execute(UPDATE);
+                assertTrue(conn.stream(SELECT).next());
+                return null;
+            }));
+            assertTrue(busy.getMessage().startsWith(BUSY), busy.getMessage());
+            // No ROLLBACK can follow the stream on this wire: the socket is
+            // closed instead, and the server drops the transaction with it.
+            assertTrue(server.awaitEnded(1, SOON), "the transaction stayed open on a live socket");
+            assertFalse(c.isUsable());
+            assertEquals(1, c.query("SELECT 1").getRowCount());
+            assertEquals(1, c.reconnects());
+        }
+        assertNull(server.finish());
+        assertEquals(List.of("BEGIN", UPDATE, "STREAM " + SELECT), sent(server, 0));
+        assertEquals(List.of("SELECT 1"), sent(server, 1));
+    }
+
+    @Test
+    void aPoolGetsItsConnectionBackWithNothingOpenWhenTheBodyLeavesAStream() throws Exception {
+        ConformanceServer server = server(
+            q("BEGIN", ok()), q(UPDATE, changed(1)), streamed(), q("ROLLBACK", ok()),
+            q("SELECT 1", oneRow("x", 1L)));
+        List<Skaidb.Connection> used = new ArrayList<>();
+        try (Skaidb.Pool pool = new Skaidb.Pool(options(server))) {
+            Skaidb.SkaidbException busy = assertThrows(Skaidb.SkaidbException.class, () -> pool.transaction(conn -> {
+                used.add(conn);
+                conn.execute(UPDATE);
+                return conn.stream(SELECT);
+            }));
+            assertTrue(busy.getMessage().startsWith(BUSY), busy.getMessage());
+            assertEquals(List.of("BEGIN", UPDATE, "STREAM " + SELECT, "ROLLBACK"), sent(server));
+            // The next borrower gets the same connection, in autocommit.
+            assertEquals(1, pool.members().get(0).idle);
+            assertEquals(1, (int) pool.withConnection(conn -> {
+                used.add(conn);
+                return conn.query("SELECT 1").getRowCount();
+            }));
+            assertSame(used.get(0), used.get(1));
+        }
+        assertNull(server.finish());
+    }
+
     // ---- a broken connection closes its socket at once ------------------------------
 
     /** How long the fake server waits to see the driver's socket close. */

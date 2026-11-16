@@ -161,7 +161,11 @@ Semantics:
   transaction` without being sent, and so does the helper instead of
   sending `COMMIT`. A failure under `COMMIT` is thrown as it is. The
   connection's monitor is held throughout, so other threads' statements
-  wait. The body ends every `RowStream` it opens.
+  wait. The body ends every `RowStream` it opens: one it leaves open is
+  closed by the helper (drained, or the connection is marked broken, as
+  `RowStream.close()` does) and the transaction is rolled back — the body's
+  exception is thrown, or `connection is busy streaming` when the body
+  returned.
 - A read that exceeds `setReadTimeout` throws and marks the connection
   broken, like any transport error.
 - A transport error marks the connection broken and closes its socket at

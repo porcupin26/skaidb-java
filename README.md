@@ -499,7 +499,10 @@ least 1) and `transaction(body, attempts, begin)` the opening statement,
 sent verbatim — `conn.transaction(body, 3, "BEGIN ATOMIC")` on a cluster. A
 body with nothing to return ends with `return null;`, and it closes every
 `RowStream` it opens before it ends: a stream that still owns the wire
-keeps `COMMIT` and `ROLLBACK` from being sent.
+keeps `COMMIT` and `ROLLBACK` from being sent. One the body leaves open is
+closed for it and the transaction is rolled back, never committed — the
+body's own exception is thrown, or `connection is busy streaming` when the
+body returned.
 
 **Conflicts.** A standalone server (0.346 or newer) refuses a `COMMIT` when
 another writer changed a row the transaction writes after the transaction
@@ -735,6 +738,7 @@ for the rest, branch on the message if you must:
 | Parameter misuse | `parameter index ... out of range`, `statement expects N parameters`, `cannot bind ...` | usable |
 | A `NULL` read through a typed getter | `column x is NULL` | usable |
 | Another statement while streaming | `connection is busy streaming` | usable once the stream ends |
+| The body of `transaction(body)` returned with a `RowStream` open | `connection is busy streaming` | usable, the stream closed and the transaction rolled back (broken if the stream could not be drained) |
 | A stream with parameters on a server older than 0.330 | `server does not support parameterised streaming (skaidb >= 0.330):` | usable |
 | Transport failure mid-statement | `query failed:`, `stream read failed:`, `prepare failed:` | **broken**: re-dials on the next statement |
 | Used after `close()` | `connection is closed` | closed |

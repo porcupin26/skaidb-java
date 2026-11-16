@@ -396,6 +396,8 @@ public final class Skaidb {
         private volatile boolean broken = false;
         /** A RowStream owns the wire until it ends; see requireIdle(). */
         private volatile boolean streaming = false;
+        /** That RowStream, so {@link #transaction} can end one its body left open. */
+        private volatile RowStream openStream;
         /**
          * True from the answer to {@link #transaction}'s begin to the answer
          * to its COMMIT or ROLLBACK: the transaction lives on this socket
@@ -670,7 +672,10 @@ public final class Skaidb {
          * and should do nothing outside the database that a second run would
          * repeat. It must end every {@link RowStream} it opens: while one
          * owns the wire neither {@code COMMIT} nor {@code ROLLBACK} can be
-         * sent.
+         * sent, so one it leaves open is closed for it (see {@link
+         * RowStream#close}) and the transaction is rolled back, never
+         * committed — the body's exception is thrown, or {@code connection
+         * is busy streaming} when the body returned.
          *
          * <p>A transport failure is the usual {@link SkaidbException} and is
          * never retried here. The server discards a transaction with its
@@ -710,8 +715,18 @@ public final class Skaidb {
                     try {
                         value = body.run(this);
                     } catch (Throwable t) {
+                        endLeftStream();
                         rollbackQuietly();
                         throw t;
+                    }
+                    if (endLeftStream()) {
+                        // What the body returned may be that stream, and
+                        // nothing says it read what it meant to: no COMMIT.
+                        rollbackQuietly();
+                        throw new SkaidbException(
+                            "connection is busy streaming: the transaction's body returned with a RowStream "
+                            + "open, so the transaction was rolled back; finish or close() every RowStream "
+                            + "from Connection.stream() inside the body");
                     }
                     // The body swallowed a transport failure: no COMMIT
                     // goes out, least of all on a session that never saw
@@ -733,11 +748,28 @@ public final class Skaidb {
         }
 
         /**
+         * End the RowStream the body left open, if it left one; true if it
+         * did. While the stream owned the wire neither COMMIT nor ROLLBACK
+         * could be sent, and the transaction would stay open on a live
+         * socket for whatever runs once the stream is closed to join. So it
+         * is closed here: drained, which leaves the wire to the ROLLBACK
+         * that follows, or — when the rest cannot be read off it — the
+         * connection is marked broken and the server drops the transaction
+         * with the socket.
+         */
+        private boolean endLeftStream() {
+            RowStream left = openStream;
+            if (left == null) return false;
+            left.close();
+            return true;
+        }
+
+        /**
          * Roll back after the body failed, never replacing the body's error:
          * a server older than 0.347 answers a {@code ROLLBACK} with nothing
          * open with an error, and the round trip itself can fail. Not sent
          * once the socket of the transaction is gone — the server discarded
-         * the transaction with it — nor while a stream owns the wire.
+         * the transaction with it.
          */
         private void rollbackQuietly() {
             if (!isUsable()) return;
@@ -1086,7 +1118,9 @@ public final class Skaidb {
                 String[] cols = new String[ncols];
                 for (int i = 0; i < ncols; i++) cols[i] = r.text();
                 streaming = true;      // released by RowStream: RowsEnd, Error or close()
-                return new RowStream(this, cols, true, -1L);
+                RowStream rows = new RowStream(this, cols, true, -1L);
+                openStream = rows;
+                return rows;
             } catch (IOException e) {
                 // Half a request may be on the wire, or half a header off it.
                 markBroken(e);
@@ -1147,7 +1181,10 @@ public final class Skaidb {
         }
 
         /** Give the wire back; the connection accepts statements again. */
-        void endStream() { streaming = false; }
+        void endStream() {
+            openStream = null;
+            streaming = false;
+        }
 
         /**
          * Prepare `sql` on the SERVER and return {statementId, paramCount}.
