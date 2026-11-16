@@ -835,6 +835,44 @@ class JdbcTest {
         assertEquals(1, stalled.requests(1).size());
     }
 
+    @Test
+    void isValidIsTrueWhileAStreamedResultSetIsOpen() throws Exception {
+        byte[] chunk = ConformanceServer.rowsChunkResponse(new Object[] { 2L });
+        ConformanceServer server = new ConformanceServer("ok", List.of(
+            streamOfT(chunk, ConformanceServer.rowsEndResponse()),
+            query("SELECT 1", ConformanceServer.rowsResponse(new String[] { "x" }, new Object[] { 1L }))));
+        try (Connection c = DriverManager.getConnection(url(server, ""), creds());
+             Statement st = c.createStatement()) {
+            st.setFetchSize(100);
+            ResultSet rs = st.executeQuery("SELECT id FROM t");
+            assertTrue(rs.next());
+            // The connection is healthy: it only cannot be asked anything
+            // until its result set is read to the end or closed.
+            assertTrue(c.isValid(1), "a connection that is streaming a result set is not an invalid one");
+            assertEquals(1, server.requests().size(), "nothing was sent behind the stream");
+            assertTrue(rs.next(), "and the stream was left as it was");
+            assertEquals(2, rs.getLong(1));
+            assertFalse(rs.next());
+            // The wire is free again: isValid is the SELECT 1 round trip it always was.
+            assertTrue(c.isValid(1));
+            assertEquals(2, server.requests().size());
+        }
+        finish(server);
+
+        // A stream that lost its connection is no longer open: the connection is not valid.
+        ConformanceServer gone = new ConformanceServer("ok", List.of(streamOfT().thenHangUp()));
+        try (Connection c = DriverManager.getConnection(url(gone, ""), creds());
+             Statement st = c.createStatement()) {
+            st.setFetchSize(100);
+            ResultSet rs = st.executeQuery("SELECT id FROM t");
+            assertTrue(rs.next());
+            assertThrows(SQLException.class, rs::next);
+            assertFalse(c.isValid(1));
+            assertEquals(1, gone.connections(), "isValid does not re-dial");
+        }
+        finish(gone);
+    }
+
     /** One way of putting a JDBC connection into database {@code app}. */
     static final class Entering {
         final String urlRest;

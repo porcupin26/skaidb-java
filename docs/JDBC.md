@@ -95,8 +95,9 @@ HikariDataSource ds = new HikariDataSource(cfg);
 ```
 
 `Connection.isValid(timeout)` is a `SELECT 1` round trip bounded by the
-timeout, so no `connectionTestQuery` is needed. `setNetworkTimeout` bounds
-every read on the connection.
+timeout, so no `connectionTestQuery` is needed; while a streamed result set
+is open on the connection it answers `true` without a round trip.
+`setNetworkTimeout` bounds every read on the connection.
 
 **Balancing across members.** A JDBC pool opens each physical connection
 through the driver, which dials the URL's hosts in shuffled order and keeps

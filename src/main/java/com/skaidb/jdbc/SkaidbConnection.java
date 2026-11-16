@@ -357,11 +357,18 @@ public final class SkaidbConnection implements Connection {
     @Override
     public boolean isClosed() { return closed; }
 
-    /** A round trip ({@code SELECT 1}) bounded by {@code timeout} seconds (0 = no bound). */
+    /**
+     * A round trip ({@code SELECT 1}) bounded by {@code timeout} seconds (0
+     * = no bound). While a streamed result set is open the connection
+     * cannot be asked anything, and is not asked: it is valid — the
+     * stream is being read from it — and the answer is {@code true}.
+     */
     @Override
     public boolean isValid(int timeout) throws SQLException {
         if (timeout < 0) throw new SQLException("timeout must be >= 0", "HY092");
-        if (closed || !conn.isUsable()) return false;
+        if (closed) return false;
+        if (busy()) return true;
+        if (!conn.isUsable()) return false;
         int before = conn.getReadTimeout();
         try {
             if (timeout > 0) conn.setReadTimeout(timeout * 1000);
