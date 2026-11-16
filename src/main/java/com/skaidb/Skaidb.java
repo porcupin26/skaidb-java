@@ -910,6 +910,15 @@ public final class Skaidb {
         public boolean isUsable() { return !closed && !broken && !streaming; }
 
         /**
+         * The session database: the {@code database} the connection was
+         * opened with, or the one the last {@code USE} statement the server
+         * accepted has entered since (see {@link ConnectOptions#database}).
+         * Empty when none was chosen — the session is then in the server's
+         * {@code default} database.
+         */
+        public String database() { return database; }
+
+        /**
          * How many times this connection has re-dialled after a transport
          * failure. Session state (a {@code BEGIN} transaction, {@code SET}
          * variables other than the session database) does not survive a

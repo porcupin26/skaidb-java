@@ -58,7 +58,6 @@ public final class SkaidbConnection implements Connection {
     /** The streamed result set that last took the wire; see {@link #busy()}. */
     private SkaidbResultSet streamed;
     private boolean readOnly = false;
-    private String catalog;
     private int holdability = ResultSet.HOLD_CURSORS_OVER_COMMIT;
     private final Properties clientInfo = new Properties();
     private SQLWarning warnings;
@@ -73,7 +72,6 @@ public final class SkaidbConnection implements Connection {
         this.conn = conn;
         this.cfg = cfg;
         this.url = url;
-        this.catalog = cfg.database.isEmpty() ? null : cfg.database;
         if (cfg.readTimeoutMs > 0) conn.setReadTimeout(cfg.readTimeoutMs);
     }
 
@@ -405,24 +403,29 @@ public final class SkaidbConnection implements Connection {
     }
 
     /**
-     * Switches the session database ({@code USE}). The connection enters
-     * it again after a reconnect, as it does the URL's database or one a
-     * {@code USE} statement entered: whichever came last.
+     * Switches the session database ({@code USE}); nothing is sent when
+     * the connection is in it already. The connection enters it again
+     * after a reconnect, as it does the URL's database or one a {@code
+     * USE} statement entered: whichever came last.
      */
     @Override
     public void setCatalog(String catalog) throws SQLException {
         checkOpen();
-        if (catalog == null || catalog.equals(this.catalog)) return;
+        if (catalog == null || catalog.equals(conn.database())) return;
         beforeControl();
         runControl("USE \"" + catalog.replace("\"", "\"\"") + "\"");
-        this.catalog = catalog;
     }
 
-    /** The session database, or the server's current one when none was chosen. */
+    /**
+     * The database the connection is in: the URL's, or the one entered
+     * last by {@link #setCatalog} or by a {@code USE} sent through a
+     * statement. When none was chosen, the server's current one.
+     */
     @Override
     public String getCatalog() throws SQLException {
         checkOpen();
-        if (catalog != null) return catalog;
+        String entered = conn.database();
+        if (!entered.isEmpty()) return entered;
         beforeControl();
         try {
             Skaidb.ResultSet rs = conn.executeRaw("SHOW DATABASES").getResultSet();

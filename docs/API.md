@@ -116,6 +116,7 @@ public <T> T      transaction(TransactionBody<T> body, int attempts);           
 public <T> T      transaction(TransactionBody<T> body, int attempts, String begin);
 public void       subscribe(String stream, String after, EventHandler handler);
 public boolean    isUsable();                         // !closed && !broken && !streaming
+public String     database();                         // the session database; "" when none was chosen
 public long       reconnects();                       // re-dials so far (session state does not survive one)
 public void       setReadTimeout(int millis);         // bound every read; 0 = none (default)
 public int        getReadTimeout();
@@ -177,7 +178,8 @@ Semantics:
 - The session database is the `database` option until a `USE` statement
   the server accepts enters another (`USE [DATABASE] name [;]`, the name
   bare or double-quoted, `--` comments skipped; any other spelling is not
-  noted). Every re-dial
+  noted); `database()` returns it, and an empty string while none was
+  chosen (the session is then in the server's `default`). Every re-dial
   enters the current one before the statement that caused it is sent; if
   that `USE` is refused the statement throws its error, the connection
   stays broken and the next statement dials again. `Pool.release` closes a

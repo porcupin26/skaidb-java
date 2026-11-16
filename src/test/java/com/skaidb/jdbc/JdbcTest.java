@@ -940,6 +940,48 @@ class JdbcTest {
         }
     }
 
+    @Test
+    void getCatalogIsTheDatabaseAUseStatementEntered() throws Exception {
+        byte[] ok = ConformanceServer.ddlResponse();
+        ConformanceServer server = new ConformanceServer("ok", List.of(
+            query("USE \"app\"", ok),                    // the URL's database, at connect
+            query("USE reports", ok),                    // a USE through a Statement
+            query("USE \"app\"", ok),                    // setCatalog, back to the URL's database
+            query("use database staging -- c", ok),      // a USE through a PreparedStatement
+            query("USE nowhere", ConformanceServer.errorResponse("database \"nowhere\" does not exist"))));
+        try (Connection c = DriverManager.getConnection(url(server, "/app"), creds());
+             Statement st = c.createStatement()) {
+            assertEquals("app", c.getCatalog());
+            st.execute("USE reports");
+            assertEquals("reports", c.getCatalog(), "the database the connection is in, not the one it started in");
+            // The connection is in reports, so going back to app is a USE to send.
+            c.setCatalog("app");
+            assertEquals(3, server.requests().size(), "setCatalog compared with the database of the URL");
+            assertEquals("app", c.getCatalog());
+            c.prepareStatement("use database staging -- c").execute();
+            assertEquals("staging", c.getCatalog());
+            c.setCatalog("staging");   // already there: nothing to send
+            assertEquals(4, server.requests().size());
+            // A USE the server refused entered nothing.
+            assertThrows(SQLException.class, () -> st.execute("USE nowhere"));
+            assertEquals("staging", c.getCatalog());
+        }
+        finish(server);
+
+        // With no database chosen the server is asked, as before — until a USE names one.
+        ConformanceServer none = new ConformanceServer("ok", List.of(
+            query("SHOW DATABASES", ConformanceServer.rowsResponse(new String[] { "database", "current" },
+                new Object[] { "default", "*" }, new Object[] { "app", "" })),
+            query("USE app", ok)));
+        try (Connection c = DriverManager.getConnection(url(none, ""), creds());
+             Statement st = c.createStatement()) {
+            assertEquals("default", c.getCatalog());
+            st.execute("USE app");
+            assertEquals("app", c.getCatalog());
+        }
+        finish(none);
+    }
+
     // ---- the statements a connection holds on the server --------------------------------
 
     @Test

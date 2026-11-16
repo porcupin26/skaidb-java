@@ -775,7 +775,8 @@ silently. Retry at the call site where you know whether that is safe.
 or mid-stream.
 
 The session database a re-dial enters is the one the connection was last
-in: the DSN's, or the one a later `USE` statement entered. The driver
+in: the DSN's, or the one a later `USE` statement entered
+(`conn.database()` returns it). The driver
 notes a `USE` the server accepted when it is written `USE [DATABASE] name`,
 the name bare or in double quotes, with nothing after it but an optional
 `;` — `--` comments aside, which are no part of the statement. It enters
