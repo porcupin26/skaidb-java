@@ -950,6 +950,13 @@ reference, including the type mapping and the metadata sources, is
 - A transaction conflict is answered by a standalone server ≥ 0.346.
   Against a server that never answers one, `transaction(body)` runs its
   body once.
+- A session's settings (`SET CONSISTENCY`, `SET SCAN BUDGET`) are sent again
+  after a re-dial as you wrote them, on any server. Putting a consistency
+  override *back* — which a `Pool` does for the next borrower, and
+  `restore`/JDBC's `endRequest()` for a pool of your own — takes `SET
+  CONSISTENCY DEFAULT`, which a server knows from 0.349 on: against an
+  older one such a connection is closed when it is returned and the next
+  borrower gets a new one.
 - Pool discovery (`PoolOptions.discover(true)`) uses `SHOW ENDPOINTS`,
   server ≥ 0.327; an older server answers it with an error and the pool
   keeps its seeds.

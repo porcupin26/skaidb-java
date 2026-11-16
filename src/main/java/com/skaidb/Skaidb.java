@@ -1986,8 +1986,8 @@ public final class Skaidb {
             lost = null;
             prepared.clear();
             closeSocket();   // already closed when it was marked broken
-            // Cleared BEFORE dialling: dial() issues USE, which runs a
-            // statement, which would otherwise re-enter this method forever.
+            // Cleared before dialling: the dial sends its own statements —
+            // the USE, the session's settings — on the new socket.
             broken = false;
             reconnects++;
             try {
