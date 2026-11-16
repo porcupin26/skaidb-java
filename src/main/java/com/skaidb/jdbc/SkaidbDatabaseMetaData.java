@@ -36,7 +36,7 @@ final class SkaidbDatabaseMetaData implements DatabaseMetaData {
     private static ResultSet empty(String... cols) { return rs(cols, new ArrayList<>()); }
 
     private Skaidb.ResultSet show(String sql) throws SQLException {
-        conn.checkOpen();
+        conn.beforeControl();
         try {
             Skaidb.ResultSet r = conn.nativeConnection().executeRaw(sql).getResultSet();
             if (r == null) throw new SQLException(sql + " returned no rows", "HY000");

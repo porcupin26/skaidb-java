@@ -35,7 +35,9 @@ import java.util.concurrent.Executor;
  * Plain {@code BEGIN} needs a standalone server; a cluster refuses it and
  * needs {@code transaction=atomic}. DDL is not transactional. If the
  * connection breaks mid-transaction the server has discarded it: the next
- * statement or {@code commit()} throws {@link SQLTransactionRollbackException}.
+ * statement or {@code commit()} throws {@link SQLTransactionRollbackException},
+ * and so does a metadata call or {@code setCatalog} made there — nothing
+ * re-dials until that has been reported.
  * A streamed result set that is still open makes the connection busy, not
  * lost: another statement or {@code commit()} throws SQLState {@code HY010}
  * and the transaction stays open, and {@code rollback()} closes the result
@@ -117,6 +119,18 @@ public final class SkaidbConnection implements Connection {
             txnOpen = true;
             txnReconnects = conn.reconnects();
         }
+    }
+
+    /**
+     * Called before a statement the driver sends on its own account — a
+     * metadata read, the {@code USE} of {@link #setCatalog}. It opens no
+     * transaction, but inside one whose connection has been lost it is
+     * refused like any other statement: sent, it would re-dial, and a
+     * transaction's connection is not replaced behind its back.
+     */
+    void beforeControl() throws SQLException {
+        checkOpen();
+        if (txnOpen) checkTransactionAlive();
     }
 
     private void checkTransactionAlive() throws SQLException {
@@ -392,6 +406,7 @@ public final class SkaidbConnection implements Connection {
     public void setCatalog(String catalog) throws SQLException {
         checkOpen();
         if (catalog == null || catalog.equals(this.catalog)) return;
+        beforeControl();
         runControl("USE \"" + catalog.replace("\"", "\"\"") + "\"");
         this.catalog = catalog;
     }
@@ -401,6 +416,7 @@ public final class SkaidbConnection implements Connection {
     public String getCatalog() throws SQLException {
         checkOpen();
         if (catalog != null) return catalog;
+        beforeControl();
         try {
             Skaidb.ResultSet rs = conn.executeRaw("SHOW DATABASES").getResultSet();
             while (rs != null && rs.next()) {

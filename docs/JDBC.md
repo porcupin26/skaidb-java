@@ -209,7 +209,9 @@ supported.
 
 If the connection breaks inside a transaction the server has discarded it:
 the next statement, or `commit()`, throws `SQLTransactionRollbackException`
-(SQLState `40003`) instead of running outside the transaction.
+(SQLState `40003`) instead of running outside the transaction. A
+`DatabaseMetaData` call, `getCatalog()` or `setCatalog()` made there throws
+it too: nothing re-dials until the loss has been reported.
 
 A streamed result set that is still open makes the connection busy, not
 lost. Another statement, or `commit()`, fails with SQLState `HY010` as it

@@ -637,7 +637,6 @@ class JdbcTest {
 
     @Test
     void noStatementOfATransactionRunsOnANewSessionAfterTheConnectionIsLost() throws Exception {
-        String update = "UPDATE t SET n = n + 1 WHERE id = 1";
         String insert = "INSERT INTO t (id) VALUES (2)";
         String prepared = "INSERT INTO t (id) VALUES (?)";
         Map<String, TransactionStep> steps = new java.util.LinkedHashMap<>();
@@ -673,6 +672,34 @@ class JdbcTest {
         });
         steps.put("commit()", (c, st) -> c.commit());
         steps.put("setAutoCommit(true)", (c, st) -> c.setAutoCommit(true));
+        refusedInALostTransaction(steps);
+    }
+
+    @Test
+    void metadataAndCatalogCallsInALostTransactionDoNotReDial() throws Exception {
+        // Reads and a USE: nothing they could write, but a re-dial for them
+        // is still a new session behind the transaction's back (PROTOCOL.md
+        // §6 rule 7) — and what they answer there is not what the
+        // transaction saw.
+        Map<String, TransactionStep> steps = new java.util.LinkedHashMap<>();
+        steps.put("getMetaData().getTables", (c, st) -> c.getMetaData().getTables(null, null, "%", null));
+        steps.put("getMetaData().getCatalogs", (c, st) -> c.getMetaData().getCatalogs());
+        steps.put("getMetaData().getColumns", (c, st) -> c.getMetaData().getColumns(null, null, "t", "%"));
+        steps.put("getMetaData().getPrimaryKeys", (c, st) -> c.getMetaData().getPrimaryKeys(null, null, "t"));
+        steps.put("getMetaData().getIndexInfo", (c, st) -> c.getMetaData().getIndexInfo(null, null, "t", false, false));
+        steps.put("getCatalog()", (c, st) -> c.getCatalog());
+        steps.put("setCatalog", (c, st) -> c.setCatalog("other"));
+        refusedInALostTransaction(steps);
+    }
+
+    /**
+     * Each step, tried as the next thing a transaction does after its
+     * connection was lost: refused with SQLState 40003, nothing sent, no
+     * re-dial; the connection then goes on with a new transaction.
+     */
+    static void refusedInALostTransaction(Map<String, TransactionStep> steps) throws Exception {
+        String update = "UPDATE t SET n = n + 1 WHERE id = 1";
+        String insert = "INSERT INTO t (id) VALUES (2)";
         for (Map.Entry<String, TransactionStep> step : steps.entrySet()) {
             String name = step.getKey();
             ConformanceServer server = ConformanceServer.sessions(List.of(
@@ -696,9 +723,10 @@ class JdbcTest {
                 // sent on a re-dialled session, where it would be committed
                 // on its own.
                 SQLException lost = assertThrows(SQLException.class, () -> step.getValue().run(c, st), name);
+                assertEquals(1, server.connections(), name + " re-dialled");
                 assertEquals(SQLTransactionRollbackException.class, lost.getClass(), name + ": " + lost);
                 assertEquals("40003", lost.getSQLState(), name);
-                assertEquals(1, server.connections(), name + " re-dialled");
+                assertEquals(0, c.unwrap(Skaidb.Connection.class).reconnects(), name);
                 c.rollback();   // nothing left to roll back: no round trip
                 assertEquals(1, server.connections(), name + ": rollback() re-dialled");
 
