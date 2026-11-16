@@ -186,7 +186,9 @@ parameters, and every one against an older server, run prepared as without
 a fetch size, their result in one frame. A `CALL` whose procedure `EMIT`s
 result sets is answered in one frame even when streamed: its sets come back
 materialised, through `getMoreResults()`, exactly as without a fetch size,
-and it holds nothing. While a streamed result set is open
+and it holds nothing. A `SET CONSISTENCY` statement is never streamed (a
+server takes it only as an ordinary statement). While a streamed result set
+is open
 it owns the connection: other statements on that connection fail with
 SQLState `HY010` until it is read to the end or closed (closing reads and
 discards the rest).

@@ -145,7 +145,9 @@ Semantics:
   is still open, `connection is closed` after `close()`, and
   `server does not support streaming` on a server without the opcode. A
   non-row statement passed to `stream` executes normally and yields a
-  stream with no columns whose `getAffected()` is the affected count.
+  stream with no columns whose `getAffected()` is the affected count. A
+  `SET CONSISTENCY` statement is sent as an ordinary statement
+  (`OP_QUERY`): a server refuses it under the stream opcode.
 - `stream(sql, params...)` binds the `?` placeholders in order, typed (any
   value `Query.setObject` takes), and sends them with the SQL in
   `OP_QUERY_STREAM_PARAMS`, server ≥ 0.330; an older server answers

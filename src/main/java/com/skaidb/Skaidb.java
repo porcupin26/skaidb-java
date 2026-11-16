@@ -1632,9 +1632,11 @@ public final class Skaidb {
          * support parameterised streaming}), and bind exactly as a prepared
          * statement's do, so the statement must be a kind the server prepares
          * (not DDL or a session statement). Without parameters the request is
-         * {@code OP_QUERY_STREAM}, which every server knows. An {@code
-         * Object[]} passed alone is the parameter list; bind an array value
-         * as a {@code List}.
+         * {@code OP_QUERY_STREAM}, which every server knows — except for a
+         * {@code SET CONSISTENCY} statement, which a server takes only as an
+         * ordinary statement and which is sent as one. An {@code Object[]}
+         * passed alone is the parameter list; bind an array value as a
+         * {@code List}.
          *
          * <p>The connection is busy for the whole stream: any other statement on
          * it throws until the stream ends or is closed, and {@link #isUsable}
@@ -1649,6 +1651,18 @@ public final class Skaidb {
             boolean bound = params != null && params.length > 0;
             if (bound && params.length > 0xffff)
                 throw new SkaidbException("too many parameters: " + params.length + " (at most 65535)");
+            if (!bound) {
+                // A consistency override is state of the session that a
+                // server takes as an ordinary statement only: sent with the
+                // stream opcode it is refused. It has nothing to stream, so
+                // it goes out as the statement it is.
+                String[] set = sessionSetting(sql);
+                if (set != null && set[0].equals("consistency")) {
+                    Object answer = run(sql, true);
+                    if (answer instanceof ResultSet) return new RowStream(this, (ResultSet) answer);
+                    return new RowStream(this, new String[0], false, (Long) answer);
+                }
+            }
             byte[] body = sql.getBytes(StandardCharsets.UTF_8);
             Buf req = new Buf();
             if (bound) {

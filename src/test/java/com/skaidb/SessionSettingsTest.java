@@ -227,6 +227,31 @@ class SessionSettingsTest {
     }
 
     @Test
+    void aConsistencyOverrideAskedForThroughAStreamIsSentAsAStatement() throws Exception {
+        // A server takes SET CONSISTENCY only as an ordinary statement: sent with the
+        // stream opcode it is refused ("SET CONSISTENCY is per-connection session state: ...").
+        ConformanceServer server = ConformanceServer.sessions(List.of(
+            List.of(q(ALL, ok()), q("set consistency one -- nearest", ok()), q("SET CONSISTENCY DEFAULT", ok()),
+                q(ALL, ok()).thenHangUp()),
+            // ... and it is noted like any other.
+            List.of(q(ALL, ok()), q(SCAN, rows(1)))));
+        try (Skaidb.Connection c = Skaidb.connect(options(server))) {
+            for (String set : new String[] { ALL, "set consistency one -- nearest", "SET CONSISTENCY DEFAULT", ALL }) {
+                try (Skaidb.RowStream answer = c.stream(set)) {
+                    assertFalse(answer.next(), set);
+                    assertFalse(answer.isStreamed(), set);
+                    assertEquals(-1, answer.getAffected(), set);
+                    assertEquals(0, answer.getColumnNames().length, set);
+                }
+                assertTrue(c.isUsable(), set);
+            }
+            lost(c, server, 1);
+            assertEquals(1, c.query(SCAN).getRowCount());
+        }
+        assertNull(server.finish());
+    }
+
+    @Test
     void whichStatementsSetTheSession() {
         Map<String, String[]> sets = new LinkedHashMap<>();
         sets.put("SET CONSISTENCY ALL", new String[] { "consistency", "SET CONSISTENCY ALL" });

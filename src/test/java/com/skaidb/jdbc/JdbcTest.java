@@ -1189,6 +1189,25 @@ class JdbcTest {
     }
 
     @Test
+    void withAFetchSizeAConsistencyOverrideIsStillSet() throws Exception {
+        // With a fetch size every Statement is streamed — but SET CONSISTENCY a server takes
+        // only as an ordinary statement, and refuses when it is sent with the stream opcode.
+        byte[] ok = ConformanceServer.ddlResponse();
+        ConformanceServer server = new ConformanceServer("ok", List.of(
+            query("SET CONSISTENCY ALL", ok),
+            ex(ConformanceServer.streamRequest("SET SCAN BUDGET ROWS 5", QUORUM), ok),
+            query("SET CONSISTENCY DEFAULT", ok)));
+        try (Connection c = DriverManager.getConnection(url(server, "?fetch_size=100"), creds());
+             Statement st = c.createStatement()) {
+            assertFalse(st.execute("SET CONSISTENCY ALL"));
+            assertEquals(0, st.getUpdateCount());
+            assertFalse(st.execute("SET SCAN BUDGET ROWS 5"));
+            assertEquals(0, c.prepareStatement("SET CONSISTENCY DEFAULT").executeUpdate());
+        }
+        finish(server);
+    }
+
+    @Test
     void setCatalogIsNotHeldHostageByTheDatabaseItLeaves() throws Exception {
         String gone = "database \"app\" does not exist";
         byte[] ok = ConformanceServer.ddlResponse();
