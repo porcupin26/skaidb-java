@@ -872,6 +872,51 @@ class JdbcTest {
     }
 
     @Test
+    void aPreparedStatementHeldAcrossAReDialRunsAsItself() throws Exception {
+        // The same parameters, a different effect.
+        String update = "UPDATE t SET v = ? WHERE id = ?";
+        String delete = "DELETE FROM t WHERE v = ? AND id = ?";
+        ConformanceServer server = ConformanceServer.sessions(List.of(
+            List.of(ex(ConformanceServer.prepareRequest(update), ConformanceServer.preparedResponse(1, 2)),
+                ex(ConformanceServer.executeRequest(1, QUORUM, "u", 1L), ConformanceServer.mutationResponse(1)),
+                ex(ConformanceServer.prepareRequest(delete), ConformanceServer.preparedResponse(2, 2)),
+                ex(ConformanceServer.executeRequest(2, QUORUM, "d", 2L), ConformanceServer.mutationResponse(1)),
+                query("SELECT 1", ConformanceServer.mutationResponse(0)).thenHangUp()),
+            // On the new connection the DELETE comes first and takes the id the UPDATE had on the old one.
+            List.of(ex(ConformanceServer.prepareRequest(delete), ConformanceServer.preparedResponse(1, 2)),
+                ex(ConformanceServer.executeRequest(1, QUORUM, "d", 2L), ConformanceServer.mutationResponse(1)),
+                ex(ConformanceServer.prepareRequest(update), ConformanceServer.preparedResponse(2, 2)),
+                ex(ConformanceServer.executeRequest(2, QUORUM, "u", 1L), ConformanceServer.mutationResponse(1)),
+                ex(ConformanceServer.batchRequest(2, QUORUM, new Object[] { "v", 3L }), ConformanceServer.mutationResponse(1)))));
+        try (Connection c = DriverManager.getConnection(url(server, ""), creds());
+             PreparedStatement up = c.prepareStatement(update);
+             PreparedStatement del = c.prepareStatement(delete);
+             Statement st = c.createStatement()) {
+            up.setString(1, "u");
+            up.setLong(2, 1);
+            del.setString(1, "d");
+            del.setLong(2, 2);
+            assertEquals(1, up.executeUpdate());
+            assertEquals(1, del.executeUpdate());
+
+            st.execute("SELECT 1");
+            assertTrue(server.awaitEnded(1, 2_000));
+            SQLException lost = assertThrows(SQLException.class, () -> st.execute("SELECT 2"));
+            assertEquals("08006", lost.getSQLState(), lost.toString());
+
+            // The PreparedStatements made before the loss, the DELETE first.
+            assertEquals(1, del.executeUpdate());
+            assertEquals(1, up.executeUpdate(), "the UPDATE ran as the UPDATE");
+            up.setString(1, "v");
+            up.setLong(2, 3);
+            up.addBatch();
+            assertEquals(1, up.executeBatch().length);
+        }
+        // Byte for byte as scripted: nothing was executed under an id of the old connection.
+        finish(server);
+    }
+
+    @Test
     void dataSourceForPools() throws Exception {
         ConformanceServer server = new ConformanceServer("ok", List.of(
             query("USE \"app\"", ConformanceServer.ddlResponse()),

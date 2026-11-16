@@ -1224,7 +1224,10 @@ public final class Skaidb {
         /**
          * Prepare `sql` on the SERVER and return {statementId, paramCount}.
          * Cached per connection, because a prepared id is only meaningful on
-         * the connection that created it.
+         * the connection that created it. The id is good until this
+         * connection's monitor is released — a re-dial forgets them all — so
+         * a caller holds the monitor from here to the execute (see
+         * Query.exec).
          */
         synchronized long[] prepareServer(String sql) {
             requireIdle();
@@ -1667,13 +1670,21 @@ public final class Skaidb {
         private Object exec() {
             if (params.length == 0) return conn.run(sql, true, level());
             try {
-                long[] p = conn.prepareServer(sql);
-                if (p[1] != params.length)
-                    throw new SkaidbException(
-                        "statement expects " + p[1] + " parameters, got " + params.length);
-                Object res = conn.execPrepared(p[0], params, level());
-                conn.noteStatement(sql);
-                return res;
+                // One hold of the connection for the prepare and the
+                // execute. The id is the server's only on the socket that
+                // issued it: let go in between, another thread's statement
+                // can find the connection gone and re-dial, and this id
+                // would then be executed on a session where it is unknown
+                // — or names whatever was prepared there first.
+                synchronized (conn) {
+                    long[] p = conn.prepareServer(sql);
+                    if (p[1] != params.length)
+                        throw new SkaidbException(
+                            "statement expects " + p[1] + " parameters, got " + params.length);
+                    Object res = conn.execPrepared(p[0], params, level());
+                    conn.noteStatement(sql);
+                    return res;
+                }
             } catch (Unpreparable e) {
                 return conn.run(bind(sql, params), true, level());
             }
@@ -1687,31 +1698,34 @@ public final class Skaidb {
          */
         public long executeBatch(java.util.List<Object[]> rows) {
             if (rows.isEmpty()) return 0L;
-            long[] p;
-            try {
-                p = conn.prepareServer(sql);
-            } catch (Unpreparable e) {
-                // A statement kind the server will not prepare (DDL, session
-                // statements): run the rows one by one with client-side
-                // binding, as a single execution would.
-                long total = 0;
-                for (Object[] r : rows) {
-                    if (r.length != params.length)
-                        throw new SkaidbException(
-                            "batch row expects " + params.length + " parameters, got " + r.length);
-                    Object res = conn.run(bind(sql, r), true, level());
-                    if (res instanceof Long && (Long) res > 0) total += (Long) res;
+            // The prepare and the batch under one hold of the connection, as in exec().
+            synchronized (conn) {
+                long[] p;
+                try {
+                    p = conn.prepareServer(sql);
+                } catch (Unpreparable e) {
+                    // A statement kind the server will not prepare (DDL, session
+                    // statements): run the rows one by one with client-side
+                    // binding, as a single execution would.
+                    long total = 0;
+                    for (Object[] r : rows) {
+                        if (r.length != params.length)
+                            throw new SkaidbException(
+                                "batch row expects " + params.length + " parameters, got " + r.length);
+                        Object res = conn.run(bind(sql, r), true, level());
+                        if (res instanceof Long && (Long) res > 0) total += (Long) res;
+                    }
+                    return total;
                 }
-                return total;
+                for (Object[] r : rows) {
+                    if (r.length != p[1])
+                        throw new SkaidbException(
+                            "batch row expects " + p[1] + " parameters, got " + r.length);
+                }
+                Object res = conn.execBatch(p[0], rows, level());
+                conn.noteStatement(sql);
+                return res instanceof Long ? (Long) res : 0L;
             }
-            for (Object[] r : rows) {
-                if (r.length != p[1])
-                    throw new SkaidbException(
-                        "batch row expects " + p[1] + " parameters, got " + r.length);
-            }
-            Object res = conn.execBatch(p[0], rows, level());
-            conn.noteStatement(sql);
-            return res instanceof Long ? (Long) res : 0L;
         }
 
         public long executeUpdate() {

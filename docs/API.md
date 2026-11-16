@@ -227,7 +227,12 @@ public void      close();                 // no-op, for try-with-resources symme
 - With ≥ 1 placeholder the statement is prepared server-side (cached per
   connection, ≤ 240 entries) and parameters travel typed. If the server
   refuses to prepare it, the driver interpolates SQL-quoted text instead,
-  where collections/maps/arrays are refused.
+  where collections/maps/arrays are refused. A `Query` holds no statement
+  id of its own: each execution takes the id from the connection's cache
+  (preparing the statement if it is not there) and uses it under the same
+  hold of the connection, so an id is never executed on another socket
+  than the one that issued it — after a re-dial, or with threads sharing
+  the connection.
 - `executeBatch` requires every row to have exactly the statement's
   parameter count; an empty list returns 0 without a round-trip. A
   statement the server refuses to prepare (DDL, `USE`) runs row by row with
