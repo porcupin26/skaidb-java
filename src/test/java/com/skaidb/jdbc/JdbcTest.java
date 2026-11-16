@@ -830,6 +830,9 @@ class JdbcTest {
         ways.put("setCatalog", new Entering("", entersApp, (c, st) -> c.setCatalog("app")));
         ways.put("USE through a Statement",
             new Entering("", query("USE app", ConformanceServer.ddlResponse()), (c, st) -> st.execute("USE app")));
+        ways.put("USE with a comment through a Statement",
+            new Entering("", query("USE app -- the app database", ConformanceServer.ddlResponse()),
+                (c, st) -> st.execute("USE app -- the app database")));
         ways.put("USE through a PreparedStatement",
             new Entering("", query("use database app;", ConformanceServer.ddlResponse()),
                 (c, st) -> c.prepareStatement("use database app;").execute()));

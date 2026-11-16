@@ -778,7 +778,8 @@ The session database a re-dial enters is the one the connection was last
 in: the DSN's, or the one a later `USE` statement entered. The driver
 notes a `USE` the server accepted when it is written `USE [DATABASE] name`,
 the name bare or in double quotes, with nothing after it but an optional
-`;`. It enters that database on the new socket before it sends anything
+`;` — `--` comments aside, which are no part of the statement. It enters
+that database on the new socket before it sends anything
 else, and if the server refuses it there the statement fails with that
 error instead of running in another database.
 

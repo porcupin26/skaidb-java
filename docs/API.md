@@ -176,7 +176,8 @@ Semantics:
   The failed statement is not retried.
 - The session database is the `database` option until a `USE` statement
   the server accepts enters another (`USE [DATABASE] name [;]`, the name
-  bare or double-quoted; any other spelling is not noted). Every re-dial
+  bare or double-quoted, `--` comments skipped; any other spelling is not
+  noted). Every re-dial
   enters the current one before the statement that caused it is sent; if
   that `USE` is refused the statement throws its error, the connection
   stays broken and the next statement dials again. `Pool.release` closes a

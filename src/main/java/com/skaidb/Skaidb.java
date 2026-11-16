@@ -2303,10 +2303,12 @@ public final class Skaidb {
      * The database {@code sql} enters, when it is exactly one {@code USE}
      * statement the driver can read: {@code USE [DATABASE] name [;]}, the
      * keywords in any case, the name bare or in double quotes with a quote
-     * inside doubled. Null for everything else — a comment, a second
-     * statement, a name spelled another way — which the driver leaves alone.
+     * inside doubled. {@code --} comments are not part of the statement, as
+     * on the server. Null for everything else — a second statement, a block
+     * comment, a name spelled another way — which the driver leaves alone.
      */
     static String usedDatabase(String sql) {
+        if (sql.contains("--")) sql = withoutLineComments(sql);
         int n = sql.length();
         int i = skipSpace(sql, 0);
         if (!sql.regionMatches(true, i, "USE", 0, 3)) return null;
@@ -2326,6 +2328,32 @@ public final class Skaidb {
         }
         if (next < n && sql.charAt(next) == ';') next = skipSpace(sql, next + 1);
         return next == n && name.length() > 0 ? name.toString() : null;
+    }
+
+    /**
+     * {@code sql} without its {@code --} comments, each of which runs to
+     * the end of its line — except where the two dashes stand inside a
+     * double-quoted name or a single-quoted string.
+     */
+    static String withoutLineComments(String sql) {
+        StringBuilder out = new StringBuilder(sql.length());
+        char quote = 0;
+        for (int i = 0, n = sql.length(); i < n; i++) {
+            char ch = sql.charAt(i);
+            if (quote != 0) {
+                out.append(ch);
+                if (ch == quote) quote = 0;
+            } else if (ch == '-' && i + 1 < n && sql.charAt(i + 1) == '-') {
+                int eol = sql.indexOf('\n', i);
+                if (eol < 0) break;
+                out.append('\n');
+                i = eol;
+            } else {
+                out.append(ch);
+                if (ch == '"' || ch == '\'') quote = ch;
+            }
+        }
+        return out.toString();
     }
 
     private static int skipSpace(String sql, int i) {

@@ -109,6 +109,8 @@ class SessionDatabaseTest {
         Send execute = paths.get("execute");
         reEnters("execute", execute, "  Use   Database\tapp  ;  ", ENTER_APP);
         reEnters("execute", execute, "USE DATABASE \"we \"\"quote\"\" it\";", "USE \"we \"\"quote\"\" it\"");
+        // The server skips a -- comment, so the statement is a USE all the same.
+        reEnters("execute", execute, "USE app -- the app database", ENTER_APP);
     }
 
     /** {@code use} is sent, the connection is lost while idle, and the next statements find {@code enter} sent first. */
@@ -194,13 +196,14 @@ class SessionDatabaseTest {
             List.of(q(ENTER_APP, ok()),
                 // refused: the session stays where it was
                 q("USE nowhere", error("database \"nowhere\" does not exist")),
-                // not exactly one USE statement as the driver reads it: left alone
-                q("USE other -- for the report", ok()),
+                // not one USE statement as the driver reads it (nor, today, as
+                // a server does): left alone, whatever answers it
+                q("USE other /* for the report */", ok()),
                 thenTheServerGoesAway()),
             List.of(q(ENTER_APP, ok()), q(COUNT, counted(3)))));
         try (Skaidb.Connection c = Skaidb.connect(options(server).database("app"))) {
             assertThrows(Skaidb.SkaidbException.class, () -> c.execute("USE nowhere"));
-            c.execute("USE other -- for the report");
+            c.execute("USE other /* for the report */");
             loseWhileIdle(c, server, 1);
             assertEquals(3, count(c));
         }
@@ -227,11 +230,28 @@ class SessionDatabaseTest {
         enters.put("USE database", "database");
         enters.put("USE DATABASE;", "DATABASE");
         enters.put("USE DATABASE database", "database");
+        // A -- comment runs to the end of its line and is not part of the statement ...
+        enters.put("USE app -- the app database", "app");
+        enters.put("USE app--the app database", "app");
+        enters.put("USE app -- it's the app; \"really\"", "app");
+        enters.put("USE app -- c ;", "app");
+        enters.put("USE app; -- done", "app");
+        enters.put("USE app -- c\n;", "app");
+        enters.put("-- first a comment\nUSE app", "app");
+        enters.put("USE -- which one\napp", "app");
+        enters.put("USE DATABASE app -- c", "app");
+        enters.put("USE DATABASE -- c\n\"app\" -- d\n; -- e", "app");
+        // ... unless the two dashes are inside the quoted name.
+        enters.put("USE \"a--b\"", "a--b");
+        enters.put("USE \"a\"\"--b\" -- c", "a\"--b");
         for (Map.Entry<String, String> e : enters.entrySet()) assertEquals(e.getValue(), Skaidb.usedDatabase(e.getKey()), e.getKey());
 
         for (String other : new String[] {
                 "", "USE", "USE ", "USE;", "USEapp", "USER app", "REUSE app", "SELECT 'USE app'", "USE 'app'",
-                "USE app -- comment", "USE app /* c */", "/* c */ USE app", "-- c\nUSE app", "USE app; SELECT 1",
+                "USE app /* c */", "/* c */ USE app", "USE app; SELECT 1",
+                // a comment hides what follows it on its line, a statement included
+                "-- USE app", "USE -- x", "USE -- app\n", "USE app -- c\nnotes", "USE app - - c", "USE 'app' -- c",
+                "-- c\nSELECT 1 -- USE app", "USE \"app -- c",
                 "USE app;;", "USE a-b", "USE app.notes", "USE app notes", "USE database app notes", "USE \"app",
                 "USE app\"", "USE \"app\"x", "USE \"a\"b\"", "USE \"\"", "USE DATABASE \"\"", "USE ?", "USE 9lives",
                 "INSERT INTO notes (id) VALUES (1)" }) {
