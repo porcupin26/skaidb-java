@@ -414,6 +414,30 @@ public final class Skaidb {
         if (begin == null) throw new SkaidbException("transaction begin statement must not be null");
     }
 
+    /** The database a new session is in until a {@code USE} enters another. */
+    static final String DEFAULT_DATABASE = "default";
+
+    /**
+     * A session's state as the driver notes it, from {@link
+     * Connection#session}: what a new connection has to be given for the
+     * session to go on — and what {@link Connection#restore} puts a
+     * connection back to.
+     */
+    public static final class Session {
+        /** The session database; empty when none was chosen (the server's {@code default}). */
+        public final String database;
+        /** The {@code SET CONSISTENCY ...} statement in force, or null: no override. */
+        public final String consistency;
+        /** The {@code SET SCAN BUDGET ...} statement in force, or null: the server's budget. */
+        public final String scanBudget;
+
+        Session(String database, String consistency, String scanBudget) {
+            this.database = database;
+            this.consistency = consistency;
+            this.scanBudget = scanBudget;
+        }
+    }
+
     // ---- Connection --------------------------------------------------------
 
     public static final class Connection implements AutoCloseable {
@@ -629,11 +653,11 @@ public final class Skaidb {
                 // other settings than the application set either.
                 String db = database;
                 try {
-                    if (enter && !db.isEmpty()) restore("USE \"" + db.replace("\"", "\"\"") + "\"");
+                    if (enter && !db.isEmpty()) sendOwn(use(db));
                     String setting = consistencySetting;
-                    if (setting != null) restore(setting);
+                    if (setting != null) sendOwn(setting);
                     setting = scanBudgetSetting;
-                    if (setting != null) restore(setting);
+                    if (setting != null) sendOwn(setting);
                 } catch (RuntimeException e) {
                     // No connection comes of this dial, so nothing would
                     // close its socket later: the session the server
@@ -648,15 +672,78 @@ public final class Skaidb {
         }
 
         /**
-         * A statement of the dial itself, which puts the new session where
-         * the old one was: sent on the socket just opened, as it is. If
-         * that socket is gone already the dial has failed — it is not
-         * replaced from in here, by a dial inside the dial.
+         * A statement the driver sends on its own account to put a session
+         * where it belongs — a dial's, for the new session; restore's, for
+         * the one a pool takes back. Sent on the socket as it is: if that
+         * is gone the caller has failed, and it is not replaced from in
+         * here (by a dial inside the dial, say). Nor is it a statement of
+         * the application's for a pool to remember a write by.
          */
-        private void restore(String sql) {
+        private void sendOwn(String sql) {
             byte[] body = sql.getBytes(StandardCharsets.UTF_8);
             roundtrip(new Buf().u8(1).u8(consistency).u32(body.length).raw(body).toBytes());
             noteSession(sql);
+        }
+
+        /** The statement that enters database {@code db}. */
+        private static String use(String db) {
+            return "USE \"" + db.replace("\"", "\"\"") + "\"";
+        }
+
+        /**
+         * The session as the driver has noted it: its database and its
+         * settings. With {@link #restore}, what a pool of your own needs to
+         * hand every borrower the same session (a {@link Pool} does it by
+         * itself).
+         */
+        public Session session() {
+            return new Session(database, consistencySetting, scanBudgetSetting);
+        }
+
+        /**
+         * Put the session back to {@code state} — typically what {@link
+         * #session} returned before the connection was lent out: a
+         * transaction the application left open is rolled back, then the
+         * database is entered ({@code USE}), the scan budget and the
+         * consistency override set again or put back to their defaults
+         * ({@code SET SCAN BUDGET DEFAULT}, {@code SET CONSISTENCY
+         * DEFAULT}). Only what differs is sent, so a session nobody
+         * changed costs no round trip.
+         *
+         * <p>False when the session could not be put back — the connection
+         * is gone, closed or still streaming, or the server refused one of
+         * the statements (a server older than 0.349 does not know {@code
+         * SET CONSISTENCY DEFAULT}). The connection is then in nobody's
+         * session and must not be handed on: close it.
+         */
+        public synchronized boolean restore(Session state) {
+            if (state == null) throw new SkaidbException("session state must not be null");
+            // A connection the server has closed meanwhile is not dialled
+            // again just to be put back: it has no session to speak of.
+            look();
+            if (!isUsable()) return false;
+            try {
+                if (noted) {
+                    sendOwn("ROLLBACK");
+                    noted = false;
+                }
+                if (!home(database).equals(home(state.database))) {
+                    sendOwn(use(home(state.database)));
+                    database = state.database;
+                }
+                if (!java.util.Objects.equals(scanBudgetSetting, state.scanBudget))
+                    sendOwn(state.scanBudget == null ? "SET SCAN BUDGET DEFAULT" : state.scanBudget);
+                if (!java.util.Objects.equals(consistencySetting, state.consistency))
+                    sendOwn(state.consistency == null ? "SET CONSISTENCY DEFAULT" : state.consistency);
+                return isUsable();
+            } catch (RuntimeException e) {
+                return false;
+            }
+        }
+
+        /** The database a session with {@code database} noted is in: none chosen is the server's default. */
+        private static String home(String database) {
+            return database.isEmpty() ? DEFAULT_DATABASE : database;
         }
 
         /**
@@ -1201,12 +1288,6 @@ public final class Skaidb {
                 return sql;   // a value with no literal form: no setting takes one
             }
         }
-
-        /**
-         * Whether the session is in {@code db}, a pool's database option
-         * ("" = the pool has none, and any database will do).
-         */
-        boolean inDatabase(String db) { return db.isEmpty() || db.equals(database); }
 
         // -- framing --
         //
@@ -3082,7 +3163,11 @@ public final class Skaidb {
      * <p>{@code maxsize} bounds the connections kept IDLE, not the number
      * checked out: a burst creates extras and the surplus is closed on return.
      * Pooled connections are dialed with the pool's connect options, so they
-     * inherit TLS, credentials, consistency and the session database; one
+     * inherit TLS, credentials, consistency and the session database, and
+     * every borrower gets one in that session: what a borrower changed
+     * with {@code USE}, {@code SET CONSISTENCY} or {@code SET SCAN BUDGET},
+     * or left open with {@code BEGIN}, is put back when the connection is
+     * returned (see {@link #release}). One
      * that loses its socket re-dials in the pool's order (usable members
      * first, the one it lost last). An idle connection the server has
      * closed meanwhile is not handed out: a checkout looks at the socket
@@ -3244,6 +3329,8 @@ public final class Skaidb {
         private static final System.Logger LOG = System.getLogger("com.skaidb.pool");
 
         private final ConnectOptions opts;
+        /** The session every borrower gets a connection in: the pool's database, nothing else set. */
+        private final Session home;
         private final int maxsize;
         private final LoadBalancing policy;
         private final boolean fifo;
@@ -3283,6 +3370,7 @@ public final class Skaidb {
         /** A pool dialing with {@code connect}, sized and balanced by {@code options}. */
         public Pool(ConnectOptions connect, PoolOptions options) {
             this.opts = connect.copy().validate();
+            this.home = new Session(opts.database, null, null);
             PoolOptions o = options.copy();
             this.maxsize = o.maxSize;
             this.policy = o.loadBalancing;
@@ -3359,21 +3447,34 @@ public final class Skaidb {
         }
 
         /**
-         * Return a connection, closing it instead if it is broken or still
-         * streaming, its member is ejected, not ready or gone, the idle set
-         * is full, or — in a pool with a session database — a {@code USE}
-         * left it in another one: the next borrower gets a connection in
-         * the pool's database, not in the last borrower's.
+         * Return a connection. The next borrower gets it in the pool's own
+         * session, so first it is put back there ({@link
+         * Connection#restore}) if its borrower moved it: a transaction
+         * left open is rolled back, the pool's database entered again
+         * ({@code default} for a pool without one), a scan budget and a
+         * consistency override put back to their defaults. A borrower
+         * that changed nothing costs no round trip. The connection is
+         * closed instead of kept if it cannot be put back, if it is broken
+         * or still streaming, if its member is ejected, not ready or
+         * gone, or if the idle set is full.
          */
         public void release(Connection c) {
+            // Whether it would be kept at all: nothing is sent to put a
+            // connection back that is closed anyway.
+            boolean wanted;
+            synchronized (this) {
+                MemberState m = members.get(c.poolEp);
+                wanted = !closed && m != null && usable(m) && idle.size() < maxsize;
+            }
+            // Outside the pool's monitor: it may take round trips.
+            boolean own = wanted && c.restore(home);
             synchronized (this) {
                 MemberState m = members.get(c.poolEp);
                 if (c.poolOut) {
                     c.poolOut = false;
                     if (m != null && m.inUse > 0) m.inUse--;
                 }
-                if (!closed && c.isUsable() && m != null && usable(m) && idle.size() < maxsize
-                        && c.inDatabase(opts.database)) {
+                if (own && !closed && m != null && usable(m) && idle.size() < maxsize) {
                     idle.addLast(c);
                     return;
                 }

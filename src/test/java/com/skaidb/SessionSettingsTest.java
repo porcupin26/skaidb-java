@@ -266,7 +266,9 @@ class SessionSettingsTest {
     void aBorrowersSettingsAreSentAgainWhenItsConnectionReDials() throws Exception {
         ConformanceServer server = ConformanceServer.sessions(List.of(
             List.of(q("USE \"app\"", ok()), q(BUDGET, ok()), q(ALL, ok()).thenHangUp()),
-            List.of(q("USE \"app\"", ok()), q(ALL, ok()), q(BUDGET, ok()), q(SCAN, error(REFUSED)))));
+            List.of(q("USE \"app\"", ok()), q(ALL, ok()), q(BUDGET, ok()), q(SCAN, error(REFUSED)),
+                // back in the pool, the connection is the pool's again (see PoolSessionTest)
+                q("SET SCAN BUDGET DEFAULT", ok()), q("SET CONSISTENCY DEFAULT", ok()))));
         List<Skaidb.Connection> used = new ArrayList<>();
         try (Skaidb.Pool pool = new Skaidb.Pool(options(server).database("app"))) {
             Skaidb.Connection c = pool.acquire();

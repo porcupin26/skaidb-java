@@ -101,6 +101,16 @@ after a conflict, so it must be safe to run more than once and should do
 nothing outside the database that a second run would repeat; it does not
 send `BEGIN`, `COMMIT` or `ROLLBACK` itself.
 
+## `Skaidb.Session`
+
+```java
+public final String database;      // "" when none was chosen (the server's default)
+public final String consistency;   // the SET CONSISTENCY statement in force, or null
+public final String scanBudget;    // the SET SCAN BUDGET statement in force, or null
+```
+
+What `Connection.session()` returns and `Connection.restore` takes.
+
 ## `Skaidb.Connection implements AutoCloseable`
 
 ```java
@@ -117,6 +127,8 @@ public <T> T      transaction(TransactionBody<T> body, int attempts, String begi
 public void       subscribe(String stream, String after, EventHandler handler);
 public boolean    isUsable();                         // !closed && !broken && !streaming
 public String     database();                         // the session database; "" when none was chosen
+public Session    session();                          // database, consistency override and scan budget as noted
+public boolean    restore(Session state);             // put the session back to it; false: could not, close the connection
 public long       reconnects();                       // re-dials so far (never inside a transaction)
 public void       setReadTimeout(int millis);         // bound every read; 0 = none (default)
 public int        getReadTimeout();
@@ -218,9 +230,18 @@ Semantics:
   accepted, sent as a statement on any path — are noted likewise and sent
   again after the `USE`, in that order, unless `... DEFAULT` has cleared
   them; a setting refused on the new connection fails the statement the
-  same way. `Pool.release` closes a
-  connection whose session database is no longer the pool's own (a pool
-  without a `database` option keeps it).
+  same way.
+- `session()` is the session as noted: `database`, `consistency` and
+  `scanBudget` (the `SET` statements in force, or `null`). `restore(state)`
+  puts the connection back to such a state for the next user of a pooled
+  connection: `ROLLBACK` if a hand-written transaction is open, `USE` if
+  the database differs (`default` for an empty one), then the scan budget
+  and the consistency override — the state's statement, or `SET SCAN BUDGET
+  DEFAULT` / `SET CONSISTENCY DEFAULT` — each only when it differs. It
+  returns `false`, and the connection is to be closed, when the connection
+  is gone, closed or streaming or the server refuses a statement.
+  `Pool.release` does this with the pool's own session: the pool's
+  database, nothing else set.
 - `subscribe` blocks until the handler returns `false` or the thread is
   interrupted. It polls `_stream_<name>` in pages of 500 with a 500 ms idle
   sleep.
@@ -345,7 +366,7 @@ public Pool(ConnectOptions connect, PoolOptions options);
 
 public Connection acquire();                              // under the pool-wide affinity key
 public Connection acquire(Object affinity);               // idle (and not closed by the server) to the picked member, else a fresh dial
-public void       release(Connection c);                  // parks it if usable, its member usable and room remains; else closes it
+public void       release(Connection c);                  // puts its session back and parks it; closes it if it cannot, or no room remains
 public <T> T      withConnection(Work<T> work);
 public <T> T      withConnection(Object affinity, Work<T> work);
 public <T> T      transaction(TransactionBody<T> body);                            // 3 attempts, "BEGIN"
@@ -357,6 +378,11 @@ public void       close();                                // closes every idle c
 
 Thread-safe. A malformed DSN throws from the constructor. The probe and
 discovery refresh run on one daemon thread per pool, started on first need.
+Every borrower gets a connection in the pool's session — its database
+(`default` without one), no transaction open, no consistency override, no
+scan budget: `release` puts back what the borrower changed
+(`Connection.restore`), sending only what is needed, and closes a
+connection it cannot put back.
 `transaction` is `Connection.transaction` on one connection checked out
 (under the pool-wide affinity key) for the whole transaction and returned
 after; its arguments are checked before the checkout.

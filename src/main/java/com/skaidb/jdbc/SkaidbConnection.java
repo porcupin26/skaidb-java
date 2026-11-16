@@ -58,6 +58,8 @@ public final class SkaidbConnection implements Connection {
     /** The streamed result set that last took the wire; see {@link #busy()}. */
     private SkaidbResultSet streamed;
     private boolean readOnly = false;
+    /** The session as the current request found it (see {@link #beginRequest}); null between requests. */
+    private Skaidb.Session requestStart;
     private int holdability = ResultSet.HOLD_CURSORS_OVER_COMMIT;
     private final Properties clientInfo = new Properties();
     private SQLWarning warnings;
@@ -367,6 +369,53 @@ public final class SkaidbConnection implements Connection {
     public int getTransactionIsolation() throws SQLException {
         checkOpen();
         return TRANSACTION_READ_COMMITTED;
+    }
+
+    // ---- request boundaries -------------------------------------------------------
+
+    /**
+     * A pool lends the connection out (JDBC 4.3). The session as it is
+     * now — its database, its {@code SET CONSISTENCY} override, its scan
+     * budget — is the one {@link #endRequest} puts the connection back to.
+     * Not nested: until the request ends, further calls change nothing.
+     */
+    @Override
+    public void beginRequest() throws SQLException {
+        checkOpen();
+        if (requestStart == null) requestStart = conn.session();
+    }
+
+    /**
+     * The pool takes the connection back (JDBC 4.3): the next borrower
+     * must find the session this request found, not the one it leaves. A
+     * streamed result set still open is closed, a transaction still open
+     * is rolled back, and what the request changed with {@code
+     * setCatalog}, a {@code USE}, a {@code SET CONSISTENCY} or a {@code
+     * SET SCAN BUDGET} is put back; a request that changed nothing costs
+     * no round trip. If the session cannot be put back — the connection
+     * is gone, or the server refuses (one older than 0.349 does not know
+     * {@code SET CONSISTENCY DEFAULT}) — the connection is closed: it is
+     * in nobody's session, and {@link #isClosed} and {@link #isValid}
+     * tell the pool to drop it.
+     */
+    @Override
+    public void endRequest() throws SQLException {
+        Skaidb.Session start = requestStart;
+        requestStart = null;
+        if (closed || start == null) return;
+        if (busy()) streamed.closeQuietly();
+        boolean back;
+        try {
+            if (txnOpen) rollback();
+            back = conn.restore(start);
+        } catch (SQLException | RuntimeException e) {
+            back = false;
+        }
+        if (!back) {
+            txnOpen = false;
+            closed = true;
+            conn.close();
+        }
     }
 
     // ---- state ----------------------------------------------------------------

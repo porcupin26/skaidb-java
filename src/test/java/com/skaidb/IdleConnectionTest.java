@@ -217,9 +217,9 @@ class IdleConnectionTest {
     @Test
     void aPoolDoesNotHandOutAConnectionTheServerClosedWhileItSatIdle() throws Exception {
         Map<String, ConformanceServer.Exchange> ends = new LinkedHashMap<>();
-        ends.put("half-closed", q(COUNT, counted(3)).thenHalfClose());
-        ends.put("closed", q(COUNT, counted(3)).thenHangUp());
-        ends.put("reset", q(COUNT, counted(3)).thenReset());
+        ends.put("half-closed", q(COUNT, counted(3)).thenHalfClose().whenTold());
+        ends.put("closed", q(COUNT, counted(3)).thenHangUp().whenTold());
+        ends.put("reset", q(COUNT, counted(3)).thenReset().whenTold());
         for (Map.Entry<String, ConformanceServer.Exchange> end : ends.entrySet()) {
             String name = end.getKey();
             ConformanceServer server = ConformanceServer.sessions(List.of(
@@ -231,7 +231,9 @@ class IdleConnectionTest {
                     used.add(c);
                     return c.query(COUNT);
                 });
+                // Back in the pool and healthy; the server closes it while it sits there.
                 assertEquals(1, pool.members().get(0).idle, name);
+                server.endNow();
                 Thread.sleep(ARRIVES);
                 // The checkout gives a working connection, and a statement on it succeeds.
                 Skaidb.Connection c = pool.acquire();

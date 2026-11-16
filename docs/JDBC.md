@@ -107,6 +107,24 @@ before it writes (no round trip), replaces the connection and runs the
 statement, or `isValid`, on the new one. Inside a transaction the
 statement throws `SQLTransactionRollbackException` (`40003`) instead.
 
+**A borrower's session.** A pooled physical connection keeps its session
+from one borrower to the next: the database a borrower entered with a `USE`
+statement, a `SET CONSISTENCY` override, a `SET SCAN BUDGET`. The driver
+puts it back at the request boundaries of JDBC 4.3. A pool that calls
+`Connection.beginRequest()` when it lends a connection and `endRequest()`
+when it takes it back gets, at `endRequest()`, the session the request
+began in: a streamed result set still open is closed, a transaction still
+open is rolled back, then `USE`, `SET SCAN BUDGET` and `SET CONSISTENCY` —
+the statements in force when the request began, or their `DEFAULT` — are
+sent for whatever the borrower changed, and nothing for a borrower that
+changed nothing. What the pool's own connection-init statement set up is
+therefore kept. If the session cannot be put back (the connection is gone;
+a server older than 0.349 refuses `SET CONSISTENCY DEFAULT`) the driver
+closes the physical connection, and `isClosed()` / `isValid()` tell the
+pool to drop it. With a pool that does not mark request boundaries, name
+the database in the URL and change it with `setCatalog` (which pools
+restore themselves), and do not leave `SET` statements behind.
+
 **Balancing across members.** A JDBC pool opens each physical connection
 through the driver, which dials the URL's hosts in shuffled order and keeps
 the connection on the member it reached — so a HikariCP pool's connections

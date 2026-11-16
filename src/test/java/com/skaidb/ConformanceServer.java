@@ -56,14 +56,26 @@ public final class ConformanceServer implements AutoCloseable {
         final List<byte[]> responses;
         /** What the server does to the socket once the responses are out. */
         final End end;
+        /** The server waits for {@link ConformanceServer#endNow} before it does. */
+        final boolean told;
         public Exchange(byte[] request, List<byte[]> responses) {
-            this(request, responses, End.NONE);
+            this(request, responses, End.NONE, false);
         }
         private Exchange(byte[] request, List<byte[]> responses, End end) {
+            this(request, responses, end, false);
+        }
+        private Exchange(byte[] request, List<byte[]> responses, End end, boolean told) {
             this.request = request;
             this.responses = responses;
             this.end = end;
+            this.told = told;
         }
+        /**
+         * This exchange, ending its connection as it says — but only once
+         * the test calls {@link ConformanceServer#endNow}: until then the
+         * connection sits there, answered and healthy.
+         */
+        public Exchange whenTold() { return new Exchange(request, responses, end, true); }
         /**
          * This exchange, after which the server closes the socket: the
          * connection is lost — under this request when it has no responses,
@@ -110,6 +122,8 @@ public final class ConformanceServer implements AutoCloseable {
     private final List<Integer> closes = new CopyOnWriteArrayList<>();
     /** The bytes each accepted connection sent after the server half-closed it. */
     private final List<java.util.concurrent.atomic.AtomicLong> afterHalfClose = new CopyOnWriteArrayList<>();
+    /** One permit for each {@link #endNow}. */
+    private final java.util.concurrent.Semaphore told = new java.util.concurrent.Semaphore(0);
     /** Connections that have ended; guarded by this. */
     private int ended = 0;
     private volatile String error;
@@ -216,6 +230,9 @@ public final class ConformanceServer implements AutoCloseable {
         }
         return true;
     }
+    /** Let the connection that waits for it ({@link Exchange#whenTold}) end now. */
+    public void endNow() { told.release(); }
+
     /**
      * Wait until {@code c} can see that the server ended its connection —
      * the close has arrived at the client's socket — as the driver itself
@@ -278,9 +295,11 @@ public final class ConformanceServer implements AutoCloseable {
      * End the connection as {@code ex} says; true when it did. A
      * half-closed connection is read to its end here, every byte counted.
      */
-    private boolean end(Socket s, DataInputStream in, Exchange ex, List<Exchange> pending) throws IOException {
+    private boolean end(Socket s, DataInputStream in, Exchange ex, List<Exchange> pending)
+            throws IOException, InterruptedException {
         if (ex.end == End.NONE) return false;
         if (!pending.isEmpty()) error = "the script goes on after the server ended the connection";
+        if (ex.told) told.acquire();
         if (ex.end == End.RESET) {
             s.setSoLinger(true, 0);
         } else if (ex.end == End.HALF_CLOSE) {

@@ -621,10 +621,21 @@ try (Skaidb.Pool pool = new Skaidb.Pool("skaidb://u:p@h1:7000,h2:7000/app", 8)) 
   a statement takes, see [Errors and reconnection](#errors-and-reconnection));
   `release()` closes a broken or still-streaming connection instead of
   parking it.
-- A borrower's `USE` does not reach the next borrower of a pool that has a
-  session database: `release()` closes a connection that a `USE` left in
-  another database. A pool without one keeps the connection, in whatever
-  database its last borrower entered.
+- Every borrower gets a connection in the pool's own session: in the
+  pool's database (the DSN's, or `default` when it names none), with no
+  transaction open, no `SET CONSISTENCY` override and no scan budget. What
+  a borrower changed is put back when the connection is returned —
+  `ROLLBACK` for a transaction left open, `USE` for the database, `SET SCAN
+  BUDGET DEFAULT`, `SET CONSISTENCY DEFAULT` — and only what it changed: a
+  borrower that changed nothing costs no round trip. A connection that
+  cannot be put back is closed instead of kept (a server older than 0.349
+  refuses `SET CONSISTENCY DEFAULT`, so there a borrower's consistency
+  override costs the connection). Choose a pool's database in its DSN; a
+  `USE` lasts for one borrow.
+- A pool of your own does the same with `conn.session()` — the session as
+  the driver notes it: database, consistency override, scan budget — and
+  `conn.restore(session)`, which puts a connection back to it and returns
+  `false` when it could not (close the connection then).
 - `pool.transaction(body)` runs a [transaction](#transactions) on one
   connection, checked out for all of it and returned after; it takes the
   same `attempts` and `begin` arguments as `conn.transaction`.
@@ -703,7 +714,8 @@ Ejections and re-admissions are logged at WARNING on the `com.skaidb.pool`
 are the same in every skaidb driver
 ([PROTOCOL.md §6.1](https://skaidb.org/docs/PROTOCOL.html#61-balancing-a-pool-across-members)).
 The JDBC `SkaidbDataSource` leaves pooling to HikariCP and the like, which
-place connections on random members; see [docs/JDBC.md](docs/JDBC.md#connection-pools).
+place connections on random members; see [docs/JDBC.md](docs/JDBC.md#connection-pools)
+— also for how a borrower's session is put back there.
 
 ## Change streams (`subscribe`)
 

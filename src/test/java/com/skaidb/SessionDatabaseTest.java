@@ -2,7 +2,6 @@ package com.skaidb;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -369,32 +368,35 @@ class SessionDatabaseTest {
 
     @Test
     void aBorrowersUseDoesNotReachTheNextBorrowerOfAPoolWithADatabase() throws Exception {
-        ConformanceServer server = ConformanceServer.sessions(List.of(
-            // The first borrower re-enters the pool's own database, the second another one.
-            List.of(q(ENTER_APP, ok()), q("USE app", ok()), q("USE reports", ok())),
-            List.of(q(ENTER_APP, ok()), q(COUNT, counted(3)))));
+        ConformanceServer server = ConformanceServer.sessions(List.of(List.of(
+            // The first borrower re-enters the pool's own database, the second another one —
+            // which the pool leaves again when the connection comes back (see PoolSessionTest).
+            q(ENTER_APP, ok()), q("USE app", ok()), q("USE reports", ok()), q(ENTER_APP, ok()),
+            q(COUNT, counted(3)))));
         List<Skaidb.Connection> used = new ArrayList<>();
         try (Skaidb.Pool pool = new Skaidb.Pool(options(server).database("app"))) {
             pool.withConnection(c -> {
                 used.add(c);
                 return c.execute("USE app");
             });
-            assertEquals(1, pool.members().get(0).idle, "still in the pool's database: kept");
+            assertEquals(1, pool.members().get(0).idle, "still in the pool's database: kept as it is");
+            assertEquals(2, server.requests().size());
             pool.withConnection(c -> {
                 used.add(c);
                 return c.execute("USE reports");
             });
             assertSame(used.get(0), used.get(1));
-            // A connection left in another database is not handed on: it is closed.
-            assertEquals(0, pool.members().get(0).idle);
-            assertTrue(server.awaitEnded(1, 2_000));
+            // A connection left in another database is put back into the pool's before it is handed on.
+            assertEquals(1, pool.members().get(0).idle);
             assertEquals(3, (long) pool.withConnection(c -> {
                 used.add(c);
+                assertEquals("app", c.database());
                 return count(c);
             }));
-            assertNotSame(used.get(1), used.get(2));
+            assertSame(used.get(1), used.get(2));
         }
         assertNull(server.finish());
-        assertEquals(List.of(ENTER_APP, COUNT), sent(server, 1), "the next borrower is in the pool's database");
+        assertEquals(List.of(ENTER_APP, "USE app", "USE reports", ENTER_APP, COUNT), sent(server, 0),
+            "the next borrower is in the pool's database");
     }
 }

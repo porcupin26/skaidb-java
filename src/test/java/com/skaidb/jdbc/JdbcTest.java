@@ -1264,6 +1264,101 @@ class JdbcTest {
         }
     }
 
+    // ---- a pool's request boundaries (JDBC 4.3 beginRequest / endRequest) --------------------
+
+    @Test
+    void aRequestThatEndsLeavesTheSessionAsItFoundIt() throws Exception {
+        String budget = "SET SCAN BUDGET ROWS 1";
+        String all = "SET CONSISTENCY ALL";
+        String count = "SELECT count(*) FROM notes";
+        String insert = "INSERT INTO notes (id) VALUES (9)";
+        byte[] ok = ConformanceServer.ddlResponse();
+        byte[] three = ConformanceServer.rowsResponse(new String[] { "count" }, new Object[] { 3L });
+        ConformanceServer server = new ConformanceServer("ok", List.of(
+            // borrower 1 moves the session ...
+            query("USE other", ok), query(budget, ok), query(all, ok),
+            // ... and the end of its request puts it back: the database every connection starts in, no settings
+            query("USE \"default\"", ok), query("SET SCAN BUDGET DEFAULT", ok), query("SET CONSISTENCY DEFAULT", ok),
+            // borrower 2: not in other, not refused for a scan budget; it changes nothing, and nothing is sent for it
+            query(count, three),
+            // borrower 3 leaves a transaction open, and a streamed result set
+            query("BEGIN", ok), query(insert, ConformanceServer.mutationResponse(1)),
+            streamOfT(ConformanceServer.rowsEndResponse()), query("ROLLBACK", ok),
+            // borrower 4 finds none of it
+            query(count, three)));
+        try (Connection c = DriverManager.getConnection(url(server, ""), creds());
+             Statement st = c.createStatement()) {
+            c.beginRequest();
+            st.execute("USE other");
+            st.execute(budget);
+            st.execute(all);
+            c.endRequest();
+            assertEquals(6, server.requests().size(), "put back when the request ends");
+
+            c.beginRequest();
+            c.beginRequest();   // not nested: the first one counts
+            assertTrue(st.executeQuery(count).next());
+            c.endRequest();
+            c.endRequest();     // no request is open: nothing to do
+            assertEquals(7, server.requests().size());
+
+            c.beginRequest();
+            c.setAutoCommit(false);
+            assertEquals(1, st.executeUpdate(insert));
+            Statement reader = c.createStatement();
+            reader.setFetchSize(100);
+            ResultSet open = reader.executeQuery("SELECT id FROM t");
+            assertTrue(open.next());
+            c.endRequest();
+            assertTrue(open.isClosed());
+            assertEquals(11, server.requests().size(), "the transaction is rolled back, not left for the next borrower");
+            c.setAutoCommit(true);
+
+            c.beginRequest();
+            assertTrue(st.executeQuery(count).next());
+            c.endRequest();
+            assertEquals(0, c.unwrap(Skaidb.Connection.class).reconnects());
+        }
+        finish(server);
+    }
+
+    @Test
+    void theSessionARequestIsPutBackToIsTheOneItStartedIn() throws Exception {
+        byte[] ok = ConformanceServer.ddlResponse();
+        ConformanceServer server = new ConformanceServer("ok", List.of(
+            // What a pool's connection-init statement set up is the pool's session: it is kept.
+            query("USE \"app\"", ok), query("SET SCAN BUDGET ROWS 5000", ok),
+            query("USE \"reports\"", ok), query("SET SCAN BUDGET ROWS 1", ok),
+            query("USE \"app\"", ok), query("SET SCAN BUDGET ROWS 5000", ok)));
+        try (Connection c = DriverManager.getConnection(url(server, "/app"), creds());
+             Statement st = c.createStatement()) {
+            st.execute("SET SCAN BUDGET ROWS 5000");
+            c.beginRequest();
+            c.setCatalog("reports");
+            st.execute("SET SCAN BUDGET ROWS 1");
+            c.endRequest();
+            assertEquals("app", c.getCatalog());
+        }
+        finish(server);
+    }
+
+    @Test
+    void aSessionThatCannotBePutBackCostsTheConnection() throws Exception {
+        // An older server does not know SET CONSISTENCY DEFAULT.
+        ConformanceServer server = new ConformanceServer("ok", List.of(
+            query("SET CONSISTENCY ALL", ConformanceServer.ddlResponse()),
+            query("SET CONSISTENCY DEFAULT", ConformanceServer.errorResponse("parse error: SET CONSISTENCY takes ONE, QUORUM or ALL"))));
+        Connection c = DriverManager.getConnection(url(server, ""), creds());
+        c.beginRequest();
+        c.createStatement().execute("SET CONSISTENCY ALL");
+        c.endRequest();
+        // In nobody's session now: the pool must not hand it to anyone, and cannot.
+        assertTrue(c.isClosed());
+        assertFalse(c.isValid(1));
+        assertTrue(server.awaitEnded(1, 2_000), "the socket stayed open");
+        finish(server);
+    }
+
     // ---- the statements a connection holds on the server --------------------------------
 
     @Test
