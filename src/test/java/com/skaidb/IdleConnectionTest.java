@@ -481,6 +481,39 @@ class IdleConnectionTest {
     }
 
     @Test
+    void subscribeReturnsWhenItsThreadIsInterruptedWhileAPollWaits() throws Exception {
+        // subscribe() ends when its thread is interrupted — in the pause
+        // between two polls, and just as well while a poll waits for the server.
+        String poll = "SELECT id, op, k, ts, doc FROM _stream_s ORDER BY id LIMIT 500";
+        ConformanceServer server = ConformanceServer.sessions(List.of(
+            List.of(q(poll)),   // never answered
+            List.of(q(COUNT, counted(3)))));
+        try (Skaidb.Connection c = Skaidb.connect(options(server))) {
+            AtomicReference<Throwable> failure = new AtomicReference<>();
+            AtomicReference<Boolean> status = new AtomicReference<>();
+            Thread subscriber = new Thread(() -> {
+                try {
+                    c.subscribe("s", null, event -> true);
+                } catch (Throwable t) {
+                    failure.set(t);
+                }
+                status.set(Thread.currentThread().isInterrupted());
+            }, "subscriber");
+            subscriber.start();
+            long deadline = System.nanoTime() + 5_000_000_000L;
+            while (server.requests().isEmpty() && System.nanoTime() < deadline) Thread.sleep(5);
+            Thread.sleep(50);
+            subscriber.interrupt();
+            subscriber.join(5_000);
+            assertFalse(subscriber.isAlive());
+            assertNull(failure.get(), "interrupting the thread returns: it is how subscribe is told to stop");
+            assertTrue(status.get());
+            assertEquals(1, c.query(COUNT).getRowCount());
+        }
+        assertNull(server.finish());
+    }
+
+    @Test
     void closeFromAnotherThreadEndsAStatementThatWaitsForTheServer() throws Exception {
         for (boolean tls : new boolean[] { false, true }) {
             // The server never answers the statement.

@@ -1223,19 +1223,29 @@ public final class Skaidb {
          *
          * <p>This polls; for push delivery subscribe to
          * {@code $stream/<db>/<name>} with any MQTT client instead. The
-         * events are identical.
+         * events are identical. Interrupting the thread returns, with its
+         * interrupt status set — whether it was pausing between two polls
+         * or waiting for the server to answer one.
          */
         public void subscribe(String stream, String after, EventHandler handler) {
             String log = "_stream_" + stream;
             String cur = after;
             while (true) {
                 ResultSet rs;
-                if (cur == null) {
-                    rs = prepare("SELECT id, op, k, ts, doc FROM " + log
-                            + " ORDER BY id LIMIT 500").executeQuery();
-                } else {
-                    rs = prepare("SELECT id, op, k, ts, doc FROM " + log
-                            + " WHERE id > ? ORDER BY id LIMIT 500").setString(1, cur).executeQuery();
+                try {
+                    if (cur == null) {
+                        rs = prepare("SELECT id, op, k, ts, doc FROM " + log
+                                + " ORDER BY id LIMIT 500").executeQuery();
+                    } else {
+                        rs = prepare("SELECT id, op, k, ts, doc FROM " + log
+                                + " WHERE id > ? ORDER BY id LIMIT 500").setString(1, cur).executeQuery();
+                    }
+                } catch (SkaidbException e) {
+                    // Interrupted while a poll waited for the server: that
+                    // ends subscribe as an interrupt in the pause below does
+                    // — it is no failure of the stream.
+                    if (e.getCause() instanceof java.nio.channels.ClosedByInterruptException) return;
+                    throw e;
                 }
                 int n = 0;
                 while (rs.next()) {
