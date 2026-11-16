@@ -209,7 +209,11 @@ Semantics:
   chosen (the session is then in the server's `default`). Every re-dial
   enters the current one before the statement that caused it is sent; if
   that `USE` is refused the statement throws its error, the connection
-  stays broken and the next statement dials again. The session's `SET
+  stays broken and the next statement dials again. A re-dial caused by a
+  `USE` statement itself does not enter the old database first (it may
+  have been dropped): the `USE` is sent on the new connection and decides;
+  refused, it leaves the connection broken, to dial into the database it
+  was in. The session's `SET
   CONSISTENCY ...` and `SET SCAN BUDGET ...` — the last of each the server
   accepted, sent as a statement on any path — are noted likewise and sent
   again after the `USE`, in that order, unless `... DEFAULT` has cleared

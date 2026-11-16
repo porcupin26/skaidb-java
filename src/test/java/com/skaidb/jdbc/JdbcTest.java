@@ -1189,6 +1189,36 @@ class JdbcTest {
     }
 
     @Test
+    void setCatalogIsNotHeldHostageByTheDatabaseItLeaves() throws Exception {
+        String gone = "database \"app\" does not exist";
+        byte[] ok = ConformanceServer.ddlResponse();
+        Map<String, TransactionStep> ways = new java.util.LinkedHashMap<>();
+        ways.put("setCatalog", (c, st) -> c.setCatalog("other"));
+        ways.put("USE through a Statement", (c, st) -> st.execute("USE \"other\""));
+        for (Map.Entry<String, TransactionStep> way : ways.entrySet()) {
+            String name = way.getKey();
+            ConformanceServer server = ConformanceServer.sessions(List.of(
+                List.of(query("USE \"app\"", ok).thenHangUp()),
+                // app was dropped meanwhile: a statement fails rather than run elsewhere ...
+                List.of(query("USE \"app\"", ConformanceServer.errorResponse(gone))),
+                // ... but the connection can still be moved, without reconnecting by hand.
+                List.of(query("USE \"other\"", ok),
+                    query("SELECT 1", ConformanceServer.rowsResponse(new String[] { "x" }, new Object[] { 1L })))));
+            try (Connection c = DriverManager.getConnection(url(server, "/app"), creds());
+                 Statement st = c.createStatement()) {
+                assertTrue(server.awaitEnded(1, 2_000), name);
+                assertTrue(ConformanceServer.awaitSeenClosed(c.unwrap(Skaidb.Connection.class), 2_000), name);
+                SQLException e = assertThrows(SQLException.class, () -> st.executeQuery("SELECT 1"), name);
+                assertEquals(gone, e.getMessage(), name);
+                way.getValue().run(c, st);
+                assertEquals("other", c.getCatalog(), name);
+                assertTrue(st.executeQuery("SELECT 1").next(), name);
+            }
+            assertNull(server.finish(), name);
+        }
+    }
+
+    @Test
     void sessionSettingsSurviveAReDial() throws Exception {
         String budget = "SET SCAN BUDGET ROWS 1";
         String all = "SET CONSISTENCY ALL";

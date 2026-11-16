@@ -814,6 +814,15 @@ that database on the new socket before it sends anything
 else, and if the server refuses it there the statement fails with that
 error instead of running in another database.
 
+One statement is not held to the old database: a `USE` itself. When the
+statement that causes the re-dial is a `USE` the driver can read, the new
+connection does not enter the old database first — the statement is
+leaving it anyway, and a database that was dropped meanwhile must not keep
+you from saying where to go instead. The settings are sent, then your
+`USE`, and its answer decides the session database as always; if it is
+refused, the connection stays in the database it was in and dials into it
+again for the next statement.
+
 The session's settings are restored the same way. A `SET CONSISTENCY ...`
 and a `SET SCAN BUDGET ...` statement the server accepted are noted, the
 last of each kind, and sent again on the new socket — after the session

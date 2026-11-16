@@ -187,6 +187,86 @@ class SessionDatabaseTest {
         assertEquals(List.of(ENTER_APP, COUNT), sent(server, 2));
     }
 
+    // ---- a USE is not held hostage by the database it leaves -----------------------------
+
+    static final String GONE = "database \"app\" does not exist";
+    static final String BUDGET = "SET SCAN BUDGET ROWS 100";
+    static final String ALL = "SET CONSISTENCY ALL";
+
+    @Test
+    void aUseIsNotHeldHostageByTheDatabaseItLeaves() throws Exception {
+        // Every way of sending the USE that leaves the dropped database.
+        Map<String, Send> paths = new LinkedHashMap<>();
+        paths.put("execute", (c, sql) -> c.execute(sql));
+        paths.put("query", (c, sql) -> c.query(sql));
+        paths.put("executeRaw", (c, sql) -> c.executeRaw(sql));
+        paths.put("prepare", (c, sql) -> c.prepare(sql).executeUpdate());
+        paths.put("stream", (c, sql) -> c.stream(sql).close());
+        for (Map.Entry<String, Send> path : paths.entrySet()) {
+            String name = path.getKey();
+            boolean streams = name.equals("stream");
+            ConformanceServer.Exchange useOther = streams
+                ? new ConformanceServer.Exchange(ConformanceServer.streamRequest("USE other", QUORUM), List.of(ok()))
+                : q("USE other", ok());
+            ConformanceServer server = ConformanceServer.sessions(List.of(
+                // In app, with settings of its own; then app is dropped from elsewhere and the connection lost.
+                List.of(q("USE app", ok()), q(BUDGET, ok()), q(ALL, ok()).thenHangUp()),
+                // Any other statement must not run anywhere else: it fails at the USE that re-enters app.
+                List.of(q(ENTER_APP, error(GONE))),
+                // But a USE says where to go instead: the settings, then the USE itself — not app first.
+                List.of(q(ALL, ok()), q(BUDGET, ok()), useOther, q(COUNT, counted(3)).thenHangUp()),
+                // ... and that is the database a later dial enters.
+                List.of(q("USE \"other\"", ok()), q(ALL, ok()), q(BUDGET, ok()), q(INSERT, changed(1)))));
+            try (Skaidb.Connection c = Skaidb.connect(options(server))) {
+                c.execute("USE app");
+                c.execute(BUDGET);
+                c.execute(ALL);
+                assertTrue(server.awaitEnded(1, 2_000), name);
+                assertTrue(ConformanceServer.awaitSeenClosed(c, 2_000), name);
+                Skaidb.SkaidbException e = assertThrows(Skaidb.SkaidbException.class, () -> c.query("SELECT 1"), name);
+                assertEquals(GONE, e.getMessage(), name);
+                assertTrue(server.awaitEnded(2, 2_000), name);
+
+                path.getValue().run(c, "USE other");
+                assertEquals("other", c.database(), name);
+                assertEquals(3, count(c), name + ": a statement after it runs in other");
+                assertEquals(2, c.reconnects(), name);
+                assertTrue(server.awaitEnded(3, 2_000), name);
+                assertTrue(ConformanceServer.awaitSeenClosed(c, 2_000), name);
+                assertEquals(1, c.execute(INSERT), name);
+            }
+            assertNull(server.finish(), name);
+            assertEquals(List.of(ENTER_APP), sent(server, 1), name);
+            assertEquals(List.of(ALL, BUDGET, (streams ? "STREAM " : "") + "USE other", COUNT), sent(server, 2),
+                name + ": the settings and the USE, no USE of the old database");
+        }
+    }
+
+    @Test
+    void aUseRefusedOnTheNewConnectionLeavesTheSessionWhereItWas() throws Exception {
+        ConformanceServer server = ConformanceServer.sessions(List.of(
+            List.of(q("USE app", ok()).thenHangUp()),
+            // The USE goes out first on the new connection, and is refused: that
+            // session is in no database, and no statement may find it there.
+            List.of(q("USE nowhere", error("database \"nowhere\" does not exist"))),
+            // The connection is still in app: the next statement dials again, into it.
+            List.of(q(ENTER_APP, ok()), q(COUNT, counted(3)))));
+        try (Skaidb.Connection c = Skaidb.connect(options(server))) {
+            c.execute("USE app");
+            assertTrue(server.awaitEnded(1, 2_000));
+            assertTrue(ConformanceServer.awaitSeenClosed(c, 2_000));
+            Skaidb.SkaidbException e = assertThrows(Skaidb.SkaidbException.class, () -> c.execute("USE nowhere"));
+            assertEquals("database \"nowhere\" does not exist", e.getMessage());
+            assertEquals("app", c.database());
+            assertTrue(server.awaitEnded(2, 2_000), "the session that is in no database is given up");
+            assertFalse(c.isUsable());
+            assertEquals(3, count(c));
+            assertEquals(2, c.reconnects());
+        }
+        assertNull(server.finish());
+        assertEquals(List.of(ENTER_APP, COUNT), sent(server, 2), "the statement ran in app, not in the default database");
+    }
+
     @Test
     void onlyAUseTheServerAcceptedAndTheDriverCanReadIsNoted() throws Exception {
         ConformanceServer server = ConformanceServer.sessions(List.of(

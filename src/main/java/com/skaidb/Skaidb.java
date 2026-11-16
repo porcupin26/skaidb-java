@@ -547,15 +547,17 @@ public final class Skaidb {
             this.pool = pool;
             this.readTimeoutMs = readTimeoutMs;
             this.database = opts.database;
-            dial(order);
+            dial(order, true);
         }
 
         /**
          * Connect, authenticate and enter the session database. Used for the
          * first connect and for every reconnect, so a recovered connection is
-         * indistinguishable from a fresh one.
+         * indistinguishable from a fresh one. With {@code enter} false the
+         * session database is not entered: the statement this dial is for
+         * is a USE, which decides the database itself (see ensureLive).
          */
-        private void dial(java.util.List<String> order) {
+        private void dial(java.util.List<String> order, boolean enter) {
             // Try each endpoint until one connects AND authenticates — a node
             // that accepts TCP while unhealthy, or closes the socket before
             // the challenge because it is full, must not swallow the attempt.
@@ -627,7 +629,7 @@ public final class Skaidb {
                 // other settings than the application set either.
                 String db = database;
                 try {
-                    if (!db.isEmpty()) restore("USE \"" + db.replace("\"", "\"\"") + "\"");
+                    if (enter && !db.isEmpty()) restore("USE \"" + db.replace("\"", "\"\"") + "\"");
                     String setting = consistencySetting;
                     if (setting != null) restore(setting);
                     setting = scanBudgetSetting;
@@ -1417,7 +1419,7 @@ public final class Skaidb {
             int ends = ending(sql);
             if (ends != 0) look();   // lost while idle is lost before the COMMIT, not under it
             if (ends != 0 && broken) return endLost(ends);
-            ensureLive();
+            boolean nowhere = ensureLive(usedDatabase(sql) != null);
             byte[] body = sql.getBytes(StandardCharsets.UTF_8);
             Buf req = new Buf();
             req.u8(1).u8(level).u32(body.length).raw(body);
@@ -1425,6 +1427,7 @@ public final class Skaidb {
             try {
                 res = roundtrip(req.toBytes());
             } catch (RuntimeException e) {
+                if (nowhere) markBroken();   // see ensureLive: the USE did not decide
                 throw ended(ends, e);
             }
             if (ends != 0) noted = false;
@@ -1495,7 +1498,7 @@ public final class Skaidb {
             int ends = bound ? 0 : ending(sql);
             if (ends != 0) look();
             if (ends != 0 && broken) return new RowStream(this, new String[0], false, endLost(ends));
-            ensureLive();
+            boolean nowhere = ensureLive(!bound && usedDatabase(sql) != null);
             try {
                 long started = System.nanoTime();
                 writeFrame(req.toBytes());
@@ -1505,6 +1508,7 @@ public final class Skaidb {
                 if (ends != 0) noted = false;   // answered: over, whatever the answer
                 if (tag == 3) {
                     String msg = r.text();
+                    if (nowhere) markBroken();   // see ensureLive: the USE did not decide
                     if (msg.contains("unknown opcode")) {
                         throw new SkaidbException("server does not support "
                             + (bound ? "parameterised streaming (skaidb >= 0.330)" : "streaming") + ": " + msg);
@@ -1607,7 +1611,7 @@ public final class Skaidb {
             requireIdle();
             // Before the cache is consulted: a reconnect empties it, so a
             // stale id from the dead socket can never be handed out.
-            ensureLive();
+            ensureLive(false);
             long[] hit = prepared.get(sql);
             if (hit != null) return hit;
             byte[] body = sql.getBytes(StandardCharsets.UTF_8);
@@ -1770,14 +1774,25 @@ public final class Skaidb {
          * The prepared-statement cache MUST be cleared: an id is only valid on
          * the connection that created it, so carrying one across a reconnect
          * would execute a different statement (or fail obscurely).
+         *
+         * <p>{@code use} says the statement is a USE the driver can read.
+         * A re-dial for it does not enter the session database first: the
+         * USE is leaving that database anyway, and one that has been
+         * dropped must not keep the application from saying where to go
+         * instead. The session's settings are still sent, and the USE's
+         * answer decides the database as usual. Returns true when it
+         * re-dialled that way and the session is therefore in no database
+         * until the USE is accepted — if it is not, the caller marks the
+         * connection broken, so that the next statement dials again, into
+         * the database the session was in, rather than run in none.
          */
-        private synchronized void ensureLive() {
+        private synchronized boolean ensureLive(boolean use) {
             if (closed) throw new SkaidbException("connection is closed");
             // A connection the server closed while it sat idle is replaced
             // here, before anything is written to it, exactly as one a
             // failed write has broken — or, inside a transaction, reported.
             look();
-            if (!broken) return;
+            if (!broken) return false;
             // A transaction lives on the connection that began it (PROTOCOL.md
             // §6 rule 7): a new session has none open, so a statement of the
             // transaction sent there would be committed on its own.
@@ -1794,11 +1809,12 @@ public final class Skaidb {
                 // the pool's order, usable members first and the one this
                 // connection just lost last.
                 Pool owner = pool;
-                dial(owner == null ? null : owner.dialOrder(connectedEp));
+                dial(owner == null ? null : owner.dialOrder(connectedEp), !use);
             } catch (RuntimeException e) {
                 markBroken();   // still down; the next statement retries
                 throw e;
             }
+            return use && !database.isEmpty();
         }
     }
 
