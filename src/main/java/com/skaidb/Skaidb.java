@@ -487,14 +487,15 @@ public final class Skaidb {
          * True from the answer to {@link #transaction}'s begin to the answer
          * to its COMMIT or ROLLBACK: the transaction lives on this socket
          * alone, so meanwhile no statement re-dials (see ensureLive).
-         * Guarded by the monitor, which the helper holds throughout.
+         * The helper's thread's alone while it has the connection (see
+         * {@link #transacting}), and read under the monitor.
          */
         private boolean inTransaction = false;
         /**
          * True while {@link #transaction} is at work — its begin, its body,
          * its COMMIT or ROLLBACK. The helper's transaction is its own and
-         * is not noted a second time (see {@link #noted}). Guarded by the
-         * monitor, which the helper holds throughout.
+         * is not noted a second time (see {@link #noted}). The helper's
+         * thread's alone, like {@link #inTransaction}.
          */
         private boolean helping = false;
         /**
@@ -506,6 +507,23 @@ public final class Skaidb {
          * ensureLive). Guarded by the monitor.
          */
         private boolean noted = false;
+        /**
+         * The thread whose {@link #transaction} is at work on this
+         * connection — from before its begin to after its COMMIT or
+         * ROLLBACK — and how deep it is in nested calls; null and 0 when
+         * no helper is. Statements of other threads wait their turn (see
+         * turn). Guarded by the monitor.
+         */
+        private Thread transacting;
+        private int transactingDepth;
+        /** When the socket last gave a frame ({@link System#nanoTime}); see turn(). */
+        private volatile long lastFrame;
+        /**
+         * How long a statement waits for another thread's {@link
+         * #transaction} that is not using the connection, in milliseconds;
+         * see turn().
+         */
+        long strandedAfterMillis = 30_000;
         /** The I/O failure that broke the connection, if one did; see lostInTransaction(). */
         private volatile IOException lost;
         /**
@@ -954,17 +972,33 @@ public final class Skaidb {
          * the helper has returned, the connection re-dials on its next
          * statement as after any transport failure.
          *
-         * <p>The connection's monitor is held from {@code begin} to the end,
-         * so statements other threads send on a shared connection wait for
-         * the transaction instead of running inside it.
+         * <p>From {@code begin} to the end the connection is the calling
+         * thread's: statements other threads send on a shared connection
+         * wait for the transaction instead of running inside it. Run every
+         * statement of the body on the body's own thread. A body that
+         * hands one to another thread and waits for that thread would wait
+         * for ever — the thread for the transaction, the transaction for
+         * the thread — so a statement that has waited 30 seconds for a
+         * transaction whose thread did not use the connection in all that
+         * time gives up: it throws {@code connection is busy in another
+         * thread's transaction}, and the body's wait ends with it. A
+         * transaction that is at work is waited for, however long it
+         * takes.
          *
          * @param attempts how many times the body may run; at least 1
          * @param begin the statement that opens the transaction
          * @throws SkaidbException {@code attempts} below 1, or a null {@code
          *     body} or {@code begin}, before anything is sent
          */
-        public synchronized <T> T transaction(TransactionBody<T> body, int attempts, String begin) {
+        public <T> T transaction(TransactionBody<T> body, int attempts, String begin) {
             checkTransaction(body, attempts, begin);
+            // From here to the end the connection is this thread's: the
+            // statements of other threads wait (see turn).
+            synchronized (this) {
+                turn();
+                transacting = Thread.currentThread();
+                transactingDepth++;
+            }
             // The helper keeps its own account of its transaction (see
             // inTransaction): what it sends is not noted as a transaction
             // of the application's.
@@ -974,6 +1008,59 @@ public final class Skaidb {
                 return transact(body, attempts, begin);
             } finally {
                 helping = outerHelp;
+                synchronized (this) {
+                    if (--transactingDepth == 0) {
+                        transacting = null;
+                        notifyAll();
+                    }
+                }
+            }
+        }
+
+        /**
+         * Wait for this thread's turn on the connection: while {@link
+         * #transaction} is at work for another thread, a statement must
+         * neither run inside that transaction nor between its statements,
+         * so it waits for the transaction to end. Called under the monitor
+         * — which the wait gives up — before anything else a statement
+         * does.
+         *
+         * <p>It does not wait for ever. A transaction's body that hands a
+         * statement on this connection to another thread and then waits
+         * for that thread can never return: the thread waits here for the
+         * transaction, the transaction for the thread. Nothing the driver
+         * can see tells that from a transaction that is merely slow — but
+         * a transaction whose thread is waiting sends nothing. So the wait
+         * ends, with an error, when the socket has given the transaction
+         * no frame for {@link #strandedAfterMillis} of this thread's
+         * waiting; while the transaction keeps using the connection it is
+         * waited for, however long it takes.
+         */
+        private void turn() {
+            Thread me = Thread.currentThread();
+            if (transacting == null || transacting == me) return;
+            long since = System.nanoTime();
+            boolean interrupted = false;
+            try {
+                while (transacting != null && transacting != me) {
+                    long last = lastFrame;
+                    long idle = System.nanoTime() - (last - since > 0 ? last : since);
+                    long left = strandedAfterMillis - idle / 1_000_000;
+                    if (left <= 0) {
+                        throw new SkaidbException("connection is busy in another thread's transaction: thread \""
+                            + transacting.getName() + "\" has a transaction open on it and has not used it for "
+                            + strandedAfterMillis / 1000.0 + " s while this statement waited. If that thread is "
+                            + "waiting for this one, neither can go on: run every statement of a transaction's body on "
+                            + "the body's own thread, and give other threads a connection of their own (a Pool)");
+                    }
+                    try {
+                        wait(left);
+                    } catch (InterruptedException e) {
+                        interrupted = true;   // as deaf to it as the wait for the monitor would be
+                    }
+                }
+            } finally {
+                if (interrupted) Thread.currentThread().interrupt();
             }
         }
 
@@ -1328,6 +1415,7 @@ public final class Skaidb {
                 readFully(buf);
                 return buf;
             } finally {
+                lastFrame = System.nanoTime();
                 inFlight.decrementAndGet();
                 if (interrupted) Thread.currentThread().interrupt();
             }
@@ -1494,6 +1582,7 @@ public final class Skaidb {
 
         /** {@link #run(String, boolean)} at an explicit consistency level. */
         synchronized Object run(String sql, boolean wantRows, int level) {
+            turn();
             // The COMMIT or ROLLBACK of a transaction the application
             // opened itself ends it — whatever answers it, and here and
             // now when its connection is already gone.
@@ -1555,6 +1644,7 @@ public final class Skaidb {
          */
         public synchronized RowStream stream(String sql, Object... params) {
             if (closed) throw new SkaidbException("connection is closed");
+            turn();
             requireIdle();
             boolean bound = params != null && params.length > 0;
             if (bound && params.length > 0xffff)
@@ -1689,6 +1779,7 @@ public final class Skaidb {
          * the monitor from here to the execute (see Query.exec).
          */
         synchronized long[] prepareServer(String sql) {
+            turn();
             requireIdle();
             // Before the cache is consulted: a reconnect empties it, so a
             // stale id from the dead socket can never be handed out.

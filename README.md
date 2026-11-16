@@ -783,6 +783,7 @@ for the rest, branch on the message if you must:
 | Parameter misuse | `parameter index ... out of range`, `statement expects N parameters`, `cannot bind ...` | usable |
 | A `NULL` read through a typed getter | `column x is NULL` | usable |
 | Another statement while streaming | `connection is busy streaming` | usable once the stream ends |
+| A statement that waited 30 s for another thread's `transaction(body)`, which did not use the connection meanwhile (its body may be waiting for this very thread) | `connection is busy in another thread's transaction` | usable; the statement was not sent |
 | The body of `transaction(body)` returned with a `RowStream` open | `connection is busy streaming` | usable, the stream closed and the transaction rolled back (broken if the stream could not be drained) |
 | A stream with parameters on a server older than 0.330 | `server does not support parameterised streaming (skaidb >= 0.330):` | usable |
 | Transport failure mid-statement | `query failed:`, `stream failed:`, `stream read failed:`, `prepare failed:`, then the reason — `the connection was closed by the server` when the server hung up | **broken**: re-dials on the next statement |
@@ -900,11 +901,18 @@ reference, including the type mapping and the metadata sources, is
   its monitor, one at a time. For parallelism use a `Pool`.
 - `setConsistency` on the connection is a shared field; prefer
   `Query.setConsistency` from shared connections.
-- `conn.transaction(body)` holds the connection's monitor from `BEGIN` to
-  `COMMIT` or `ROLLBACK`, so other threads' statements on a shared
-  connection wait for the transaction instead of running inside it. A
-  transaction written by hand has no such guard against other threads:
-  give it a connection of its own.
+- `conn.transaction(body)` has the connection to itself from `BEGIN` to
+  `COMMIT` or `ROLLBACK`: other threads' statements on a shared connection
+  wait for the transaction instead of running inside it. Run every
+  statement of the body on the body's own thread. A body that hands a
+  statement on its connection to another thread and waits for that thread
+  could never return — the thread waits for the transaction, the
+  transaction for the thread — so a statement that has waited 30 seconds
+  for a transaction whose thread did not use the connection in all that
+  time gives up with `connection is busy in another thread's transaction`,
+  which ends the body's wait too. A transaction that is at work is waited
+  for, however long it takes. A transaction written by hand has no such
+  guard against other threads: give it a connection of its own.
 - A `RowStream` is not thread-safe: one stream, one reader. It may be
   closed from another thread.
 - A thread that is interrupted while it waits for the server stops

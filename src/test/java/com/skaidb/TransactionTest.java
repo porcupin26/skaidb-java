@@ -878,10 +878,10 @@ class TransactionTest {
             }, "other-statement");
             c.transaction(conn -> {
                 other.start();
-                // The other thread is parked on the connection's monitor
-                // before the transaction sends anything more.
+                // The other thread is waiting for its turn on the
+                // connection before the transaction sends anything more.
                 long deadline = System.nanoTime() + 10_000_000_000L;
-                while (other.getState() != Thread.State.BLOCKED) {
+                while (other.getState() != Thread.State.TIMED_WAITING) {
                     assertTrue(other.isAlive() && System.nanoTime() < deadline, "the other statement did not wait");
                     Thread.onSpinWait();
                 }
@@ -893,6 +893,117 @@ class TransactionTest {
         assertNull(failure.get());
         assertNull(server.finish());
         assertEquals(List.of("BEGIN", UPDATE, "COMMIT", "SELECT 2"), sent(server));
+    }
+
+    @Test
+    void aBodyThatWaitsForAThreadUsingItsConnectionGetsAnErrorNotAHang() throws Exception {
+        // The body hands work to another thread and waits for it; that
+        // thread uses the body's connection — which it cannot have before
+        // the transaction ends, which cannot end before the body returns.
+        ConformanceServer server = server(
+            q("BEGIN", ok()), q(UPDATE, changed(1)), q("COMMIT", ok()),
+            q("SELECT 2", oneRow("x", 2L)));
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        try (Skaidb.Connection c = connect(server)) {
+            c.strandedAfterMillis = 300;
+            long changed = c.transaction(conn -> {
+                Thread helper = new Thread(() -> {
+                    try {
+                        conn.query("SELECT 2");
+                    } catch (Throwable t) {
+                        failure.set(t);
+                    }
+                }, "helper-of-the-body");
+                helper.start();
+                try {
+                    helper.join(5_000);
+                } catch (InterruptedException e) {
+                    throw new IllegalStateException(e);
+                }
+                assertFalse(helper.isAlive(), "the body and the thread it waits for wait for each other, for good");
+                return conn.execute(UPDATE);
+            });
+            // The transaction itself is none the worse for it.
+            assertEquals(1L, changed);
+            Skaidb.SkaidbException e = assertInstanceOf(Skaidb.SkaidbException.class, failure.get());
+            assertTrue(e.getMessage().startsWith("connection is busy in another thread's transaction"), e.getMessage());
+            assertTrue(e.getMessage().contains(Thread.currentThread().getName()), e.getMessage());
+            assertNull(e.getCause(), "nothing is wrong with the connection");
+            // Once the transaction is over the connection is anybody's again.
+            assertEquals(1, c.query("SELECT 2").getRowCount());
+            assertEquals(0, c.reconnects());
+        }
+        assertNull(server.finish());
+        assertEquals(List.of("BEGIN", UPDATE, "COMMIT", "SELECT 2"), sent(server), "the helper's statement was never sent");
+    }
+
+    @Test
+    void anotherThreadWaitsForAsLongAsTheTransactionKeepsUsingTheConnection() throws Exception {
+        // Five statements 150 ms apart: 600 ms in all, each gap well under the 400 ms a stranded statement gets.
+        List<ConformanceServer.Exchange> script = new ArrayList<>();
+        script.add(q("BEGIN", ok()));
+        for (int i = 0; i < 5; i++) script.add(q(UPDATE, changed(1)));
+        script.add(q("COMMIT", ok()));
+        script.add(q("SELECT 2", oneRow("x", 2L)));
+        ConformanceServer server = new ConformanceServer("ok", script);
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        try (Skaidb.Connection c = connect(server)) {
+            c.strandedAfterMillis = 400;
+            Thread other = new Thread(() -> {
+                try {
+                    c.query("SELECT 2");
+                } catch (Throwable t) {
+                    failure.set(t);
+                }
+            }, "other-statement");
+            c.transaction(conn -> {
+                other.start();
+                for (int i = 0; i < 5; i++) {
+                    conn.execute(UPDATE);
+                    try {
+                        Thread.sleep(150);
+                    } catch (InterruptedException e) {
+                        throw new IllegalStateException(e);
+                    }
+                }
+                return null;
+            });
+            other.join(10_000);
+            assertFalse(other.isAlive());
+        }
+        assertNull(failure.get(), "a transaction that is at work is waited for, however long it takes");
+        assertNull(server.finish());
+    }
+
+    @Test
+    void aSecondThreadsTransactionWaitsForTheFirst() throws Exception {
+        ConformanceServer server = server(
+            q("BEGIN", ok()), q(UPDATE, changed(1)), q("COMMIT", ok()),
+            q("BEGIN", ok()), q(DEBIT, changed(1)), q("COMMIT", ok()));
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        try (Skaidb.Connection c = connect(server)) {
+            Thread second = new Thread(() -> {
+                try {
+                    c.transaction(conn -> conn.execute(DEBIT));
+                } catch (Throwable t) {
+                    failure.set(t);
+                }
+            }, "second-transaction");
+            c.transaction(conn -> {
+                second.start();
+                long deadline = System.nanoTime() + 10_000_000_000L;
+                while (second.getState() != Thread.State.TIMED_WAITING) {
+                    assertTrue(second.isAlive() && System.nanoTime() < deadline, "the second transaction did not wait");
+                    Thread.onSpinWait();
+                }
+                return conn.execute(UPDATE);
+            });
+            second.join(10_000);
+            assertFalse(second.isAlive());
+        }
+        assertNull(failure.get());
+        assertNull(server.finish());
+        assertEquals(List.of("BEGIN", UPDATE, "COMMIT", "BEGIN", DEBIT, "COMMIT"), sent(server), "one after the other, never one in the other");
     }
 
     @Test

@@ -173,8 +173,12 @@ Semantics:
   swallows the failure throws `the connection was lost during the
   transaction` without being sent, and so does the helper instead of
   sending `COMMIT`. A failure under `COMMIT` is thrown as it is. The
-  connection's monitor is held throughout, so other threads' statements
-  wait. The body ends every `RowStream` it opens: one it leaves open is
+  connection is the calling thread's throughout, so other threads'
+  statements wait for the transaction to end — as long as it is at work:
+  one that has waited 30 s without the transaction's thread using the
+  connection throws `connection is busy in another thread's transaction`
+  and is not sent (a body waiting for that very thread would otherwise
+  never return). The body ends every `RowStream` it opens: one it leaves open is
   closed by the helper (drained, or the connection is marked broken, as
   `RowStream.close()` does) and the transaction is rolled back — the body's
   exception is thrown, or `connection is busy streaming` when the body
