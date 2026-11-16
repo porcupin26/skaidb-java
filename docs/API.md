@@ -153,12 +153,15 @@ Semantics:
   refused with a `TransactionConflictException` starts over from `begin`,
   with no pause, until the body has run `attempts` times; the last run's
   conflict is thrown. Any other `COMMIT` error is thrown, with no retry and
-  no `ROLLBACK`. A transport failure is never retried, and `COMMIT` and
-  `ROLLBACK` are only sent on the socket `begin` went out on: after a
-  failure in the body no `ROLLBACK` follows, and a body that swallows one
-  gets `the connection was lost during the transaction` instead of a
-  `COMMIT`. The connection's monitor is held throughout, so other threads'
-  statements wait. The body ends every `RowStream` it opens.
+  no `ROLLBACK`. A transport failure is never retried, and nothing
+  re-dials between the answer to `begin` and the end (`begin` itself
+  re-dials a broken connection as any statement does): after a failure in
+  the body no `ROLLBACK` follows, each later statement of a body that
+  swallows the failure throws `the connection was lost during the
+  transaction` without being sent, and so does the helper instead of
+  sending `COMMIT`. A failure under `COMMIT` is thrown as it is. The
+  connection's monitor is held throughout, so other threads' statements
+  wait. The body ends every `RowStream` it opens.
 - A read that exceeds `setReadTimeout` throws and marks the connection
   broken, like any transport error.
 - A transport error marks the connection broken and closes its socket at

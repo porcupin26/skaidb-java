@@ -549,10 +549,14 @@ and with an error (`no transaction in progress`) by an older one, which is
 why the clean-up above ignores what it returns.
 
 A re-dial after a transport failure starts a fresh session without the
-transaction — the server has discarded it. The helper never retries a
-transport failure and never sends `COMMIT` or `ROLLBACK` on a re-dialled
-socket (a body that swallows the failure gets `the connection was lost
-during the transaction` instead of a commit); by hand, compare
+transaction — the server has discarded it. Inside the helper nothing
+re-dials between `BEGIN` and the end: it never retries a transport
+failure, and once the connection is lost every further statement of the
+body is refused with `the connection was lost during the transaction`
+instead of being sent on a new session, where it would be committed on its
+own. A body that swallows the failure gets that error instead of a commit.
+A failure under the `COMMIT` itself is thrown as it is: whether the server
+applied the transaction is then unknown. By hand, compare
 `conn.reconnects()` before and after the transaction's statements. The JDBC
 layer does that check for you.
 
@@ -727,7 +731,7 @@ for the rest, branch on the message if you must:
 | TLS setup problem | `TLS setup failed:` | never opened |
 | The server rejected a statement | the server's own text, e.g. a syntax or constraint error | **usable** |
 | A `COMMIT` refused because another writer changed a row the transaction writes (`TransactionConflictException`) | `transaction conflict:` | **usable**, the transaction is over: run it again |
-| The connection was lost inside `transaction(body)` and the body carried on | `the connection was lost during the transaction` | broken, or already re-dialled |
+| The connection was lost inside `transaction(body)` and the body carried on: each further statement, then the helper itself | `the connection was lost during the transaction` | **broken**: re-dials on the next statement after the helper |
 | Parameter misuse | `parameter index ... out of range`, `statement expects N parameters`, `cannot bind ...` | usable |
 | A `NULL` read through a typed getter | `column x is NULL` | usable |
 | Another statement while streaming | `connection is busy streaming` | usable once the stream ends |

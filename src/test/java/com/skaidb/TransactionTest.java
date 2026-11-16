@@ -65,9 +65,14 @@ class TransactionTest {
     }
 
     /** The statements the fake server received, in order. */
-    static List<String> sent(ConformanceServer s) {
+    static List<String> sent(ConformanceServer s) { return statements(s.requests()); }
+
+    /** The statements the fake server received on connection {@code n} (the first is 0). */
+    static List<String> sent(ConformanceServer s, int n) { return statements(s.requests(n)); }
+
+    static List<String> statements(List<byte[]> requests) {
         List<String> out = new ArrayList<>();
-        for (byte[] request : s.requests()) {
+        for (byte[] request : requests) {
             Skaidb.Reader r = new Skaidb.Reader(request);
             int op = r.u8();
             if (op == 1) {
@@ -420,6 +425,148 @@ class TransactionTest {
         }
         assertNull(server.finish());
         assertEquals(List.of("BEGIN", UPDATE), sent(server));
+    }
+
+    // ---- the transaction never leaves its session (PROTOCOL.md §6 rule 7) -----------
+
+    static final String LOST = "the connection was lost during the transaction";
+    static final String DEBIT = "UPDATE accounts SET balance = balance - 25 WHERE id = 2";
+    static final String CREDIT = "INSERT INTO ledger (id, amount) VALUES (7, 25)";
+
+    /** The driver's transport error: the I/O failure is its cause. */
+    static void assertTransport(Skaidb.SkaidbException e) {
+        assertEquals(Skaidb.SkaidbException.class, e.getClass());
+        assertInstanceOf(IOException.class, e.getCause(), e.getMessage());
+    }
+
+    /** The loss of the transaction's connection, reported for a statement the driver did not send. */
+    static void assertLost(Skaidb.SkaidbException e) {
+        assertTransport(e);
+        assertTrue(e.getMessage().startsWith(LOST), e.getMessage());
+    }
+
+    @Test
+    void noStatementOfTheBodyRunsOnANewSessionAfterTheConnectionIsLost() throws Exception {
+        ConformanceServer server = ConformanceServer.sessions(List.of(
+            // The server goes away under the body's second statement ...
+            List.of(q("BEGIN", ok()), q(UPDATE, changed(1)), q(DEBIT).thenHangUp()),
+            // ... and is back for whoever dials next: a session with no transaction open.
+            List.of(q("SELECT 1", oneRow("x", 1L)))));
+        List<Skaidb.SkaidbException> raised = new ArrayList<>();
+        try (Skaidb.Connection c = connect(server)) {
+            Skaidb.SkaidbException reported = assertThrows(Skaidb.SkaidbException.class, () -> c.transaction(conn -> {
+                conn.execute(UPDATE);
+                try {
+                    conn.execute(DEBIT);
+                } catch (Skaidb.SkaidbException e) {
+                    raised.add(e);   // swallowed: the body carries on
+                }
+                try {
+                    conn.execute(CREDIT);   // on a new session this write would autocommit
+                } catch (Skaidb.SkaidbException e) {
+                    raised.add(e);
+                }
+                return "done";
+            }));
+            assertEquals(1, server.connections(), "a statement of the body re-dialled");
+            assertEquals(2, raised.size(), "the statement after the loss raises too");
+            assertTransport(raised.get(0));
+            assertLost(raised.get(1));
+            // The helper reports the loss; it sent neither COMMIT nor ROLLBACK anywhere.
+            assertLost(reported);
+            assertEquals(0, c.reconnects());
+
+            // The connection is as after any connection loss: its next statement re-dials.
+            assertFalse(c.isUsable());
+            assertEquals(1, c.query("SELECT 1").getRowCount());
+            assertEquals(1, c.reconnects());
+            assertTrue(c.isUsable());
+        }
+        assertNull(server.finish());
+        assertEquals(List.of("BEGIN", UPDATE, DEBIT), sent(server, 0));
+        assertEquals(List.of("SELECT 1"), sent(server, 1), "nothing of the transaction reached the new session");
+    }
+
+    @Test
+    void everyKindOfStatementIsRefusedOnceTheTransactionsConnectionIsLost() throws Exception {
+        ConformanceServer server = ConformanceServer.sessions(List.of(
+            List.of(q("BEGIN", ok()), q(UPDATE).thenHangUp()),
+            List.of(q("SELECT 1", oneRow("x", 1L)))));
+        try (Skaidb.Connection c = connect(server)) {
+            assertLost(assertThrows(Skaidb.SkaidbException.class, () -> c.transaction(conn -> {
+                assertTransport(assertThrows(Skaidb.SkaidbException.class, () -> conn.execute(UPDATE)));
+                assertLost(assertThrows(Skaidb.SkaidbException.class, () -> conn.execute(CREDIT)));
+                assertLost(assertThrows(Skaidb.SkaidbException.class, () -> conn.query("SELECT balance FROM accounts")));
+                assertLost(assertThrows(Skaidb.SkaidbException.class, () -> conn.executeRaw(CREDIT)));
+                assertLost(assertThrows(Skaidb.SkaidbException.class,
+                    () -> conn.prepare(PREPARED).setLong(1, 7L).setLong(2, 25L).executeUpdate()));
+                assertLost(assertThrows(Skaidb.SkaidbException.class,
+                    () -> conn.prepare(PREPARED).executeBatch(List.of(new Object[] { 7L, 25L }, new Object[] { 8L, 5L }))));
+                assertLost(assertThrows(Skaidb.SkaidbException.class, () -> conn.stream("SELECT id FROM ledger")));
+                assertLost(assertThrows(Skaidb.SkaidbException.class, () -> conn.stream("SELECT id FROM ledger WHERE id > ?", 1L)));
+                // A transaction opened inside the lost one is refused at its begin.
+                assertLost(assertThrows(Skaidb.SkaidbException.class, () -> conn.transaction(inner -> inner.execute(CREDIT))));
+                assertEquals(0, conn.reconnects());
+                return null;
+            })));
+            assertEquals(1, server.connections(), "a statement of the body re-dialled");
+            assertEquals(1, c.query("SELECT 1").getRowCount());
+        }
+        assertNull(server.finish());
+        assertEquals(List.of("BEGIN", UPDATE), sent(server, 0));
+        assertEquals(List.of("SELECT 1"), sent(server, 1));
+    }
+
+    @Test
+    void aPoolsTransactionStaysOnItsSessionToo() throws Exception {
+        ConformanceServer server = ConformanceServer.sessions(List.of(
+            List.of(q("BEGIN", ok()), q(UPDATE, changed(1)), q(DEBIT).thenHangUp()),
+            List.of(q("SELECT 1", oneRow("x", 1L)))));
+        List<Skaidb.Connection> used = new ArrayList<>();
+        try (Skaidb.Pool pool = new Skaidb.Pool(options(server))) {
+            assertLost(assertThrows(Skaidb.SkaidbException.class, () -> pool.transaction(conn -> {
+                used.add(conn);
+                conn.execute(UPDATE);
+                assertTransport(assertThrows(Skaidb.SkaidbException.class, () -> conn.execute(DEBIT)));
+                assertLost(assertThrows(Skaidb.SkaidbException.class, () -> conn.execute(CREDIT)));
+                return null;
+            })));
+            assertEquals(1, server.connections(), "a statement of the body re-dialled");
+            // The lost connection did not go back to the pool: the next checkout dials.
+            assertEquals(0, pool.members().get(0).idle);
+            assertEquals(1, (int) pool.withConnection(conn -> {
+                used.add(conn);
+                return conn.query("SELECT 1").getRowCount();
+            }));
+            assertFalse(used.get(0) == used.get(1));
+        }
+        assertNull(server.finish());
+        assertEquals(List.of("BEGIN", UPDATE, DEBIT), sent(server, 0));
+        assertEquals(List.of("SELECT 1"), sent(server, 1));
+    }
+
+    @Test
+    void aConnectionLostUnderTheCommitIsReportedAsThatFailure() throws Exception {
+        // The reply to COMMIT never arrives: the server may or may not have applied it.
+        ConformanceServer server = ConformanceServer.sessions(List.of(
+            List.of(q("BEGIN", ok()), q(UPDATE, changed(1)), q("COMMIT").thenHangUp()),
+            List.of(q("SELECT 1", oneRow("x", 1L)))));
+        AtomicInteger runs = new AtomicInteger();
+        try (Skaidb.Connection c = connect(server)) {
+            Skaidb.SkaidbException e = assertThrows(Skaidb.SkaidbException.class, () -> c.transaction(conn -> {
+                runs.incrementAndGet();
+                return conn.execute(UPDATE);
+            }, 3));
+            assertTransport(e);
+            assertTrue(e.getMessage().startsWith("query failed"), e.getMessage());
+            assertFalse(e.getMessage().contains("discarded"), "the outcome of a lost COMMIT is unknown: " + e.getMessage());
+            assertEquals(1, runs.get(), "not run again");
+            assertEquals(1, server.connections(), "no ROLLBACK, no second COMMIT on a new session");
+            assertEquals(1, c.query("SELECT 1").getRowCount());
+        }
+        assertNull(server.finish());
+        assertEquals(List.of("BEGIN", UPDATE, "COMMIT"), sent(server, 0));
+        assertEquals(List.of("SELECT 1"), sent(server, 1));
     }
 
     // ---- a broken connection closes its socket at once ------------------------------

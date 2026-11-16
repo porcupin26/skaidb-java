@@ -396,6 +396,15 @@ public final class Skaidb {
         private volatile boolean broken = false;
         /** A RowStream owns the wire until it ends; see requireIdle(). */
         private volatile boolean streaming = false;
+        /**
+         * True from the answer to {@link #transaction}'s begin to the answer
+         * to its COMMIT or ROLLBACK: the transaction lives on this socket
+         * alone, so meanwhile no statement re-dials (see ensureLive).
+         * Guarded by the monitor, which the helper holds throughout.
+         */
+        private boolean inTransaction = false;
+        /** The I/O failure that broke the connection, if one did; see lostInTransaction(). */
+        private volatile IOException lost;
         private final java.util.Map<String, long[]> prepared = new java.util.HashMap<>();
         // Retained so a reconnect can repeat the original connect exactly.
         private final ConnectOptions opts;
@@ -665,12 +674,18 @@ public final class Skaidb {
          *
          * <p>A transport failure is the usual {@link SkaidbException} and is
          * never retried here. The server discards a transaction with its
-         * socket and this connection re-dials on its next statement, so
-         * {@code COMMIT} and {@code ROLLBACK} are only ever sent on the
-         * socket {@code begin} went out on: after a failure in the body
-         * nothing is rolled back (there is nothing left to), and a body that
-         * swallows one gets {@code the connection was lost during the
-         * transaction} instead of a commit.
+         * socket, so the transaction never leaves the socket {@code begin}
+         * was answered on: {@code begin} re-dials a broken connection as
+         * any statement does, but from its answer to the end nothing does.
+         * After a failure in the body nothing is rolled back (there is
+         * nothing left to), and a body that swallows the failure finds
+         * every later statement refused with {@code the connection was lost
+         * during the transaction} — it is not sent on a new session, where
+         * it would be committed on its own — and gets that error instead of
+         * a commit. A failure under {@code COMMIT} itself is thrown as it
+         * is: the server may or may not have applied the transaction. Once
+         * the helper has returned, the connection re-dials on its next
+         * statement as after any transport failure.
          *
          * <p>The connection's monitor is held from {@code begin} to the end,
          * so statements other threads send on a shared connection wait for
@@ -684,28 +699,35 @@ public final class Skaidb {
         public synchronized <T> T transaction(TransactionBody<T> body, int attempts, String begin) {
             checkTransaction(body, attempts, begin);
             for (int attempt = 1; ; attempt++) {
-                // A refused BEGIN is thrown from here: going on would
-                // autocommit every statement of the body.
+                // Nothing is open yet, so begin re-dials a broken connection
+                // as any statement does. A refused BEGIN is thrown from
+                // here: going on would autocommit every statement of the body.
                 run(begin, true);
-                long session = reconnects;
-                T value;
+                boolean outer = inTransaction;
+                inTransaction = true;
                 try {
-                    value = body.run(this);
-                } catch (Throwable t) {
-                    rollbackQuietly(session);
-                    throw t;
-                }
-                if (broken || reconnects != session)
-                    throw new SkaidbException(
-                        "the connection was lost during the transaction; the server discarded it");
-                try {
-                    run("COMMIT", true);
-                    return value;
-                } catch (TransactionConflictException e) {
-                    // Nothing was committed and the transaction is over.
-                    // The other writer has finished, so the next run reads
-                    // the rows as they are now: no wait before it.
-                    if (attempt >= attempts) throw e;
+                    T value;
+                    try {
+                        value = body.run(this);
+                    } catch (Throwable t) {
+                        rollbackQuietly();
+                        throw t;
+                    }
+                    // The body swallowed a transport failure: no COMMIT
+                    // goes out, least of all on a session that never saw
+                    // the BEGIN.
+                    if (broken) throw lostInTransaction();
+                    try {
+                        run("COMMIT", true);
+                        return value;
+                    } catch (TransactionConflictException e) {
+                        // Nothing was committed and the transaction is over.
+                        // The other writer has finished, so the next run reads
+                        // the rows as they are now: no wait before it.
+                        if (attempt >= attempts) throw e;
+                    }
+                } finally {
+                    inTransaction = outer;
                 }
             }
         }
@@ -714,18 +736,27 @@ public final class Skaidb {
          * Roll back after the body failed, never replacing the body's error:
          * a server older than 0.347 answers a {@code ROLLBACK} with nothing
          * open with an error, and the round trip itself can fail. Not sent
-         * once the socket of the transaction ({@code session}: the re-dial
-         * count at its BEGIN) is gone — the server discarded the transaction
-         * with it, and the statement would re-dial to roll back nothing —
-         * nor while a stream owns the wire.
+         * once the socket of the transaction is gone — the server discarded
+         * the transaction with it — nor while a stream owns the wire.
          */
-        private void rollbackQuietly(long session) {
-            if (!isUsable() || reconnects != session) return;
+        private void rollbackQuietly() {
+            if (!isUsable()) return;
             try {
                 run("ROLLBACK", true);
             } catch (RuntimeException ignored) {
                 // clean-up only
             }
+        }
+
+        /**
+         * What a statement of {@link #transaction} gets — the helper's own
+         * COMMIT included — instead of being sent once the transaction's
+         * connection is gone: a transport error, its cause the I/O failure
+         * that broke the connection.
+         */
+        private SkaidbException lostInTransaction() {
+            return new SkaidbException(
+                "the connection was lost during the transaction; the server discarded it", lost);
         }
 
         /** One change captured by a stream. */
@@ -820,7 +851,7 @@ public final class Skaidb {
             try {
                 if (socket != null) socket.setSoTimeout(millis);
             } catch (IOException e) {
-                markBroken();
+                markBroken(e);
             }
         }
 
@@ -1058,7 +1089,7 @@ public final class Skaidb {
                 return new RowStream(this, cols, true, -1L);
             } catch (IOException e) {
                 // Half a request may be on the wire, or half a header off it.
-                markBroken();
+                markBroken(e);
                 observeFailure();
                 throw new SkaidbException("stream failed: " + e.getMessage(), e);
             }
@@ -1077,7 +1108,7 @@ public final class Skaidb {
             try {
                 return readFrame();
             } catch (IOException e) {
-                markBroken();   // socket gone; the next statement re-dials
+                markBroken(e);   // socket gone; the next statement re-dials
                 observeFailure();
                 throw new SkaidbException("stream read failed: " + e.getMessage(), e);
             }
@@ -1107,6 +1138,12 @@ public final class Skaidb {
             } catch (IOException ignored) {
                 // already gone
             }
+        }
+
+        /** {@link #markBroken()} for an I/O failure; the one that broke the connection is kept. */
+        private void markBroken(IOException failure) {
+            if (!broken) lost = failure;
+            markBroken();
         }
 
         /** Give the wire back; the connection accepts statements again. */
@@ -1146,7 +1183,7 @@ public final class Skaidb {
             } catch (IOException e) {
                 // As in roundtrip: the wire position is unknown, so the next
                 // statement re-dials instead of reusing this socket.
-                markBroken();
+                markBroken(e);
                 observeFailure();
                 throw new SkaidbException("prepare failed: " + e.getMessage(), e);
             }
@@ -1216,7 +1253,7 @@ public final class Skaidb {
                 // retried here — an ambiguous write must never be repeated
                 // silently. The connection is marked broken; the next
                 // statement re-dials through ensureLive.
-                markBroken();
+                markBroken(e);
                 observeFailure();
                 throw new SkaidbException("query failed: " + e.getMessage(), e);
             }
@@ -1256,7 +1293,8 @@ public final class Skaidb {
 
         /**
          * Re-dial if the transport died since the last statement, BEFORE
-         * anything is prepared on it.
+         * anything is prepared on it — unless the statement belongs to a
+         * {@link #transaction} whose connection that was: it is refused.
          *
          * The prepared-statement cache MUST be cleared: an id is only valid on
          * the connection that created it, so carrying one across a reconnect
@@ -1265,6 +1303,11 @@ public final class Skaidb {
         private synchronized void ensureLive() {
             if (closed) throw new SkaidbException("connection is closed");
             if (!broken) return;
+            // A transaction lives on the connection that began it (PROTOCOL.md
+            // §6 rule 7): a new session has none open, so a statement of the
+            // helper's body sent there would be committed on its own.
+            if (inTransaction) throw lostInTransaction();
+            lost = null;
             prepared.clear();
             try {
                 if (socket != null) socket.close();
