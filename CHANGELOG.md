@@ -4,6 +4,93 @@ All notable changes to the skaidb Java driver. The driver has its own
 version series, independent of the skaidb server; see the README's
 compatibility section for which server versions each release speaks to.
 
+## 1.5.1 (2026-11-16)
+
+A transaction stays on the connection it began on, a connection stays in
+the database it was in, a prepared statement stays the statement it was,
+and a broken connection lets go of its socket at once.
+
+- Fixed: inside `conn.transaction(body)`, a body that caught a transport
+  failure and carried on had its next statement sent on a re-dialled
+  connection, where no transaction is open — so that statement was
+  committed on its own, while the helper reported the loss. Nothing
+  re-dials any more between the answer to `BEGIN` and the end of the
+  helper: each further statement of the body throws `the connection was
+  lost during the transaction` without being sent, and so does the helper
+  instead of sending `COMMIT`; both carry the I/O failure as their cause.
+  `BEGIN` itself still re-dials a broken connection as any statement does,
+  a failure under `COMMIT` is still thrown as it is, and the connection
+  re-dials on its first statement after the helper. `pool.transaction` is
+  the same helper.
+- Fixed: a body that returned or threw with a `RowStream` still open left
+  the transaction open — neither `COMMIT` nor `ROLLBACK` can be sent behind
+  a stream — and once the stream was closed, later statements on that
+  connection ran inside the transaction and were lost with it. The helper
+  now closes such a stream and rolls the transaction back; if the rest of
+  the stream cannot be drained the connection is marked broken, and the
+  server drops the transaction with the socket. The body's exception is
+  thrown as before; a body that returned gets `connection is busy
+  streaming: the transaction's body returned with a RowStream open ...`.
+- Fixed: a connection marked broken — a transport failure, a read that
+  exceeded `setReadTimeout`, a stream that lost its place on the wire —
+  kept its dead socket open until the next statement re-dialled or
+  `close()` ran, so the server kept the session, and a transaction open on
+  it, until then. The socket is now closed the moment the connection is
+  marked broken.
+- Fixed (JDBC): with `setAutoCommit(false)`, a streamed `ResultSet` that
+  was still open made the driver take the connection for lost. Another
+  statement and `commit()` threw `SQLTransactionRollbackException`
+  (`40003`), `rollback()` returned without rolling back, and the
+  transaction stayed open on the server: statements run in autocommit
+  afterwards joined it and were never committed. A statement or `commit()`
+  behind an open streamed result set now fails with SQLState `HY010`, as
+  it does outside a transaction, and the transaction stays open;
+  `rollback()` closes the result set and rolls back.
+- Fixed: a database entered with a `USE` statement was lost when the
+  connection re-dialled after a transport failure: the new session was in
+  no database, and the next statements ran against the default database's
+  tables of the same names — refused there at best, read or written
+  silently otherwise. Only the database of the DSN (or `ConnectOptions`)
+  was entered again. The connection now notes a `USE` the server accepted
+  (`USE [DATABASE] name [;]`, the name bare or in double quotes; a `--`
+  comment after it, or on a line before it, is skipped as the server skips
+  it) and every re-dial enters the database the connection was last in
+  before anything else is sent; if the server refuses it there, the
+  statement fails with that error instead of running elsewhere. JDBC:
+  `setCatalog` and a `USE` sent through a statement survive a reconnect the
+  same way.
+- Fixed: a pool with a session database handed a connection on in whatever
+  database its last borrower's `USE` had left it. `release()` now closes
+  such a connection, so the next borrower gets one in the pool's database.
+  A pool without a session database keeps the connection, as before.
+- Fixed: a connection that ran more than 256 distinct parameterised
+  statements filled the server's table of prepared statements (256 for a
+  connection), and from then on the driver sent each further one as text
+  with its values written into it — silently, and typed differently: a
+  timestamp was stored as a number, bytes as a hex string, and an array or
+  document parameter failed (`cannot bind a collection into a statement
+  the server will not prepare`). The connection now keeps the 240
+  statements used most recently and closes the least recently used one on
+  the server (`OP_CLOSE`) to make room, so any number of distinct
+  statements run with typed parameters. A prepare the server refuses with
+  `too many prepared statements` all the same is thrown as a statement
+  error. JDBC: any number of `PreparedStatement`s can be created and
+  dropped, closed or not — the statement on the server belongs to the
+  connection, shared by its text.
+- Fixed: with threads sharing one connection, a statement with parameters
+  could be executed under a prepared-statement id of the connection's
+  previous socket, when another thread's statement re-dialled between the
+  first thread's prepare and its execute. On the new session that id is
+  unknown — or names another statement, which then ran with the first
+  one's values. The prepare and the execute now happen under one hold of
+  the connection.
+- Fixed: a connect whose login succeeded and whose session database was
+  then refused (the `USE` failed) left its socket open until the garbage
+  collector closed it. It is closed before the error is thrown.
+- `examples/Transactions.java`: the transaction helper end to end — a
+  commit, a conflict that is retried, a conflict that is thrown, a
+  rollback.
+
 ## 1.5.0 (2026-11-15)
 
 A retrying transaction helper and a typed error for a transaction conflict.

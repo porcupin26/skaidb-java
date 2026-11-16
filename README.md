@@ -52,7 +52,7 @@ The artifact is published through [JitPack](https://jitpack.io/#porcupin26/skaid
 which builds it from the git tag on first request. Coordinates:
 
 ```
-com.github.porcupin26:skaidb-java:v1.5.0
+com.github.porcupin26:skaidb-java:v1.5.1
 ```
 
 > **Note:** `v1.0.0` is not resolvable through JitPack — its first build
@@ -77,7 +77,7 @@ GPG-signed artifacts, which this project does not have yet).
   <dependency>
     <groupId>com.github.porcupin26</groupId>
     <artifactId>skaidb-java</artifactId>
-    <version>v1.5.0</version>
+    <version>v1.5.1</version>
   </dependency>
 </dependencies>
 ```
@@ -91,7 +91,7 @@ repositories {
 }
 
 dependencies {
-    implementation("com.github.porcupin26:skaidb-java:v1.5.0")
+    implementation("com.github.porcupin26:skaidb-java:v1.5.1")
 }
 ```
 
@@ -104,7 +104,7 @@ repositories {
 }
 
 dependencies {
-    implementation 'com.github.porcupin26:skaidb-java:v1.5.0'
+    implementation 'com.github.porcupin26:skaidb-java:v1.5.1'
 }
 ```
 
