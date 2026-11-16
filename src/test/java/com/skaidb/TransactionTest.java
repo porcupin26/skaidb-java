@@ -569,6 +569,113 @@ class TransactionTest {
         assertEquals(List.of("SELECT 1"), sent(server, 1));
     }
 
+    // ---- the opening statement re-dials like any other statement ----------------------
+
+    @Test
+    void beginReDialsABrokenConnectionAndTheTransactionRunsOnTheNewSession() throws Exception {
+        ConformanceServer server = ConformanceServer.sessions(List.of(
+            // The server goes away under an ordinary statement ...
+            List.of(q("SELECT 1").thenHangUp()),
+            // ... and the helper is the next thing the connection is asked for.
+            List.of(q("BEGIN", ok()), q(UPDATE, changed(1)), q("COMMIT", conflict()),
+                q("BEGIN", ok()), q(UPDATE, changed(1)), q("COMMIT", ok()))));
+        try (Skaidb.Connection c = connect(server)) {
+            assertTransport(assertThrows(Skaidb.SkaidbException.class, () -> c.query("SELECT 1")));
+            assertFalse(c.isUsable());
+            // Nothing is open yet, so BEGIN re-dials as any statement would.
+            assertEquals(1L, (long) c.transaction(conn -> conn.execute(UPDATE)));
+            assertEquals(1, c.reconnects(), "one re-dial, for the first BEGIN");
+            assertTrue(c.isUsable());
+        }
+        assertNull(server.finish());
+        assertEquals(List.of("SELECT 1"), sent(server, 0));
+        assertEquals(runs(2), sent(server, 1), "both runs of the transaction, whole, on the new session");
+    }
+
+    @Test
+    void afterAServerRestartBeginFailsAndRecoversAsAnOrdinaryStatementDoes() throws Exception {
+        // The server goes away while the connection sits idle. The driver
+        // learns of it from the next statement, which it does not send a
+        // second time (it may have run); the one after re-dials.
+        ConformanceServer plain = ConformanceServer.sessions(List.of(
+            List.of(q("SELECT 1", oneRow("x", 1L)).thenHangUp()),
+            List.of(q(UPDATE, changed(1)))));
+        try (Skaidb.Connection c = connect(plain)) {
+            c.query("SELECT 1");
+            assertTrue(plain.awaitEnded(1, SOON));
+            assertTrue(c.isUsable(), "nothing has told the driver yet");
+            Skaidb.SkaidbException e = assertThrows(Skaidb.SkaidbException.class, () -> c.execute(UPDATE));
+            assertTransport(e);
+            assertTrue(e.getMessage().startsWith("query failed"), e.getMessage());
+            assertEquals(1L, c.execute(UPDATE));
+            assertEquals(1, c.reconnects());
+        }
+        assertNull(plain.finish());
+
+        // The helper's BEGIN in that state is that statement, no more and no less.
+        ConformanceServer server = ConformanceServer.sessions(List.of(
+            List.of(q("SELECT 1", oneRow("x", 1L)).thenHangUp()),
+            List.of(q("BEGIN", ok()), q(UPDATE, changed(1)), q("COMMIT", ok()))));
+        AtomicInteger runs = new AtomicInteger();
+        Skaidb.TransactionBody<Long> body = conn -> {
+            runs.incrementAndGet();
+            return conn.execute(UPDATE);
+        };
+        try (Skaidb.Connection c = connect(server)) {
+            c.query("SELECT 1");
+            assertTrue(server.awaitEnded(1, SOON));
+            assertTrue(c.isUsable());
+            Skaidb.SkaidbException e = assertThrows(Skaidb.SkaidbException.class, () -> c.transaction(body));
+            assertTransport(e);
+            assertTrue(e.getMessage().startsWith("query failed"), e.getMessage());
+            assertEquals(0, runs.get(), "the body does not run after a failed BEGIN");
+            assertEquals(1, server.connections(), "and nothing follows it on a new session");
+            assertEquals(1L, (long) c.transaction(body));
+            assertEquals(1, runs.get());
+            assertEquals(1, c.reconnects());
+        }
+        assertNull(server.finish());
+        assertEquals(List.of("SELECT 1"), sent(server, 0));
+        assertEquals(runs(1), sent(server, 1));
+    }
+
+    @Test
+    void afterAServerRestartAPoolsTransactionFailsAndRecoversAsItsOrdinaryStatementDoes() throws Exception {
+        ConformanceServer plain = ConformanceServer.sessions(List.of(
+            List.of(q("SELECT 1", oneRow("x", 1L)).thenHangUp()),
+            List.of(q(UPDATE, changed(1)))));
+        try (Skaidb.Pool pool = new Skaidb.Pool(options(plain))) {
+            pool.withConnection(conn -> conn.query("SELECT 1"));
+            assertTrue(plain.awaitEnded(1, SOON));
+            // The idle connection looks usable, so it is the one checked out.
+            assertTransport(assertThrows(Skaidb.SkaidbException.class, () -> pool.withConnection(conn -> conn.execute(UPDATE))));
+            assertEquals(1L, (long) pool.withConnection(conn -> conn.execute(UPDATE)));
+        }
+        assertNull(plain.finish());
+
+        ConformanceServer server = ConformanceServer.sessions(List.of(
+            List.of(q("SELECT 1", oneRow("x", 1L)).thenHangUp()),
+            List.of(q("BEGIN", ok()), q(UPDATE, changed(1)), q("COMMIT", ok()))));
+        AtomicInteger runs = new AtomicInteger();
+        Skaidb.TransactionBody<Long> body = conn -> {
+            runs.incrementAndGet();
+            return conn.execute(UPDATE);
+        };
+        try (Skaidb.Pool pool = new Skaidb.Pool(options(server))) {
+            pool.withConnection(conn -> conn.query("SELECT 1"));
+            assertTrue(server.awaitEnded(1, SOON));
+            assertTransport(assertThrows(Skaidb.SkaidbException.class, () -> pool.transaction(body)));
+            assertEquals(0, runs.get());
+            assertEquals(1, server.connections());
+            // The dead connection was dropped at its return; the next transaction dials.
+            assertEquals(1L, (long) pool.transaction(body));
+            assertEquals(1, runs.get());
+        }
+        assertNull(server.finish());
+        assertEquals(List.of("SELECT 1"), sent(server, 0));
+        assertEquals(runs(1), sent(server, 1));
+    }
+
     // ---- a stream the body leaves open -----------------------------------------------
 
     static final String SELECT = "SELECT id FROM accounts";
