@@ -144,9 +144,11 @@ try (Skaidb.Connection conn = Skaidb.connect("skaidb://user:pass@localhost:7000/
 }
 ```
 
-Two runnable programs live in [`examples/`](examples/): `Example.java` is
+Three runnable programs live in [`examples/`](examples/): `Example.java` is
 this tour; `Advanced.java` covers typed parameters, batches, per-statement
-consistency, streaming, pooling, multi-result-set `CALL`s and change streams.
+consistency, streaming, pooling, multi-result-set `CALL`s and change
+streams; `Transactions.java` runs the transaction helper through a commit,
+a conflict that is retried, a conflict that is thrown and a rollback.
 
 ```sh
 javac -d out src/main/java/com/skaidb/Skaidb.java examples/Example.java
@@ -550,6 +552,10 @@ Two rules hold however the transaction is written:
 A `ROLLBACK` with nothing open is answered with success by a server ≥ 0.347
 and with an error (`no transaction in progress`) by an older one, which is
 why the clean-up above ignores what it returns.
+
+[`examples/Transactions.java`](examples/Transactions.java) runs the helper
+against a server: a commit, a conflict retried, a conflict thrown, a
+rollback.
 
 A re-dial after a transport failure starts a fresh session without the
 transaction — the server has discarded it. Inside the helper nothing
