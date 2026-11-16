@@ -4,6 +4,132 @@ All notable changes to the skaidb Java driver. The driver has its own
 version series, independent of the skaidb server; see the README's
 compatibility section for which server versions each release speaks to.
 
+## 1.5.2 (2026-11-16)
+
+A connection the server closed while it sat idle costs no statement, a
+re-dialled connection is the session the lost one was — settings
+included — a pool hands every borrower its own session, and a transaction
+written by hand stays on its connection as the helper's does.
+
+**Upgrade notes.**
+- On a pool without a database option a borrower's `USE` no longer carries
+  over to later borrowers: every borrower starts in `default`. Choose the
+  pool's database in its DSN (or `ConnectOptions`). The same goes for a
+  borrower's `SET CONSISTENCY` and `SET SCAN BUDGET`, and for a
+  transaction it left open, with or without a database option.
+- A thread that is interrupted while it waits for the server now stops
+  waiting: its statement throws a transport error and the connection is
+  closed (it re-dials on its next statement). The interrupt used to be
+  ignored until the server answered. A thread that merely arrives with its
+  interrupt status set runs its statements as before.
+- The first statement after the server restarted is no longer the one
+  that fails: code that retried it once "to get past the dead connection"
+  still works, and no longer has anything to retry.
+
+**Fixed**
+- A connection the server had closed while it sat idle — a restart, a
+  failover, an idle timeout — failed the next statement with a transport
+  error (`query failed: Broken pipe`, or over a network a failed read
+  after a write that still succeeded), once for every idle connection, and
+  a pool handed such a connection out as live. Before it writes a request
+  the driver now looks at the socket: one read that does not wait, no
+  round trip. Anything readable on an idle connection — the end of the
+  stream, a reset, stray bytes — means it is gone, and it is replaced
+  before anything was sent on it: the statement, a read or a write alike,
+  runs on the new connection. Under TLS the look reads the TCP connection
+  beneath the session; a connection that is streaming is not looked at;
+  inside a transaction a connection found gone is the transaction lost,
+  not a re-dial. `Pool.acquire` takes the same look and drops a dead idle
+  connection. JDBC: the same for statements, `isValid()` and metadata.
+- `SET CONSISTENCY ...` and `SET SCAN BUDGET ...` were lost when a
+  connection re-dialled: after a restart a scan the application's budget
+  had refused simply ran, and an application that had asked for `SET
+  CONSISTENCY ALL` read at each request's own level. The connection notes
+  the last statement of each kind the server accepted, as it notes a
+  `USE`, and sends them again on the new connection — after the session
+  database, the consistency override first — before the statement; `...
+  DEFAULT` clears the note. A setting the new connection refuses fails
+  the statement with that error: it never runs under other settings than
+  the ones the application set.
+- A pool handed a connection on in the session its last borrower left:
+  in the database of that borrower's `USE` (a pool without a database
+  option), under its `SET SCAN BUDGET`, at its `SET CONSISTENCY` level, or
+  inside a transaction it had left open. `Pool.release` now puts the
+  connection back into the pool's own session before it is kept —
+  `ROLLBACK`, `USE` of the pool's database (`default` when it has none),
+  `SET SCAN BUDGET DEFAULT`, `SET CONSISTENCY DEFAULT`, only the ones that
+  are needed — and closes a connection it cannot put back (a server older
+  than 0.349 refuses `SET CONSISTENCY DEFAULT`). A pool with a database
+  option used to close a connection a `USE` had moved; it now moves it
+  back. For a pool of your own: `Connection.session()` returns the noted
+  session (`Skaidb.Session`: database, consistency override, scan budget)
+  and `Connection.restore(session)` puts a connection back to it. JDBC: the
+  connection does that at the request boundaries of JDBC 4.3 —
+  `beginRequest()` takes the session as the request finds it,
+  `endRequest()` closes an open streamed result set, rolls an open
+  transaction back and puts the session back, or closes the connection
+  when it cannot. A pool has to mark those boundaries for it: HikariCP
+  does from version 6 on when the JVM runs with
+  `-Dcom.zaxxer.hikari.enableRequestBoundaries=true`; see docs/JDBC.md.
+- After a connection loss, a `USE` could not leave a database that had
+  been dropped meanwhile: the re-dial entered the old database first, was
+  refused, and `USE other` failed like every other statement — the
+  application could only reconnect by hand. A re-dial caused by a `USE`
+  statement itself (or JDBC's `setCatalog`) no longer enters the old
+  database first; the session's settings are sent, then the `USE`, whose
+  answer decides. Any other statement still fails rather than run in
+  another database.
+- A transaction written by hand — `BEGIN` sent as a statement — did not
+  stay on its connection: after a lost connection the driver re-dialled,
+  and the rest of the transaction, and its `COMMIT`, ran on a new session,
+  each statement committed on its own. The connection now notes a `BEGIN`
+  the server accepted (any statement whose first word is `BEGIN`) and the
+  `COMMIT [TRANSACTION]` or `ROLLBACK [TRANSACTION]` that ends it, and in
+  between nothing re-dials, exactly as inside `transaction(body)`: every
+  statement after the loss throws `the connection was lost during the
+  transaction` without being sent. The application ends the transaction
+  as it would have — `ROLLBACK` succeeds without being sent, `COMMIT`
+  throws that error (`... nothing was committed`) — and the next statement
+  re-dials. A `COMMIT` under which the connection is lost says that
+  whether the transaction was committed is unknown. JDBC: a `BEGIN` sent
+  through a `Statement` is held to the same rule (SQLState `40003`).
+- A body of `transaction(body)` that handed a statement on its connection
+  to another thread and waited for that thread never returned: the thread
+  waited for the transaction to end, the transaction for the thread. A
+  statement of another thread still waits for the transaction — as long
+  as the transaction is at work. One that has waited 30 seconds without
+  the transaction's thread using the connection throws `connection is
+  busy in another thread's transaction` and is not sent, which ends the
+  body's wait too.
+- A server that hung up was reported as `query failed: null` (`no
+  reachable endpoint in h:p: null` at the login). The error says `the
+  connection was closed by the server`; no transport error reads `null`
+  any more.
+- `close()` may be called from another thread at any moment of a
+  statement, under TLS too: it ends a statement that waits for the server
+  and neither throws nor waits for it.
+- `subscribe()` returns when its thread is interrupted while a poll waits
+  for the server, as it does for an interrupt between two polls.
+- JDBC: inside a transaction whose connection was lost, `DatabaseMetaData`
+  calls, `getCatalog()` and `setCatalog()` re-dialled — a new session
+  behind the transaction's back. They throw
+  `SQLTransactionRollbackException` (`40003`) like a statement.
+- JDBC: `isValid()` answered `false` for a healthy connection while a
+  streamed `ResultSet` was open on it. It answers `true`, without a round
+  trip.
+- JDBC: `getCatalog()` went on answering the URL's database after a `USE`
+  sent through a statement had entered another, and a `setCatalog()` back
+  to the URL's database sent nothing. Both follow the database the
+  connection is in (`Skaidb.Connection.database()`, new).
+- JDBC: a statement refused for the scan budget carried SQLState `HY000`
+  against a real server, whose message starts with `resource limit: scan
+  budget exceeded`. It is `SQLNonTransientException`, `54000`, as
+  documented.
+- JDBC: on a connection with a fetch size, `SET CONSISTENCY ...` through a
+  `Statement` was refused by the server (it takes that statement only
+  un-streamed). `stream(sql)` sends a `SET CONSISTENCY` as the ordinary
+  statement it is.
+
 ## 1.5.1 (2026-11-16)
 
 A transaction stays on the connection it began on, a connection stays in

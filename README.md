@@ -52,7 +52,7 @@ The artifact is published through [JitPack](https://jitpack.io/#porcupin26/skaid
 which builds it from the git tag on first request. Coordinates:
 
 ```
-com.github.porcupin26:skaidb-java:v1.5.1
+com.github.porcupin26:skaidb-java:v1.5.2
 ```
 
 > **Note:** `v1.0.0` is not resolvable through JitPack — its first build
@@ -77,7 +77,7 @@ GPG-signed artifacts, which this project does not have yet).
   <dependency>
     <groupId>com.github.porcupin26</groupId>
     <artifactId>skaidb-java</artifactId>
-    <version>v1.5.1</version>
+    <version>v1.5.2</version>
   </dependency>
 </dependencies>
 ```
@@ -91,7 +91,7 @@ repositories {
 }
 
 dependencies {
-    implementation("com.github.porcupin26:skaidb-java:v1.5.1")
+    implementation("com.github.porcupin26:skaidb-java:v1.5.2")
 }
 ```
 
@@ -104,7 +104,7 @@ repositories {
 }
 
 dependencies {
-    implementation 'com.github.porcupin26:skaidb-java:v1.5.1'
+    implementation 'com.github.porcupin26:skaidb-java:v1.5.2'
 }
 ```
 
@@ -985,6 +985,12 @@ ejection and re-admission, discovery, read-your-writes) against fake
 members that each serve many connections, `TransactionTest` scripts the
 fake server statement by statement for the typed conflict error and the
 `transaction` helper (retry, rollback, refused `BEGIN`),
+`SessionDatabaseTest`, `SessionSettingsTest`, `PoolSessionTest`,
+`IdleConnectionTest` and `HandWrittenTransactionTest` script several
+connections in turn — the fake server can hang up, half-close, reset and
+listen behind TLS — for what a lost connection must not cost: the session
+database and settings, a pool's own session, a statement after the server
+closed an idle connection, a transaction written by hand,
 `ConformanceTest` runs the shared conformance suite (below),
 `CertificateAuthTest` runs certificate login against a real TLS listener
 that requires a client certificate (a throwaway test CA lives in
