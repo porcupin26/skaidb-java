@@ -36,6 +36,10 @@ import java.util.concurrent.Executor;
  * needs {@code transaction=atomic}. DDL is not transactional. If the
  * connection breaks mid-transaction the server has discarded it: the next
  * statement or {@code commit()} throws {@link SQLTransactionRollbackException}.
+ * A streamed result set that is still open makes the connection busy, not
+ * lost: another statement or {@code commit()} throws SQLState {@code HY010}
+ * and the transaction stays open, and {@code rollback()} closes the result
+ * set and rolls back.
  * A {@code commit()} the server refuses because another writer changed a row
  * the transaction writes throws it too, with SQLState {@code 40001}: nothing
  * was committed, the transaction is over and the connection is usable, so
@@ -49,6 +53,8 @@ public final class SkaidbConnection implements Connection {
     private boolean autoCommit = true;
     private boolean txnOpen = false;
     private long txnReconnects = 0;
+    /** The streamed result set that last took the wire; see {@link #busy()}. */
+    private SkaidbResultSet streamed;
     private boolean readOnly = false;
     private String catalog;
     private int holdability = ResultSet.HOLD_CURSORS_OVER_COMMIT;
@@ -114,11 +120,25 @@ public final class SkaidbConnection implements Connection {
     }
 
     private void checkTransactionAlive() throws SQLException {
-        if (!conn.isUsable() || conn.reconnects() != txnReconnects) {
+        if (!(conn.isUsable() || busy()) || conn.reconnects() != txnReconnects) {
             txnOpen = false;
             throw new SQLTransactionRollbackException(
                 "the connection was lost during the transaction; the server discarded it", "40003");
         }
+    }
+
+    /** A statement's streamed result set took the wire. */
+    void streaming(SkaidbResultSet rs) { streamed = rs; }
+
+    /**
+     * True while a streamed result set owns the wire. The connection is
+     * then unusable for anything else but not lost: the transaction is
+     * still open on it, and a statement, COMMIT or ROLLBACK sent now is
+     * refused before it leaves ({@code connection is busy streaming}).
+     */
+    private boolean busy() {
+        if (streamed != null && !streamed.streaming()) streamed = null;
+        return streamed != null;
     }
 
     private void runControl(String sql) throws SQLException {
@@ -252,7 +272,10 @@ public final class SkaidbConnection implements Connection {
         if (autoCommit) throw new SQLException("commit() with autoCommit on", "25000");
         if (!txnOpen) return;
         checkTransactionAlive();
-        txnOpen = false;
+        // A COMMIT that is sent ends the transaction, whatever answers it.
+        // Behind an open streamed result set it is not sent (HY010), and
+        // the transaction stays open.
+        if (!busy()) txnOpen = false;
         runControl("COMMIT");
     }
 
@@ -261,6 +284,12 @@ public final class SkaidbConnection implements Connection {
         checkOpen();
         if (autoCommit) throw new SQLException("rollback() with autoCommit on", "25000");
         if (!txnOpen) return;
+        // A rollback ends what the transaction was reading too: closing a
+        // streamed result set gives the wire back for the ROLLBACK, or
+        // breaks the connection, and the server drops the transaction
+        // with the socket. Skipping the ROLLBACK instead would leave the
+        // transaction open for later statements to run in.
+        if (busy()) streamed.closeQuietly();
         txnOpen = false;
         if (!conn.isUsable() || conn.reconnects() != txnReconnects) return;   // already gone
         runControl("ROLLBACK");

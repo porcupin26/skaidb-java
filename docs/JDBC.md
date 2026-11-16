@@ -202,6 +202,12 @@ If the connection breaks inside a transaction the server has discarded it:
 the next statement, or `commit()`, throws `SQLTransactionRollbackException`
 (SQLState `40003`) instead of running outside the transaction.
 
+A streamed result set that is still open makes the connection busy, not
+lost. Another statement, or `commit()`, fails with SQLState `HY010` as it
+does outside a transaction, nothing is sent and the transaction stays
+open: read the result set to the end or close it, then go on.
+`rollback()` closes the result set itself and rolls the transaction back.
+
 A standalone server (0.346 or newer) refuses a `commit()` when another
 writer changed a row the transaction writes after the transaction began:
 `SQLTransactionRollbackException` with SQLState `40001`, the server's

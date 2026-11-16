@@ -714,6 +714,99 @@ class JdbcTest {
         }
     }
 
+    /** A stream of {@code SELECT id FROM t}: its header and first chunk, then {@code rest}. */
+    static ConformanceServer.Exchange streamOfT(byte[]... rest) {
+        List<byte[]> frames = new ArrayList<>(List.of(
+            ConformanceServer.rowsHeaderResponse("id"), ConformanceServer.rowsChunkResponse(new Object[] { 1L })));
+        frames.addAll(List.of(rest));
+        return new ConformanceServer.Exchange(
+            ConformanceServer.streamRequest("SELECT id FROM t", QUORUM), frames);
+    }
+
+    @Test
+    void aStreamedResultSetLeftOpenKeepsTheTransactionItIsIn() throws Exception {
+        String update = "UPDATE t SET n = n + 1 WHERE id = 1";
+        String insert = "INSERT INTO t (id) VALUES (2)";
+        byte[] chunk = ConformanceServer.rowsChunkResponse(new Object[] { 2L });
+
+        // commit(): refused while the result set owns the wire, sent once it is closed.
+        ConformanceServer committing = new ConformanceServer("ok", List.of(
+            query("BEGIN", ConformanceServer.ddlResponse()),
+            query(update, ConformanceServer.mutationResponse(1)),
+            streamOfT(chunk, ConformanceServer.rowsEndResponse()),
+            query("COMMIT", ConformanceServer.ddlResponse())));
+        try (Connection c = DriverManager.getConnection(url(committing, ""), creds())) {
+            c.setAutoCommit(false);
+            Statement st = c.createStatement();
+            assertEquals(1, st.executeUpdate(update));
+            Statement reader = c.createStatement();
+            reader.setFetchSize(100);
+            ResultSet rs = reader.executeQuery("SELECT id FROM t");
+            assertTrue(rs.next());
+            // The connection is busy, as it would be outside a transaction — not lost.
+            SQLException busy = assertThrows(SQLException.class, () -> st.executeUpdate(insert));
+            assertEquals("HY010", busy.getSQLState(), busy.toString());
+            busy = assertThrows(SQLException.class, c::commit);
+            assertEquals("HY010", busy.getSQLState(), busy.toString());
+            assertEquals(3, committing.requests().size(), "neither was sent");
+            // Nothing was sent, so the transaction is still open: close the result set, commit.
+            rs.close();
+            c.commit();
+            assertEquals(0, c.unwrap(Skaidb.Connection.class).reconnects());
+        }   // nothing is open: close() makes no round trip
+        finish(committing);
+        assertEquals(4, committing.requests().size());
+
+        // rollback(): ends the transaction and what it was reading.
+        ConformanceServer rollingBack = new ConformanceServer("ok", List.of(
+            query("BEGIN", ConformanceServer.ddlResponse()),
+            query(update, ConformanceServer.mutationResponse(1)),
+            streamOfT(chunk, ConformanceServer.rowsEndResponse()),
+            query("ROLLBACK", ConformanceServer.ddlResponse()),
+            query(insert, ConformanceServer.mutationResponse(1))));
+        try (Connection c = DriverManager.getConnection(url(rollingBack, ""), creds())) {
+            c.setAutoCommit(false);
+            Statement st = c.createStatement();
+            assertEquals(1, st.executeUpdate(update));
+            Statement reader = c.createStatement();
+            reader.setFetchSize(100);
+            ResultSet rs = reader.executeQuery("SELECT id FROM t");
+            assertTrue(rs.next());
+            c.rollback();
+            assertTrue(rs.isClosed());
+            assertEquals(4, rollingBack.requests().size(), "ROLLBACK reached the server");
+            // Nothing is open on the server: this statement is committed on its own.
+            c.setAutoCommit(true);
+            assertEquals(1, st.executeUpdate(insert));
+        }
+        finish(rollingBack);
+        assertEquals(5, rollingBack.requests().size());
+
+        // rollback() when the rest of the stream cannot be read off the wire:
+        // the socket is closed, and the server drops the transaction with it.
+        ConformanceServer stalled = ConformanceServer.sessions(List.of(
+            List.of(query("BEGIN", ConformanceServer.ddlResponse()),
+                query(update, ConformanceServer.mutationResponse(1)),
+                streamOfT()),
+            List.of(query(insert, ConformanceServer.mutationResponse(1)))));
+        try (Connection c = DriverManager.getConnection(url(stalled, "?read_timeout=200"), creds())) {
+            c.setAutoCommit(false);
+            Statement st = c.createStatement();
+            assertEquals(1, st.executeUpdate(update));
+            Statement reader = c.createStatement();
+            reader.setFetchSize(100);
+            assertTrue(reader.executeQuery("SELECT id FROM t").next());
+            c.rollback();
+            assertTrue(stalled.awaitEnded(1, 2_000), "the transaction stayed open on a live socket");
+            c.setAutoCommit(true);
+            assertEquals(1, st.executeUpdate(insert));
+            assertEquals(1, c.unwrap(Skaidb.Connection.class).reconnects());
+        }
+        finish(stalled);
+        assertEquals(3, stalled.requests(0).size());
+        assertEquals(1, stalled.requests(1).size());
+    }
+
     @Test
     void dataSourceForPools() throws Exception {
         ConformanceServer server = new ConformanceServer("ok", List.of(

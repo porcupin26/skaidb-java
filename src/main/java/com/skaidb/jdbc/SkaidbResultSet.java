@@ -77,6 +77,12 @@ public final class SkaidbResultSet implements ResultSet {
         if (closed) throw Errors.closed("result set");
     }
 
+    /**
+     * True while this result set's stream may still own the connection's
+     * wire: streamed, not read to its end (or to an error) and not closed.
+     */
+    boolean streaming() { return stream != null && !closed && !after; }
+
     // ---- navigation --------------------------------------------------------------
 
     @Override

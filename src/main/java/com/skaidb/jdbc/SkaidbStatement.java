@@ -108,6 +108,7 @@ public class SkaidbStatement implements Statement {
         }
         if (!s.isStreamed()) return acceptSets(s);
         current = new SkaidbResultSet(this, s, maxRows);
+        conn.streaming(current);
         return true;
     }
 
