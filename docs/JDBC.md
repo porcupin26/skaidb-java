@@ -20,7 +20,9 @@ jdbc:skaidb://host[:port][,host2[:port]...][/database][?key=value&...]
 ```
 
 The port defaults to 7000. The path is the session database (entered with
-`USE` after every connect and reconnect). Values are percent-decoded (`%40`
+`USE` after every connect and reconnect); `setCatalog`, or a `USE` sent
+through a statement, changes it, and a reconnect then enters the database
+the connection was last in. Values are percent-decoded (`%40`
 is `@`; a `+` stays a `+`). Keys given as `Properties` (including the
 `user`/`password` of `DriverManager.getConnection(url, user, password)`)
 override the URL's. An unknown key in the URL is an error; unknown

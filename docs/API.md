@@ -174,6 +174,12 @@ Semantics:
   loses its place on the wire. The next statement re-dials (seed failover,
   handshake, Hello, `USE`), clears the prepared cache, and only then runs.
   The failed statement is not retried.
+- The session database is the `database` option until a `USE` statement
+  the server accepts enters another (`USE [DATABASE] name [;]`, the name
+  bare or double-quoted; any other spelling is not noted). Every re-dial
+  enters the current one before the statement that caused it is sent; if
+  that `USE` is refused the statement throws its error, the connection
+  stays broken and the next statement dials again.
 - `subscribe` blocks until the handler returns `false` or the thread is
   interrupted. It polls `_stream_<name>` in pages of 500 with a 500 ms idle
   sleep.

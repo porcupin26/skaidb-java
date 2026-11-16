@@ -383,7 +383,11 @@ public final class SkaidbConnection implements Connection {
         return readOnly;
     }
 
-    /** Switches the session database ({@code USE}); it is re-entered after a reconnect only if it came from the URL. */
+    /**
+     * Switches the session database ({@code USE}). The connection enters
+     * it again after a reconnect, as it does the URL's database or one a
+     * {@code USE} statement entered: whichever came last.
+     */
     @Override
     public void setCatalog(String catalog) throws SQLException {
         checkOpen();

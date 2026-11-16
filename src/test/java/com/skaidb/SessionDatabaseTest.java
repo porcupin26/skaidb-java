@@ -1,0 +1,271 @@
+package com.skaidb;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import org.junit.jupiter.api.Test;
+
+/**
+ * The session database survives a re-dial: the database a connection is in
+ * — from its {@code database} option, or entered with a {@code USE}
+ * statement — is state of the server-side session, so the driver re-enters
+ * it on a new socket before it sends anything else. Against the scripted
+ * fake server over several connections: each test states every statement
+ * each session may receive.
+ */
+class SessionDatabaseTest {
+
+    static final int QUORUM = Skaidb.CONSISTENCY_QUORUM;
+    static final String COUNT = "SELECT count(*) FROM notes";
+    static final String INSERT = "INSERT INTO notes (id, body) VALUES (4, 'four')";
+    /** How the driver enters database {@code app} on a dial. */
+    static final String ENTER_APP = "USE \"app\"";
+
+    static Skaidb.ConnectOptions options(ConformanceServer s) {
+        return new Skaidb.ConnectOptions().host("127.0.0.1", s.port())
+            .user(ConformanceServer.username()).password(ConformanceServer.password());
+    }
+
+    static ConformanceServer.Exchange q(String sql, byte[]... responses) {
+        return new ConformanceServer.Exchange(ConformanceServer.queryRequest(sql, QUORUM), List.of(responses));
+    }
+
+    static byte[] ok() { return ConformanceServer.ddlResponse(); }
+    static byte[] changed(long n) { return ConformanceServer.mutationResponse(n); }
+    static byte[] error(String message) { return ConformanceServer.errorResponse(message); }
+    static byte[] counted(long n) { return ConformanceServer.rowsResponse(new String[] { "count" }, new Object[] { n }); }
+
+    /** An answered statement after which the server goes away, with the client idle. */
+    static ConformanceServer.Exchange thenTheServerGoesAway() { return q("SELECT 1", counted(1)).thenHangUp(); }
+
+    /** The statements connection {@code n} (the first is 0) received. */
+    static List<String> sent(ConformanceServer s, int n) { return TransactionTest.statements(s.requests(n)); }
+
+    static long count(Skaidb.Connection c) {
+        Skaidb.ResultSet rs = c.query(COUNT);
+        rs.next();
+        return rs.getLong(1);
+    }
+
+    /**
+     * Lose the connection while it sits idle: the server answers one last
+     * statement and goes away, and the next statement fails — it is not
+     * sent a second time. The one after that re-dials.
+     */
+    static void loseWhileIdle(Skaidb.Connection c, ConformanceServer server, int connectionsSoFar) throws Exception {
+        c.query("SELECT 1");
+        assertTrue(server.awaitEnded(connectionsSoFar, 2_000));
+        Skaidb.SkaidbException e = assertThrows(Skaidb.SkaidbException.class, () -> c.query(COUNT));
+        assertInstanceOf(IOException.class, e.getCause(), e.getMessage());
+        assertFalse(c.isUsable());
+    }
+
+    // ---- the database option -----------------------------------------------------
+
+    @Test
+    void theDatabaseOptionIsReEnteredOnTheNewConnection() throws Exception {
+        ConformanceServer server = ConformanceServer.sessions(List.of(
+            List.of(q(ENTER_APP, ok()), thenTheServerGoesAway()),
+            List.of(q(ENTER_APP, ok()), q(COUNT, counted(3)), q(INSERT, changed(1)))));
+        try (Skaidb.Connection c = Skaidb.connect(options(server).database("app"))) {
+            loseWhileIdle(c, server, 1);
+            assertEquals(3, count(c));
+            assertEquals(1, c.execute(INSERT));
+            assertEquals(1, c.reconnects());
+        }
+        assertNull(server.finish());
+        assertEquals(List.of(ENTER_APP, COUNT, INSERT), sent(server, 1), "the database first, then the statements");
+    }
+
+    // ---- a USE statement -----------------------------------------------------------
+
+    /** One way of sending a statement that takes no parameters. */
+    interface Send {
+        void run(Skaidb.Connection c, String sql);
+    }
+
+    @Test
+    void aDatabaseEnteredWithUseIsReEnteredOnTheNewConnection() throws Exception {
+        // Every way of sending a statement without parameters ...
+        Map<String, Send> paths = new LinkedHashMap<>();
+        paths.put("execute", (c, sql) -> c.execute(sql));
+        paths.put("query", (c, sql) -> c.query(sql));
+        paths.put("executeRaw", (c, sql) -> c.executeRaw(sql));
+        paths.put("prepare", (c, sql) -> c.prepare(sql).executeUpdate());
+        for (Map.Entry<String, Send> path : paths.entrySet()) reEnters(path.getKey(), path.getValue(), "USE app", ENTER_APP);
+        // ... and the statement as written, with how the driver enters that
+        // database again (whichStatementsEnterADatabase has every spelling).
+        Send execute = paths.get("execute");
+        reEnters("execute", execute, "  Use   Database\tapp  ;  ", ENTER_APP);
+        reEnters("execute", execute, "USE DATABASE \"we \"\"quote\"\" it\";", "USE \"we \"\"quote\"\" it\"");
+    }
+
+    /** {@code use} is sent, the connection is lost while idle, and the next statements find {@code enter} sent first. */
+    static void reEnters(String path, Send send, String use, String enter) throws Exception {
+        String what = path + "(" + use + ")";
+        ConformanceServer server = ConformanceServer.sessions(List.of(
+            List.of(q(use, ok()), thenTheServerGoesAway()),
+            List.of(q(enter, ok()), q(COUNT, counted(3)), q(INSERT, changed(1)))));
+        try (Skaidb.Connection c = Skaidb.connect(options(server))) {
+            send.run(c, use);
+            loseWhileIdle(c, server, 1);
+            assertEquals(3, count(c), what);
+            assertEquals(1, c.execute(INSERT), what);
+        }
+        assertNull(server.finish(), what);
+        assertEquals(List.of(enter, COUNT, INSERT), sent(server, 1), what + ": the database first, then the statements");
+    }
+
+    @Test
+    void aUseSentThroughAStreamIsNotedToo() throws Exception {
+        ConformanceServer server = ConformanceServer.sessions(List.of(
+            List.of(new ConformanceServer.Exchange(ConformanceServer.streamRequest("USE app", QUORUM), List.of(ok())),
+                thenTheServerGoesAway()),
+            List.of(q(ENTER_APP, ok()), q(COUNT, counted(3)))));
+        try (Skaidb.Connection c = Skaidb.connect(options(server))) {
+            try (Skaidb.RowStream rows = c.stream("USE app")) {
+                assertFalse(rows.next());
+            }
+            loseWhileIdle(c, server, 1);
+            assertEquals(3, count(c));
+        }
+        assertNull(server.finish());
+        assertEquals(List.of(ENTER_APP, COUNT), sent(server, 1));
+    }
+
+    @Test
+    void theLastDatabaseEnteredIsTheOneReEntered() throws Exception {
+        ConformanceServer server = ConformanceServer.sessions(List.of(
+            // the option's database, then two USE statements: the last one counts
+            List.of(q("USE \"reports\"", ok()), q("USE staging", ok()), q("USE app", ok()), thenTheServerGoesAway()),
+            // ... on every later dial as well
+            List.of(q(ENTER_APP, ok()), thenTheServerGoesAway()),
+            List.of(q(ENTER_APP, ok()), q(COUNT, counted(3)))));
+        try (Skaidb.Connection c = Skaidb.connect(options(server).database("reports"))) {
+            c.execute("USE staging");
+            c.execute("USE app");
+            loseWhileIdle(c, server, 1);
+            loseWhileIdle(c, server, 2);
+            assertEquals(3, count(c));
+            assertEquals(2, c.reconnects());
+        }
+        assertNull(server.finish());
+        assertEquals(List.of(ENTER_APP, "SELECT 1"), sent(server, 1));
+        assertEquals(List.of(ENTER_APP, COUNT), sent(server, 2));
+    }
+
+    @Test
+    void aStatementFailsWhenItsDatabaseCannotBeReEntered() throws Exception {
+        String gone = "database \"app\" does not exist";
+        ConformanceServer server = ConformanceServer.sessions(List.of(
+            List.of(q("USE app", ok()), thenTheServerGoesAway()),
+            // The new session refuses the database: nothing else may be sent on it.
+            List.of(q(ENTER_APP, error(gone))),
+            // The next statement dials again, and this time is let in.
+            List.of(q(ENTER_APP, ok()), q(COUNT, counted(3)))));
+        try (Skaidb.Connection c = Skaidb.connect(options(server))) {
+            c.execute("USE app");
+            loseWhileIdle(c, server, 1);
+            Skaidb.SkaidbException e = assertThrows(Skaidb.SkaidbException.class, () -> c.execute(INSERT));
+            assertEquals(gone, e.getMessage(), "the statement fails with what the USE was answered");
+            assertTrue(server.awaitEnded(2, 2_000), "that session is given up, socket and all");
+            assertEquals(List.of(ENTER_APP), sent(server, 1), "the statement ran in no other database");
+            assertFalse(c.isUsable());
+            assertEquals(3, count(c));
+        }
+        assertNull(server.finish());
+        assertEquals(List.of(ENTER_APP, COUNT), sent(server, 2));
+    }
+
+    @Test
+    void onlyAUseTheServerAcceptedAndTheDriverCanReadIsNoted() throws Exception {
+        ConformanceServer server = ConformanceServer.sessions(List.of(
+            List.of(q(ENTER_APP, ok()),
+                // refused: the session stays where it was
+                q("USE nowhere", error("database \"nowhere\" does not exist")),
+                // not exactly one USE statement as the driver reads it: left alone
+                q("USE other -- for the report", ok()),
+                thenTheServerGoesAway()),
+            List.of(q(ENTER_APP, ok()), q(COUNT, counted(3)))));
+        try (Skaidb.Connection c = Skaidb.connect(options(server).database("app"))) {
+            assertThrows(Skaidb.SkaidbException.class, () -> c.execute("USE nowhere"));
+            c.execute("USE other -- for the report");
+            loseWhileIdle(c, server, 1);
+            assertEquals(3, count(c));
+        }
+        assertNull(server.finish());
+        assertEquals(List.of(ENTER_APP, COUNT), sent(server, 1));
+    }
+
+    @Test
+    void whichStatementsEnterADatabase() {
+        Map<String, String> enters = new LinkedHashMap<>();
+        enters.put("USE app", "app");
+        enters.put("use app", "app");
+        enters.put("Use App_2", "App_2");
+        enters.put("USE _bi", "_bi");
+        enters.put("\n\tUSE  app  ;  ", "app");
+        enters.put("USE app;", "app");
+        enters.put("USE DATABASE app", "app");
+        enters.put("use database app ;", "app");
+        enters.put("USE \"app\"", "app");
+        enters.put("USE DATABASE \"my app\";", "my app");
+        enters.put("USE \"a\"\"b\"", "a\"b");
+        enters.put("USE \"database\"", "database");
+        // DATABASE with no name after it is the name.
+        enters.put("USE database", "database");
+        enters.put("USE DATABASE;", "DATABASE");
+        enters.put("USE DATABASE database", "database");
+        for (Map.Entry<String, String> e : enters.entrySet()) assertEquals(e.getValue(), Skaidb.usedDatabase(e.getKey()), e.getKey());
+
+        for (String other : new String[] {
+                "", "USE", "USE ", "USE;", "USEapp", "USER app", "REUSE app", "SELECT 'USE app'", "USE 'app'",
+                "USE app -- comment", "USE app /* c */", "/* c */ USE app", "-- c\nUSE app", "USE app; SELECT 1",
+                "USE app;;", "USE a-b", "USE app.notes", "USE app notes", "USE database app notes", "USE \"app",
+                "USE app\"", "USE \"app\"x", "USE \"a\"b\"", "USE \"\"", "USE DATABASE \"\"", "USE ?", "USE 9lives",
+                "INSERT INTO notes (id) VALUES (1)" }) {
+            assertNull(Skaidb.usedDatabase(other), other);
+        }
+    }
+
+    // ---- pools -----------------------------------------------------------------------
+
+    @Test
+    void aPooledConnectionReEntersItsDatabaseWhenItReDials() throws Exception {
+        ConformanceServer server = ConformanceServer.sessions(List.of(
+            List.of(q(ENTER_APP, ok()), thenTheServerGoesAway()),
+            List.of(q(ENTER_APP, ok()), q(COUNT, counted(3)), q(INSERT, changed(1)))));
+        List<Skaidb.Connection> used = new ArrayList<>();
+        try (Skaidb.Pool pool = new Skaidb.Pool(options(server).database("app"))) {
+            // Lost while it is checked out: the same connection re-dials.
+            pool.withConnection(c -> {
+                used.add(c);
+                try {
+                    loseWhileIdle(c, server, 1);
+                } catch (Exception e) {
+                    throw new IllegalStateException(e);
+                }
+                assertEquals(3, count(c));
+                return null;
+            });
+            // In the pool's database still, so it went back to the pool.
+            assertEquals(1, (long) pool.withConnection(c -> {
+                used.add(c);
+                return c.execute(INSERT);
+            }));
+            assertSame(used.get(0), used.get(1));
+        }
+        assertNull(server.finish());
+        assertEquals(List.of(ENTER_APP, COUNT, INSERT), sent(server, 1));
+    }
+}

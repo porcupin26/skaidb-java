@@ -144,7 +144,11 @@ public final class Skaidb {
         }
         public ConnectOptions user(String user) { this.user = user; return this; }
         public ConnectOptions password(String password) { this.password = password == null ? "" : password; return this; }
-        /** Session database, entered with {@code USE} after every connect and reconnect. */
+        /**
+         * Session database, entered with {@code USE} after every connect —
+         * and after a reconnect, unless a {@code USE} statement has entered
+         * another one since: then that one is.
+         */
         public ConnectOptions database(String database) { this.database = database == null ? "" : database; return this; }
         /** Default consistency: {@link #CONSISTENCY_ONE}, {@link #CONSISTENCY_QUORUM} or {@link #CONSISTENCY_ALL}. */
         public ConnectOptions consistency(int level) {
@@ -410,6 +414,13 @@ public final class Skaidb {
         private final java.util.Map<String, long[]> prepared = new java.util.HashMap<>();
         // Retained so a reconnect can repeat the original connect exactly.
         private final ConnectOptions opts;
+        /**
+         * The session database: the connect options' at first, then
+         * whichever a USE statement the server accepted has entered ("" =
+         * none chosen). It is state of the server-side session, so every
+         * dial enters it before anything else is sent (see dial).
+         */
+        private volatile String database;
         /** SO_TIMEOUT for every read, 0 = none; re-applied on each re-dial. */
         private volatile int readTimeoutMs = 0;
         /** How many times ensureLive re-dialled; see {@link #reconnects()}. */
@@ -443,6 +454,7 @@ public final class Skaidb {
             this.consistency = opts.consistency;
             this.pool = pool;
             this.readTimeoutMs = readTimeoutMs;
+            this.database = opts.database;
             dial(order);
         }
 
@@ -496,10 +508,16 @@ public final class Skaidb {
                 }
                 connectedEp = ep;
                 sendHello();
-                // USE is per-connection session state, so it runs on every dial.
-                if (opts.database != null && !opts.database.isEmpty()) {
+                // The session database is per-connection state, so every
+                // dial enters it: the options' on the first connect, on a
+                // re-dial the one the session was in — a USE statement may
+                // have changed it since. A statement must never run in
+                // another database than the one the application chose, so
+                // a refusal here fails the dial, and the statement with it.
+                String db = database;
+                if (!db.isEmpty()) {
                     try {
-                        execute("USE \"" + opts.database.replace("\"", "\"\"") + "\"");
+                        execute("USE \"" + db.replace("\"", "\"\"") + "\"");
                     } catch (RuntimeException e) {
                         // No connection comes of this dial, so nothing would
                         // close its socket later: the session the server
@@ -924,10 +942,13 @@ public final class Skaidb {
         }
 
         /**
-         * A statement succeeded: a pool with read-your-writes on remembers
-         * which member took a write.
+         * A statement succeeded: a USE has moved the session to another
+         * database, which a re-dial has to enter again, and a pool with
+         * read-your-writes on remembers which member took a write.
          */
         void noteStatement(String sql) {
+            String entered = usedDatabase(sql);
+            if (entered != null) database = entered;
             Pool owner = pool;
             if (owner != null && isWrite(sql)) owner.wrote(this);
         }
@@ -2222,6 +2243,70 @@ public final class Skaidb {
     // keeps the caller on its member a little longer).
     private static final java.util.Set<String> READ_KEYWORDS = new java.util.HashSet<>(java.util.Arrays.asList(
             "select", "show", "explain", "describe", "desc", "values", "with", "use"));
+
+    /**
+     * The database {@code sql} enters, when it is exactly one {@code USE}
+     * statement the driver can read: {@code USE [DATABASE] name [;]}, the
+     * keywords in any case, the name bare or in double quotes with a quote
+     * inside doubled. Null for everything else — a comment, a second
+     * statement, a name spelled another way — which the driver leaves alone.
+     */
+    static String usedDatabase(String sql) {
+        int n = sql.length();
+        int i = skipSpace(sql, 0);
+        if (!sql.regionMatches(true, i, "USE", 0, 3)) return null;
+        int at = skipSpace(sql, i + 3);
+        if (at == i + 3) return null;                      // USER, USEFUL, a bare USE
+        StringBuilder name = new StringBuilder();
+        int end = nameAt(sql, at, name);
+        if (end < 0) return null;
+        int next = skipSpace(sql, end);
+        // DATABASE is the optional keyword only with a name after it;
+        // alone it is the name, as the server reads it.
+        if (sql.charAt(at) != '"' && name.toString().equalsIgnoreCase("DATABASE")
+                && next > end && next < n && sql.charAt(next) != ';') {
+            end = nameAt(sql, next, name);
+            if (end < 0) return null;
+            next = skipSpace(sql, end);
+        }
+        if (next < n && sql.charAt(next) == ';') next = skipSpace(sql, next + 1);
+        return next == n && name.length() > 0 ? name.toString() : null;
+    }
+
+    private static int skipSpace(String sql, int i) {
+        while (i < sql.length() && Character.isWhitespace(sql.charAt(i))) i++;
+        return i;
+    }
+
+    /**
+     * Read the database name that starts at {@code i} into {@code name}:
+     * double-quoted, a quote inside doubled, or bare (letters, digits and
+     * underscores, not starting with a digit). The index just past it; -1
+     * when no name starts there.
+     */
+    private static int nameAt(String sql, int i, StringBuilder name) {
+        int n = sql.length();
+        name.setLength(0);
+        if (i < n && sql.charAt(i) == '"') {
+            for (i++; i < n; i++) {
+                char ch = sql.charAt(i);
+                if (ch != '"') {
+                    name.append(ch);
+                } else if (i + 1 < n && sql.charAt(i + 1) == '"') {
+                    name.append('"');
+                    i++;
+                } else {
+                    return i + 1;
+                }
+            }
+            return -1;                                     // no closing quote
+        }
+        int start = i;
+        while (i < n && (Character.isLetterOrDigit(sql.charAt(i)) || sql.charAt(i) == '_')) i++;
+        if (i == start || Character.isDigit(sql.charAt(start))) return -1;
+        name.append(sql, start, i);
+        return i;
+    }
 
     /**
      * Whether {@code sql} counts as a write: its first keyword, after

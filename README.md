@@ -167,7 +167,7 @@ skaidb://[user[:password]@]host[:port][,host2[:port2]...][/database][?option=val
 |------|---------|---------|
 | `user`, `password` | SCRAM-SHA-256 credentials. Omit both for an anonymous connection (only works when the server allows it). | `anonymous`, empty |
 | `host[:port]`, comma-separated | Seed list. The driver shuffles it and dials seeds in turn until one **connects and authenticates**; a node that accepts TCP while unhealthy, or closes the connection before the handshake because it is full, is skipped, while a login refused for its credentials stops at once. skaidb is leaderless, so any node serves every statement. | port `7000` |
-| `/database` | Session database: the driver runs `USE "database"` after every connect and reconnect. | none |
+| `/database` | Session database: the driver runs `USE "database"` after every connect and reconnect. A `USE` statement the server accepts changes it: after a reconnect the driver enters the database the connection was last in. | none |
 | `consistency=one\|quorum\|all` | Default consistency level for statements on this connection. | `quorum` |
 | `tls=true` | Encrypt with TLS, verifying the server certificate against the JVM's default trust store. | off |
 | `tls_ca=/path/to/ca.pem` | Encrypt with TLS, trusting only the CA certificate(s) in that PEM file. Implies `tls=true`. | — |
@@ -755,11 +755,19 @@ transaction left open on it, with the socket rather than when the
 connection is next used. The next statement re-dials through the seed
 list, re-authenticates, re-enters the session database and clears the
 prepared-statement cache — a recovered connection is indistinguishable
-from a fresh one. The failed
-statement itself is **not retried**: it may already have executed, and an
-ambiguous write must never be repeated silently. Retry at the call site
-where you know whether that is safe. `isUsable()` tells a pool (or you)
-whether a connection is closed, broken or mid-stream.
+from a fresh one. The failed statement itself is **not retried**: it may
+already have executed, and an ambiguous write must never be repeated
+silently. Retry at the call site where you know whether that is safe.
+`isUsable()` tells a pool (or you) whether a connection is closed, broken
+or mid-stream.
+
+The session database a re-dial enters is the one the connection was last
+in: the DSN's, or the one a later `USE` statement entered. The driver
+notes a `USE` the server accepted when it is written `USE [DATABASE] name`,
+the name bare or in double quotes, with nothing after it but an optional
+`;`. It enters that database on the new socket before it sends anything
+else, and if the server refuses it there the statement fails with that
+error instead of running in another database.
 
 ## JDBC
 

@@ -807,6 +807,70 @@ class JdbcTest {
         assertEquals(1, stalled.requests(1).size());
     }
 
+    /** One way of putting a JDBC connection into database {@code app}. */
+    static final class Entering {
+        final String urlRest;
+        /** What the driver sends for it, as the fake server's first exchange. */
+        final ConformanceServer.Exchange sent;
+        final TransactionStep how;
+        Entering(String urlRest, ConformanceServer.Exchange sent, TransactionStep how) {
+            this.urlRest = urlRest;
+            this.sent = sent;
+            this.how = how;
+        }
+    }
+
+    @Test
+    void theSessionDatabaseIsReEnteredAfterAReDial() throws Exception {
+        String count = "SELECT count(*) FROM notes";
+        String insert = "INSERT INTO notes (id) VALUES (4)";
+        ConformanceServer.Exchange entersApp = query("USE \"app\"", ConformanceServer.ddlResponse());
+        Map<String, Entering> ways = new java.util.LinkedHashMap<>();
+        ways.put("the URL's database", new Entering("/app", entersApp, (c, st) -> { }));
+        ways.put("setCatalog", new Entering("", entersApp, (c, st) -> c.setCatalog("app")));
+        ways.put("USE through a Statement",
+            new Entering("", query("USE app", ConformanceServer.ddlResponse()), (c, st) -> st.execute("USE app")));
+        ways.put("USE through a PreparedStatement",
+            new Entering("", query("use database app;", ConformanceServer.ddlResponse()),
+                (c, st) -> c.prepareStatement("use database app;").execute()));
+        ways.put("USE through a streamed Statement",
+            new Entering("?fetch_size=100", ex(ConformanceServer.streamRequest("USE app", QUORUM), ConformanceServer.ddlResponse()),
+                (c, st) -> st.execute("USE app")));
+        for (Map.Entry<String, Entering> way : ways.entrySet()) {
+            String name = way.getKey();
+            Entering entering = way.getValue();
+            boolean streams = entering.urlRest.contains("fetch_size");
+            ConformanceServer.Exchange one = streams
+                ? ex(ConformanceServer.streamRequest("SELECT 1", QUORUM), ConformanceServer.mutationResponse(0))
+                : query("SELECT 1", ConformanceServer.mutationResponse(0));
+            ConformanceServer server = ConformanceServer.sessions(List.of(
+                // In app; then the server goes away while the connection sits idle.
+                List.of(entering.sent, one.thenHangUp()),
+                // The new session: the database first, then the statements.
+                List.of(entersApp,
+                    streams ? ex(ConformanceServer.streamRequest(count, QUORUM), ConformanceServer.mutationResponse(3))
+                            : query(count, ConformanceServer.mutationResponse(3)),
+                    streams ? ex(ConformanceServer.streamRequest(insert, QUORUM), ConformanceServer.mutationResponse(1))
+                            : query(insert, ConformanceServer.mutationResponse(1)))));
+            try (Connection c = DriverManager.getConnection(url(server, entering.urlRest), creds());
+                 Statement st = c.createStatement()) {
+                entering.how.run(c, st);
+                st.execute("SELECT 1");
+                assertTrue(server.awaitEnded(1, 2_000), name);
+                // The statement that finds the connection gone is not sent twice ...
+                SQLException lost = assertThrows(SQLException.class, () -> st.execute(count), name);
+                assertEquals("08006", lost.getSQLState(), name + ": " + lost);
+                // ... and the next ones run in app, on the new session.
+                st.execute(count);
+                assertEquals(3, st.getUpdateCount(), name);
+                assertEquals(1, st.executeUpdate(insert), name);
+                assertEquals(1, c.unwrap(Skaidb.Connection.class).reconnects(), name);
+            }
+            assertNull(server.finish(), name);
+            assertEquals(3, server.requests(1).size(), name + ": USE, then the two statements");
+        }
+    }
+
     @Test
     void dataSourceForPools() throws Exception {
         ConformanceServer server = new ConformanceServer("ok", List.of(
