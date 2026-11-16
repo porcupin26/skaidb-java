@@ -121,9 +121,18 @@ changed nothing. What the pool's own connection-init statement set up is
 therefore kept. If the session cannot be put back (the connection is gone;
 a server older than 0.349 refuses `SET CONSISTENCY DEFAULT`) the driver
 closes the physical connection, and `isClosed()` / `isValid()` tell the
-pool to drop it. With a pool that does not mark request boundaries, name
-the database in the URL and change it with `setCatalog` (which pools
-restore themselves), and do not leave `SET` statements behind.
+pool to drop it.
+
+Not every pool marks request boundaries. HikariCP does from version 6 on,
+and only when the JVM is started with
+`-Dcom.zaxxer.hikari.enableRequestBoundaries=true`; without that property,
+and in older versions, it gives the driver no sign that a connection
+changes hands, and what one borrower set with SQL the next one finds. A
+pool resets by itself what was changed through the JDBC API —
+`setCatalog`, `setAutoCommit`, `setReadOnly` — so with such a pool name
+the database in the URL, change it with `setCatalog` rather than with a
+`USE` statement, and put a `SET CONSISTENCY` or `SET SCAN BUDGET` back
+(`... DEFAULT`) before the connection is closed.
 
 **Balancing across members.** A JDBC pool opens each physical connection
 through the driver, which dials the URL's hosts in shuffled order and keeps
