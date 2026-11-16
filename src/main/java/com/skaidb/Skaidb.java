@@ -344,6 +344,12 @@ public final class Skaidb {
     static final String TOO_MANY_PREPARED = "too many prepared statements";
 
     /**
+     * What a transport error says when the socket ended where the server's
+     * next frame was due: the server closed the connection.
+     */
+    static final String CLOSED_BY_SERVER = "the connection was closed by the server";
+
+    /**
      * The exception for a server {@code Error} response: the server's
      * message, unchanged, as a {@link TransactionConflictException} when it
      * is a transaction conflict.
@@ -985,10 +991,17 @@ public final class Skaidb {
         }
 
         private byte[] readFrame() throws IOException {
-            int len = in.readInt(); // big-endian
-            byte[] buf = new byte[len];
-            in.readFully(buf);
-            return buf;
+            try {
+                int len = in.readInt(); // big-endian
+                byte[] buf = new byte[len];
+                in.readFully(buf);
+                return buf;
+            } catch (java.io.EOFException e) {
+                // The socket ended where a frame was due: the server hung up.
+                // The JDK's exception for that carries no message at all, and
+                // the caller's error would read "query failed: null".
+                throw new java.io.EOFException(CLOSED_BY_SERVER);
+            }
         }
 
         // -- handshake --

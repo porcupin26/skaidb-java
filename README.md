@@ -759,7 +759,7 @@ for the rest, branch on the message if you must:
 | Another statement while streaming | `connection is busy streaming` | usable once the stream ends |
 | The body of `transaction(body)` returned with a `RowStream` open | `connection is busy streaming` | usable, the stream closed and the transaction rolled back (broken if the stream could not be drained) |
 | A stream with parameters on a server older than 0.330 | `server does not support parameterised streaming (skaidb >= 0.330):` | usable |
-| Transport failure mid-statement | `query failed:`, `stream read failed:`, `prepare failed:` | **broken**: re-dials on the next statement |
+| Transport failure mid-statement | `query failed:`, `stream failed:`, `stream read failed:`, `prepare failed:`, then the reason — `the connection was closed by the server` when the server hung up | **broken**: re-dials on the next statement |
 | Used after `close()` | `connection is closed` | closed |
 
 A statement error never damages the connection. A transport error marks it

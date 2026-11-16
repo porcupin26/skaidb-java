@@ -304,4 +304,60 @@ class NativeExtrasTest {
         assertTrue(server.awaitEnded(1, 2_000), "the socket of the failed connect stayed open");
         assertNull(server.finish());
     }
+
+    // ---- a server that hangs up --------------------------------------------------------
+
+    /** What the driver says when the socket ends where a frame was due. */
+    static final String CLOSED_BY_SERVER = Skaidb.CLOSED_BY_SERVER;
+
+    @Test
+    void aServerHangUpSaysTheConnectionWasClosedByTheServer() throws Exception {
+        String select = "SELECT id FROM t";
+        String prepared = "INSERT INTO t (id) VALUES (?)";
+        byte[] stream = ConformanceServer.streamRequest(select, Skaidb.CONSISTENCY_QUORUM);
+        // The server takes the request and closes the socket instead of answering it.
+        java.util.Map<String, ConformanceServer.Exchange> hangUps = new java.util.LinkedHashMap<>();
+        hangUps.put("query failed: ", TransactionTest.q(select).thenHangUp());
+        hangUps.put("prepare failed: ", TransactionTest.ex(ConformanceServer.prepareRequest(prepared)).thenHangUp());
+        hangUps.put("stream failed: ", TransactionTest.ex(stream).thenHangUp());
+        hangUps.put("stream read failed: ",
+            TransactionTest.ex(stream, ConformanceServer.rowsHeaderResponse("id")).thenHangUp());
+        for (java.util.Map.Entry<String, ConformanceServer.Exchange> hangUp : hangUps.entrySet()) {
+            String prefix = hangUp.getKey();
+            ConformanceServer server = new ConformanceServer("ok", List.of(hangUp.getValue()));
+            try (Skaidb.Connection c = connect(server)) {
+                Skaidb.SkaidbException e = assertThrows(Skaidb.SkaidbException.class, () -> {
+                    if (prefix.startsWith("query")) c.query(select);
+                    else if (prefix.startsWith("prepare")) c.prepare(prepared).setLong(1, 1L).executeUpdate();
+                    else if (prefix.startsWith("stream failed")) c.stream(select);
+                    else c.stream(select).next();
+                });
+                // Not "query failed: null": the end of the stream has no message of its own.
+                assertEquals(prefix + "the connection was closed by the server", e.getMessage());
+                assertInstanceOf(java.io.EOFException.class, e.getCause());
+                assertFalse(c.isUsable());
+            }
+            assertNull(server.finish(), prefix);
+        }
+    }
+
+    @Test
+    void aServerThatHangsUpAtTheLoginSaysSoToo() throws Exception {
+        // Accepts, reads AuthStart and closes: what a member that is full does (PROTOCOL.md §6).
+        try (ServerSocket ss = new ServerSocket(0, 1, InetAddress.getLoopbackAddress())) {
+            Thread t = new Thread(() -> {
+                try (Socket s = ss.accept()) {
+                    DataInputStream in = new DataInputStream(s.getInputStream());
+                    in.readFully(new byte[in.readInt()]);
+                } catch (Exception ignored) {
+                    // the test fails on what the driver reports
+                }
+            });
+            t.start();
+            Skaidb.ConnectOptions o = new Skaidb.ConnectOptions().host("127.0.0.1", ss.getLocalPort()).user("u").password("p");
+            Skaidb.SkaidbException e = assertThrows(Skaidb.SkaidbException.class, () -> Skaidb.connect(o));
+            assertEquals("no reachable endpoint in 127.0.0.1:" + ss.getLocalPort() + ": " + CLOSED_BY_SERVER, e.getMessage());
+            t.join(10_000);
+        }
+    }
 }
