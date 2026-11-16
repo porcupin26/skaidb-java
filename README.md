@@ -309,16 +309,25 @@ is `AutoCloseable` for symmetry with JDBC but holds no resources.
 With parameters present the driver prepares the statement **on the server**
 and sends the values as typed binary values — the only way to bind an
 array, a document, a `UUID` or a `BigDecimal` losslessly. The server-side
-prepared id is cached per connection (up to 240 distinct statements) and the
-cache is cleared on reconnect, so a stale id can never execute the wrong
-statement.
+prepared id is cached per connection, by the statement's text: the 240
+statements used most recently. A server keeps at most 256 prepared
+statements for a connection, so when another one needs room the driver lets
+the least recently used go and frees its slot on the server (`OP_CLOSE`);
+used again later, that statement is simply prepared again. Any number of
+distinct statements can therefore run on one connection, each with typed
+parameters. The cache is cleared on reconnect, so a stale id can never
+execute the wrong statement. A `Query` holds no server-side statement of
+its own — `close()` on it does nothing.
 
 Statement kinds the server refuses to prepare — DDL and session statements
 such as `USE` — fall back to **client-side text binding**: the values are
 SQL-quoted and interpolated (`'` doubled, `NULL`/`TRUE`/`FALSE`, numbers as
 literals, bytes as hex, timestamps as epoch milliseconds). On that path a
 collection, map or Java array is refused with an exception rather than
-silently stringified, because skaidb has no literal form for them.
+silently stringified, because skaidb has no literal form for them. A
+prepare refused because the connection's table on the server is full (`too
+many prepared statements`) is not such a statement kind: it is thrown as
+the statement error it is, never answered with literals.
 
 ## Result sets
 

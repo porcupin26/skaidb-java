@@ -338,6 +338,12 @@ public final class Skaidb {
     static final String CONFLICT_PREFIX = "transaction conflict:";
 
     /**
+     * What the refusal of a prepare starts with when the connection's
+     * prepared-statement table on the server is full (PROTOCOL.md §3.3).
+     */
+    static final String TOO_MANY_PREPARED = "too many prepared statements";
+
+    /**
      * The exception for a server {@code Error} response: the server's
      * message, unchanged, as a {@link TransactionConflictException} when it
      * is a transaction conflict.
@@ -411,7 +417,17 @@ public final class Skaidb {
         private boolean inTransaction = false;
         /** The I/O failure that broke the connection, if one did; see lostInTransaction(). */
         private volatile IOException lost;
-        private final java.util.Map<String, long[]> prepared = new java.util.HashMap<>();
+        /**
+         * The statements prepared on this socket's session, by their text,
+         * least recently used first. A server holds at most 256 for a
+         * connection and refuses a prepare beyond that, so the driver keeps
+         * fewer and gives back the slot of each one it lets go (see
+         * prepareServer). An id means nothing on another socket: emptied
+         * on every re-dial (see ensureLive).
+         */
+        private final java.util.LinkedHashMap<String, long[]> prepared = new java.util.LinkedHashMap<>(16, 0.75f, true);
+        /** How many prepared statements a connection keeps: below the server's 256. */
+        static final int PREPARED_MAX = 240;
         // Retained so a reconnect can repeat the original connect exactly.
         private final ConnectOptions opts;
         /**
@@ -1225,9 +1241,9 @@ public final class Skaidb {
          * Prepare `sql` on the SERVER and return {statementId, paramCount}.
          * Cached per connection, because a prepared id is only meaningful on
          * the connection that created it. The id is good until this
-         * connection's monitor is released — a re-dial forgets them all — so
-         * a caller holds the monitor from here to the execute (see
-         * Query.exec).
+         * connection's monitor is released: the next prepare may let the
+         * statement go, and a re-dial forgets them all — so a caller holds
+         * the monitor from here to the execute (see Query.exec).
          */
         synchronized long[] prepareServer(String sql) {
             requireIdle();
@@ -1241,6 +1257,17 @@ public final class Skaidb {
             req.u8(2).u32(body.length).raw(body);
             if (closed) throw new SkaidbException("connection is closed");
             try {
+                // Room first: the least recently used statement leaves the
+                // cache and OP_CLOSE gives its slot on the server back, so
+                // the server's table never fills. (What a server that does
+                // not know OP_CLOSE answers changes nothing here.)
+                if (prepared.size() >= PREPARED_MAX) {
+                    java.util.Iterator<long[]> eldest = prepared.values().iterator();
+                    long id = eldest.next()[0];
+                    eldest.remove();
+                    writeFrame(new Buf().u8(4).u32((int) id).toBytes());
+                    readFrame();
+                }
                 long started = System.nanoTime();
                 writeFrame(req.toBytes());
                 Reader r = new Reader(readFrame());
@@ -1250,10 +1277,19 @@ public final class Skaidb {
                     long id = r.u32() & 0xffffffffL;
                     int nparams = r.u16();
                     long[] v = new long[] { id, nparams };
-                    if (prepared.size() < 240) prepared.put(sql, v);
+                    prepared.put(sql, v);
                     return v;
                 }
-                if (tag == 3) throw new Unpreparable(r.text());
+                if (tag == 3) {
+                    String refusal = r.text();
+                    // The server's table is full all the same: a statement
+                    // error. The text fallback is for a statement KIND the
+                    // server does not prepare; taken here it would send the
+                    // values as literals, which types them differently — a
+                    // timestamp as a number, bytes as a string.
+                    if (refusal.startsWith(TOO_MANY_PREPARED)) throw serverError(refusal);
+                    throw new Unpreparable(refusal);
+                }
                 throw new SkaidbException("unexpected prepare response tag " + tag);
             } catch (IOException e) {
                 // As in roundtrip: the wire position is unknown, so the next
@@ -1671,11 +1707,10 @@ public final class Skaidb {
             if (params.length == 0) return conn.run(sql, true, level());
             try {
                 // One hold of the connection for the prepare and the
-                // execute. The id is the server's only on the socket that
-                // issued it: let go in between, another thread's statement
-                // can find the connection gone and re-dial, and this id
-                // would then be executed on a session where it is unknown
-                // — or names whatever was prepared there first.
+                // execute: the id is the server's only on the socket that
+                // issued it and only while the statement keeps its place in
+                // the connection's cache, and under the monitor neither a
+                // re-dial nor another thread's prepare can come in between.
                 synchronized (conn) {
                     long[] p = conn.prepareServer(sql);
                     if (p[1] != params.length)

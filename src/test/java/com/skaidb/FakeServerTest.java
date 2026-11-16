@@ -37,7 +37,19 @@ class FakeServerTest {
         final List<Object[]> params = new CopyOnWriteArrayList<>();
         volatile int connections = 0;
         final List<Socket> sockets = new CopyOnWriteArrayList<>();
+        /** The text of each statement an OP_EXECUTE ran, in order. */
+        final List<String> executed = new CopyOnWriteArrayList<>();
+        /** The ids OP_CLOSE freed, in order. */
+        final List<Integer> closed = new CopyOnWriteArrayList<>();
+        /** Prepares refused because the connection's table was full. */
+        volatile int refusedPrepares = 0;
+        /** The most prepared statements a connection held at once. */
+        volatile int mostPrepared = 0;
     }
+
+    /** What a server keeps per connection (PROTOCOL.md §3.3). */
+    static final int MAX_PREPARED = 256;
+    static final String TABLE_FULL = "too many prepared statements (max 256); close some first";
 
     private ServerSocket server;
     private Thread acceptor;
@@ -57,6 +69,7 @@ class FakeServerTest {
             try {
                 while (!server.isClosed()) {
                     Socket s = server.accept();
+                    s.setTcpNoDelay(true);   // a frame is two writes: do not wait for an ACK between them
                     seen.connections++;
                     seen.sockets.add(s);
                     Thread t = new Thread(() -> serve(s));
@@ -149,6 +162,7 @@ class FakeServerTest {
 
             int nextStmt = 100;
             java.util.Map<Integer, Integer> stmtParams = new java.util.HashMap<>();
+            java.util.Map<Integer, String> stmtSql = new java.util.HashMap<>();
             while (true) {
                 byte[] frame;
                 try { frame = readFrame(in); } catch (IOException eof) { return; }
@@ -175,8 +189,15 @@ class FakeServerTest {
                             writeFrame(out, new Skaidb.Buf().u8(3).str("cannot prepare DDL").toBytes());
                             break;
                         }
+                        if (stmtParams.size() >= MAX_PREPARED) {
+                            seen.refusedPrepares++;
+                            writeFrame(out, new Skaidb.Buf().u8(3).str(TABLE_FULL).toBytes());
+                            break;
+                        }
                         int id = nextStmt++;
                         stmtParams.put(id, Skaidb.countPlaceholders(sql));
+                        stmtSql.put(id, sql);
+                        seen.mostPrepared = Math.max(seen.mostPrepared, stmtParams.size());
                         seen.sql.add("PREPARE " + sql);
                         writeFrame(out, new Skaidb.Buf().u8(4).u32(id).u16(stmtParams.get(id)).toBytes());
                         break;
@@ -187,9 +208,26 @@ class FakeServerTest {
                         int n = r.u16();
                         Object[] p = new Object[n];
                         for (int i = 0; i < n; i++) p[i] = Skaidb.decodeValue(new Skaidb.Reader(r.blob()));
+                        if (!stmtSql.containsKey(id)) {
+                            writeFrame(out, new Skaidb.Buf().u8(3).str("unknown prepared statement id " + id).toBytes());
+                            break;
+                        }
                         seen.levels.add(level);
                         seen.params.add(p);
-                        writeFrame(out, answer("EXEC " + id, p));
+                        seen.executed.add(stmtSql.get(id));
+                        writeFrame(out, stmtSql.get(id).startsWith("INSERT")
+                            ? new Skaidb.Buf().u8(1).i64(1).toBytes() : answer("EXEC " + id, p));
+                        break;
+                    }
+                    case 4: { // Close: the statement's slot is free again
+                        int id = r.u32();
+                        if (stmtParams.remove(id) == null) {
+                            writeFrame(out, new Skaidb.Buf().u8(3).str("unknown prepared statement id " + id).toBytes());
+                            break;
+                        }
+                        stmtSql.remove(id);
+                        seen.closed.add(id);
+                        writeFrame(out, new Skaidb.Buf().u8(2).toBytes());
                         break;
                     }
                     case 7: { // Batch
@@ -354,6 +392,114 @@ class FakeServerTest {
             assertThrows(Skaidb.SkaidbException.class,
                 () -> conn.prepare("INSERT INTO t (a, b) VALUES (?, ?)").executeBatch(List.<Object[]>of(new Object[] { 1 })));
         }
+    }
+
+    // ---- the server's prepared-statement table (256 a connection) ---------------------
+
+    static String insertInto(int n) { return "INSERT INTO t (id, a" + n + ", tags, at, raw) VALUES (?, ?, ?, ?, ?)"; }
+
+    @Test
+    void threeHundredDistinctStatementsEachBindTypedParameters() {
+        java.time.Instant at = java.time.Instant.parse("2026-11-16T10:20:30.123Z");
+        byte[] raw = { (byte) 0xde, (byte) 0xad };
+        List<String> tags = java.util.Arrays.asList("x", "y");
+        try (Skaidb.Connection conn = Skaidb.connect(dsn())) {
+            for (int n = 0; n < 300; n++) {
+                // An array has no literal form, and a timestamp or bytes sent
+                // as a literal is stored as a number or a string.
+                assertEquals(1L, conn.prepare(insertInto(n)).setLong(1, n).setString(2, "n" + n)
+                    .setObject(3, tags).setObject(4, at).setObject(5, raw).executeUpdate(), "statement " + (n + 1));
+            }
+            assertEquals(1, seen.connections);
+        }
+        assertEquals(0, seen.refusedPrepares, "the server's table never filled");
+        // Each one ran prepared, its values typed ...
+        assertEquals(300, seen.executed.size());
+        for (int n = 0; n < 300; n++) {
+            assertEquals(insertInto(n), seen.executed.get(n));
+            Object[] p = seen.params.get(n);
+            assertEquals((long) n, p[0]);
+            assertEquals(tags, p[2]);
+            assertEquals(at, p[3]);
+            assertTrue(java.util.Arrays.equals(raw, (byte[]) p[4]));
+        }
+        // ... and none as text with its values written into it.
+        assertEquals(List.of(), seen.sql.stream().filter(s -> s.startsWith("INSERT")).collect(java.util.stream.Collectors.toList()));
+        // The driver keeps fewer statements than the server allows, and
+        // gives back the slot of each one it lets go: the oldest first.
+        assertTrue(seen.mostPrepared < MAX_PREPARED, "prepared at once: " + seen.mostPrepared);
+        assertEquals(300 - seen.mostPrepared, seen.closed.size());
+        for (int i = 0; i < seen.closed.size(); i++) assertEquals(100 + i, seen.closed.get(i));
+    }
+
+    @Test
+    void aStatementInUseKeepsItsSlotAndIsNotPreparedAgain() {
+        String hot = "SELECT id, name FROM t WHERE id = ?";
+        try (Skaidb.Connection conn = Skaidb.connect(dsn())) {
+            Skaidb.Query q = conn.prepare(hot);
+            for (int n = 0; n < 300; n++) {
+                // Used between every two others: never the least recently used.
+                assertTrue(q.setLong(1, n).executeQuery().next());
+                assertEquals(1L, conn.prepare("INSERT INTO t (id, a" + n + ") VALUES (?, ?)")
+                    .setLong(1, n).setString(2, "n").executeUpdate());
+            }
+        }
+        assertEquals(1, seen.sql.stream().filter(s -> s.equals("PREPARE " + hot)).count(), "prepared once");
+        assertFalse(seen.closed.contains(100), "the statement in use was never closed");
+        assertEquals(0, seen.refusedPrepares);
+        assertEquals(600, seen.executed.size());
+    }
+
+    @Test
+    void aPrepareRefusedBecauseTheTableIsFullIsAStatementError() throws Exception {
+        // A server that does not give slots back: each OP_CLOSE is refused.
+        ServerSocket deaf = listen(0);
+        List<String> texts = new CopyOnWriteArrayList<>();
+        Thread t = new Thread(() -> {
+            try (Socket sock = deaf.accept()) {
+                sock.setTcpNoDelay(true);
+                DataInputStream in = new DataInputStream(sock.getInputStream());
+                OutputStream out = sock.getOutputStream();
+                readFrame(in);
+                writeFrame(out, new Skaidb.Buf().u8(11).u32(16).raw(new byte[16]).u32(1).str("srv-nonce").toBytes());
+                readFrame(in);
+                writeFrame(out, new Skaidb.Buf().u8(13).u8(1).raw(new byte[32]).toBytes());
+                while (true) {
+                    Skaidb.Reader r = new Skaidb.Reader(readFrame(in));
+                    int op = r.u8();
+                    if (op == 2) {
+                        writeFrame(out, new Skaidb.Buf().u8(3).str(TABLE_FULL).toBytes());
+                    } else if (op == 1) {
+                        r.u8();
+                        texts.add(r.text());
+                        writeFrame(out, new Skaidb.Buf().u8(1).i64(1).toBytes());
+                    } else {
+                        writeFrame(out, new Skaidb.Buf().u8(2).toBytes());
+                    }
+                }
+            } catch (IOException e) {
+                // the client went away
+            }
+        });
+        t.setDaemon(true);
+        t.start();
+        try (Skaidb.Connection conn = Skaidb.connect("skaidb://anonymous@127.0.0.1:" + deaf.getLocalPort())) {
+            Skaidb.SkaidbException e = assertThrows(Skaidb.SkaidbException.class, () -> conn.prepare(
+                "INSERT INTO t (id, at) VALUES (?, ?)").setLong(1, 1).setObject(2, java.time.Instant.EPOCH).executeUpdate());
+            assertEquals(TABLE_FULL, e.getMessage());
+            assertEquals(Skaidb.SkaidbException.class, e.getClass());
+            // A batch goes the same way.
+            e = assertThrows(Skaidb.SkaidbException.class, () -> conn.prepare(
+                "INSERT INTO t (id, at) VALUES (?, ?)").executeBatch(List.<Object[]>of(new Object[] { 1L, java.time.Instant.EPOCH })));
+            assertEquals(TABLE_FULL, e.getMessage());
+            // It is a statement error: the connection goes on.
+            assertTrue(conn.isUsable());
+            assertEquals(1L, conn.execute("INSERT INTO t (id) VALUES (2)"));
+        } finally {
+            deaf.close();
+        }
+        assertEquals(List.of("INSERT INTO t (id) VALUES (2)"), texts,
+            "the refused statement was not sent as text, its values as literals");
     }
 
     @Test

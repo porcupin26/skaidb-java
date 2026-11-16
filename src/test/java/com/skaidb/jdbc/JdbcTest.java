@@ -871,6 +871,53 @@ class JdbcTest {
         }
     }
 
+    // ---- the statements a connection holds on the server --------------------------------
+
+    @Test
+    void anyNumberOfPreparedStatementsNeverFillsTheServersTable() throws Exception {
+        // 300 PreparedStatements, each with a text of its own, executed and
+        // dropped; a server holds at most 256 prepared statements for a connection.
+        Instant at = Instant.parse("2026-11-16T10:20:30.123Z");
+        List<ConformanceServer.Exchange> script = new ArrayList<>();
+        for (int n = 0; n < 300; n++) {
+            script.add(ex(ConformanceServer.prepareRequest("INSERT INTO t (id, a" + n + ") VALUES (?, ?)"),
+                ConformanceServer.preparedResponse(n + 1, 2)));
+            script.add(ex(ConformanceServer.executeRequest(n + 1, QUORUM, (long) n, at), ConformanceServer.mutationResponse(1)));
+        }
+        // A text used a moment ago still has its statement; one let go long ago is prepared again.
+        script.add(ex(ConformanceServer.executeRequest(300, QUORUM, 299L, at), ConformanceServer.mutationResponse(1)));
+        script.add(ex(ConformanceServer.prepareRequest("INSERT INTO t (id, a0) VALUES (?, ?)"),
+            ConformanceServer.preparedResponse(301, 2)));
+        script.add(ex(ConformanceServer.executeRequest(301, QUORUM, 0L, at), ConformanceServer.mutationResponse(1)));
+        ConformanceServer server = new ConformanceServer("ok", script);
+        try (Connection c = DriverManager.getConnection(url(server, ""), creds())) {
+            for (int n = 0; n < 300; n++) {
+                PreparedStatement ps = c.prepareStatement("INSERT INTO t (id, a" + n + ") VALUES (?, ?)");
+                ps.setLong(1, n);
+                ps.setTimestamp(2, Timestamp.from(at));   // typed every time: never a literal in the text
+                assertEquals(1, ps.executeUpdate(), "statement " + (n + 1));
+                // Closed or simply dropped, it is the same: the statement on
+                // the server belongs to the connection, which keeps it for
+                // the next PreparedStatement with this text.
+                if (n % 2 == 0) ps.close();
+            }
+            for (int n : new int[] { 299, 0 }) {
+                try (PreparedStatement ps = c.prepareStatement("INSERT INTO t (id, a" + n + ") VALUES (?, ?)")) {
+                    ps.setLong(1, n);
+                    ps.setTimestamp(2, Timestamp.from(at));
+                    assertEquals(1, ps.executeUpdate());
+                }
+            }
+        }
+        finish(server);
+        // The connection kept the 240 used last and gave the server back the
+        // slot of each one it let go, the least recently used first — so the
+        // server never held more than 240.
+        List<Integer> freed = new ArrayList<>();
+        for (int id = 1; id <= 61; id++) freed.add(id);
+        assertEquals(freed, server.closes());
+    }
+
     @Test
     void aPreparedStatementHeldAcrossAReDialRunsAsItself() throws Exception {
         // The same parameters, a different effect.

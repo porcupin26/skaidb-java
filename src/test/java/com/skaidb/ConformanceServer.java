@@ -77,6 +77,8 @@ public final class ConformanceServer implements AutoCloseable {
     private final List<byte[]> requests = new CopyOnWriteArrayList<>();
     /** The requests of each accepted connection. */
     private final List<List<byte[]>> received = new CopyOnWriteArrayList<>();
+    /** The statement ids OP_CLOSE named. */
+    private final List<Integer> closes = new CopyOnWriteArrayList<>();
     /** Connections that have ended; guarded by this. */
     private int ended = 0;
     private volatile String error;
@@ -134,6 +136,11 @@ public final class ConformanceServer implements AutoCloseable {
     public String error() { return error; }
     /** The non-ignorable requests received, in order. */
     public List<byte[]> requests() { return requests; }
+    /**
+     * The prepared-statement ids the client closed (OP_CLOSE), in order. An
+     * OP_CLOSE may arrive at any point and is answered, never scripted.
+     */
+    public List<Integer> closes() { return closes; }
     /** How many connections were accepted. */
     public int connections() { return received.size(); }
     /** The non-ignorable requests connection {@code n} (the first is 0) sent, in order. */
@@ -173,6 +180,7 @@ public final class ConformanceServer implements AutoCloseable {
         try {
             for (List<Exchange> script : scripts) {
                 try (Socket s = listener.accept()) {
+                    s.setTcpNoDelay(true);   // a frame is two writes: do not wait for an ACK between them
                     List<byte[]> got = new CopyOnWriteArrayList<>();
                     received.add(got);
                     serve(new DataInputStream(s.getInputStream()), s.getOutputStream(), new ArrayList<>(script), got);
@@ -247,6 +255,7 @@ public final class ConformanceServer implements AutoCloseable {
                 return;
             }
             if (req.length > 0 && (req[0] == 4 || req[0] == 8)) {
+                if (req[0] == 4) closes.add(new Skaidb.Reader(Arrays.copyOfRange(req, 1, req.length)).u32());
                 writeFrame(out, ddl);
                 continue;
             }

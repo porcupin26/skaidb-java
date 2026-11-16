@@ -80,6 +80,7 @@ class PreparedStatementTest {
         }
         // Byte for byte as scripted: no execute went out under an id of the old connection.
         assertNull(server.finish());
+        assertEquals(List.of(), server.closes());
     }
 
     // ---- two threads on one connection ---------------------------------------------

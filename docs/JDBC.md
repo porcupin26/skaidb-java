@@ -117,6 +117,13 @@ and [PROTOCOL.md §6.1](https://skaidb.org/docs/PROTOCOL.html#61-balancing-a-poo
   bind losslessly. Statements the server will not prepare (DDL, `USE`) fall
   back to client-side literal binding. Every parameter must be set
   (SQLState `07001` otherwise).
+- The statement on the server belongs to the connection, not to the
+  `PreparedStatement` object: the connection keeps the 240 texts used most
+  recently, shares each among every `PreparedStatement` with that text, and
+  closes the least recently used one on the server when another needs
+  room. `PreparedStatement.close()` therefore frees nothing on the server,
+  and an application may create and drop any number of them, closed or
+  not, without filling the server's table of 256 statements a connection.
 - `PreparedStatement.executeBatch()` sends every row in **one** round trip
   (`OP_EXECUTE_BATCH`). The server reports the total only, so each element
   of the returned array is `Statement.SUCCESS_NO_INFO` and
