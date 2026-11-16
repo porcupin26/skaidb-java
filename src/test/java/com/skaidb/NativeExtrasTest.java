@@ -290,4 +290,18 @@ class NativeExtrasTest {
         }
         assertEquals("closed", seen.get(), "the driver closed the socket right after the refusal");
     }
+
+    @Test
+    void aConnectRefusedForItsSessionDatabaseClosesItsSocket() throws Exception {
+        // The login succeeds; the USE that enters the session database is refused.
+        ConformanceServer server = new ConformanceServer("ok", List.of(
+            q("USE \"nowhere\"", ConformanceServer.errorResponse("database \"nowhere\" does not exist"))));
+        Skaidb.ConnectOptions o = new Skaidb.ConnectOptions().host("127.0.0.1", server.port())
+            .user(ConformanceServer.username()).password(ConformanceServer.password()).database("nowhere");
+        Skaidb.SkaidbException e = assertThrows(Skaidb.SkaidbException.class, () -> Skaidb.connect(o));
+        assertEquals("database \"nowhere\" does not exist", e.getMessage());
+        // No connection came of it, so nothing is left to close it later.
+        assertTrue(server.awaitEnded(1, 2_000), "the socket of the failed connect stayed open");
+        assertNull(server.finish());
+    }
 }

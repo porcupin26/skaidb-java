@@ -498,7 +498,15 @@ public final class Skaidb {
                 sendHello();
                 // USE is per-connection session state, so it runs on every dial.
                 if (opts.database != null && !opts.database.isEmpty()) {
-                    execute("USE \"" + opts.database.replace("\"", "\"\"") + "\"");
+                    try {
+                        execute("USE \"" + opts.database.replace("\"", "\"\"") + "\"");
+                    } catch (RuntimeException e) {
+                        // No connection comes of this dial, so nothing would
+                        // close its socket later: the session the server
+                        // opened for it must not outlive the refusal.
+                        try { s.close(); } catch (IOException ignored) {}
+                        throw e;
+                    }
                 }
                 return;
             }
