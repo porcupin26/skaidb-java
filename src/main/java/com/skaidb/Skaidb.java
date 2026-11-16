@@ -953,6 +953,12 @@ public final class Skaidb {
             if (owner != null && isWrite(sql)) owner.wrote(this);
         }
 
+        /**
+         * Whether the session is in {@code db}, a pool's database option
+         * ("" = the pool has none, and any database will do).
+         */
+        boolean inDatabase(String db) { return db.isEmpty() || db.equals(database); }
+
         // -- framing --
         private void writeFrame(byte[] payload) throws IOException {
             out.write(new byte[]{
@@ -2821,8 +2827,10 @@ public final class Skaidb {
 
         /**
          * Return a connection, closing it instead if it is broken or still
-         * streaming, its member is ejected, not ready or gone, or the idle set
-         * is full.
+         * streaming, its member is ejected, not ready or gone, the idle set
+         * is full, or — in a pool with a session database — a {@code USE}
+         * left it in another one: the next borrower gets a connection in
+         * the pool's database, not in the last borrower's.
          */
         public void release(Connection c) {
             synchronized (this) {
@@ -2831,7 +2839,8 @@ public final class Skaidb {
                     c.poolOut = false;
                     if (m != null && m.inUse > 0) m.inUse--;
                 }
-                if (!closed && c.isUsable() && m != null && usable(m) && idle.size() < maxsize) {
+                if (!closed && c.isUsable() && m != null && usable(m) && idle.size() < maxsize
+                        && c.inDatabase(opts.database)) {
                     idle.addLast(c);
                     return;
                 }

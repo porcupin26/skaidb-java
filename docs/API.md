@@ -179,7 +179,9 @@ Semantics:
   bare or double-quoted; any other spelling is not noted). Every re-dial
   enters the current one before the statement that caused it is sent; if
   that `USE` is refused the statement throws its error, the connection
-  stays broken and the next statement dials again.
+  stays broken and the next statement dials again. `Pool.release` closes a
+  connection whose session database is no longer the pool's own (a pool
+  without a `database` option keeps it).
 - `subscribe` blocks until the handler returns `false` or the thread is
   interrupted. It polls `_stream_<name>` in pages of 500 with a 500 ms idle
   sleep.

@@ -598,6 +598,10 @@ try (Skaidb.Pool pool = new Skaidb.Pool("skaidb://u:p@h1:7000,h2:7000/app", 8)) 
   members first, the one it lost last.
 - `acquire()` returns only connections that pass `isUsable()`; `release()`
   closes a broken or still-streaming connection instead of parking it.
+- A borrower's `USE` does not reach the next borrower of a pool that has a
+  session database: `release()` closes a connection that a `USE` left in
+  another database. A pool without one keeps the connection, in whatever
+  database its last borrower entered.
 - `pool.transaction(body)` runs a [transaction](#transactions) on one
   connection, checked out for all of it and returned after; it takes the
   same `attempts` and `begin` arguments as `conn.transaction`.
