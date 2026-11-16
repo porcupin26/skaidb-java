@@ -70,7 +70,9 @@ final class Errors {
         if (m.startsWith("unknown column") || m.startsWith("no such column")) return new SQLSyntaxErrorException(msg, "42703", e);
         if (m.startsWith("type error: unknown function")) return new SQLSyntaxErrorException(msg, "42883", e);
         if (m.contains("already exists")) return new SQLSyntaxErrorException(msg, "42P07", e);
-        if (m.startsWith("scan budget exceeded")) return new SQLNonTransientException(msg, "54000", e);
+        // A server words it "resource limit: scan budget exceeded (N rows examined): ...".
+        if (m.startsWith("scan budget exceeded") || m.startsWith("resource limit: scan budget exceeded"))
+            return new SQLNonTransientException(msg, "54000", e);
         if (m.startsWith("parameter index") || m.startsWith("statement expects") || m.startsWith("batch row expects"))
             return new SQLException(msg, "07001", e);
         if (m.startsWith("cannot bind")) return new SQLDataException(msg, "22023", e);

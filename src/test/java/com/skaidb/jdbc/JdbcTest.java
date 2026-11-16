@@ -541,6 +541,10 @@ class JdbcTest {
             { "no such table: nope", SQLSyntaxErrorException.class, "42P01" },
             { "type error: unknown function version()", SQLSyntaxErrorException.class, "42883" },
             { "connection is closed", SQLNonTransientConnectionException.class, "08003" },
+            // The scan budget as a server words it, and as the conformance vectors do.
+            { "resource limit: scan budget exceeded (2 rows examined): narrow the filter, add a covering index, "
+                + "or raise storage.scan_row_budget [table app.notes]", java.sql.SQLNonTransientException.class, "54000" },
+            { "scan budget exceeded", java.sql.SQLNonTransientException.class, "54000" },
             { "something else", SQLException.class, "HY000" },
         };
         for (Object[] row : table) {
