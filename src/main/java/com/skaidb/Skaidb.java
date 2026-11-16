@@ -456,6 +456,12 @@ public final class Skaidb {
         private OutputStream out;
         /** The one byte peerGone() reads into. Guarded by the monitor. */
         private final ByteBuffer probe = ByteBuffer.allocate(1);
+        /**
+         * Held while peerGone() has the channel in non-blocking mode, and
+         * by closeSocket(): closing a TLS socket writes to the channel, and
+         * a write that found it non-blocking would be refused outright.
+         */
+        private final Object wireMode = new Object();
         /** How many threads are in a read or a write on the socket right now; see closeSocket(). */
         private final java.util.concurrent.atomic.AtomicInteger inFlight = new java.util.concurrent.atomic.AtomicInteger();
         /**
@@ -1400,6 +1406,7 @@ public final class Skaidb {
             boolean interrupted = Thread.interrupted();
             inFlight.incrementAndGet();
             try {
+                if (closed) throw new java.net.SocketException("Socket closed");   // see closeSocket()
                 out.write(new byte[]{
                     (byte) (payload.length >>> 24), (byte) (payload.length >>> 16),
                     (byte) (payload.length >>> 8), (byte) payload.length});
@@ -1417,6 +1424,7 @@ public final class Skaidb {
             boolean interrupted = Thread.interrupted();
             inFlight.incrementAndGet();
             try {
+                if (closed) throw new java.net.SocketException("Socket closed");   // see closeSocket()
                 byte[] head = new byte[4];
                 readFully(head);
                 int len = ((head[0] & 0xff) << 24) | ((head[1] & 0xff) << 16)
@@ -1449,15 +1457,35 @@ public final class Skaidb {
          * JDK 11 for as long as the read lasts). So then the TCP connection
          * under the session is closed first: the other thread's read ends
          * at once, and nobody is left to notify.
+         *
+         * <p>close() may come from any thread at any moment of another
+         * thread's statement, so two things keep that statement out of the
+         * way of the close_notify. A thread counts itself in ({@link
+         * #inFlight}) before it looks at {@code closed}, and close() sets
+         * {@code closed} before it looks at the count: one of the two sees
+         * the other, so a thread that was not counted here does not start
+         * reading after it. And the look at an idle connection, which has
+         * the channel in non-blocking mode for an instant, holds {@link
+         * #wireMode} for that instant, as this does throughout.
          */
         private void closeSocket() {
-            Socket s = socket;
-            SocketChannel ch = wire;
-            if (ch != null && inFlight.get() > 0) {
-                try { ch.close(); } catch (IOException ignored) {}
-            }
-            if (s != null) {
-                try { s.close(); } catch (IOException ignored) {}
+            synchronized (wireMode) {
+                Socket s = socket;
+                SocketChannel ch = wire;
+                if (ch != null && inFlight.get() > 0) {
+                    try { ch.close(); } catch (IOException ignored) {}
+                }
+                if (s != null) {
+                    try {
+                        s.close();
+                    } catch (IOException | RuntimeException ignored) {
+                        // already gone, or the TLS session could not say goodbye
+                    }
+                }
+                // Whatever the TLS socket made of its close: the TCP connection ends here.
+                if (ch != null) {
+                    try { ch.close(); } catch (IOException ignored) {}
+                }
             }
         }
 
@@ -1483,17 +1511,19 @@ public final class Skaidb {
             SocketChannel ch = wire;
             try {
                 probe.clear();
-                ch.configureBlocking(false);
                 int n;
-                try {
-                    n = ch.read(probe);
-                } finally {
-                    ch.configureBlocking(true);
+                synchronized (wireMode) {
+                    ch.configureBlocking(false);
+                    try {
+                        n = ch.read(probe);
+                    } finally {
+                        ch.configureBlocking(true);
+                    }
                 }
                 if (n == 0) return null;
                 return new EOFException(n < 0 ? CLOSED_BY_SERVER : "the server sent data nobody asked for");
             } catch (IOException e) {
-                return e;   // a reset
+                return e;   // a reset, or closed under the look
             }
         }
 

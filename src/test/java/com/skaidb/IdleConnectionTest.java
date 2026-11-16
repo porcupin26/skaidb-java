@@ -560,6 +560,183 @@ class IdleConnectionTest {
         }
     }
 
+    /**
+     * A TLS server for any number of connections that takes the login
+     * (an empty password: the driver then checks no signature), and
+     * answers every request with a Ddl frame for as long as it is asked —
+     * or, {@code silent}, never answers a statement at all.
+     */
+    static final class AnsweringTlsServer implements AutoCloseable {
+        final java.net.ServerSocket listener;
+        final boolean silent;
+
+        AnsweringTlsServer(boolean silent) throws Exception {
+            this.silent = silent;
+            javax.net.ssl.SSLContext ctx = javax.net.ssl.SSLContext.getInstance("TLS");
+            ctx.init(Skaidb.clientKeyManagers(ConformanceServer.tls("server.pem"), ConformanceServer.tls("server.key")), null, null);
+            listener = ctx.getServerSocketFactory().createServerSocket(0, 50, java.net.InetAddress.getLoopbackAddress());
+            Thread acceptor = new Thread(() -> {
+                for (;;) {
+                    try {
+                        java.net.Socket s = listener.accept();
+                        Thread t = new Thread(() -> serve(s), "answering-tls-connection");
+                        t.setDaemon(true);
+                        t.start();
+                    } catch (IOException e) {
+                        return;
+                    }
+                }
+            }, "answering-tls-server");
+            acceptor.setDaemon(true);
+            acceptor.start();
+        }
+
+        Skaidb.ConnectOptions options() {
+            return new Skaidb.ConnectOptions().host("127.0.0.1", listener.getLocalPort()).tlsCa(ConformanceServer.tls("ca.pem"));
+        }
+
+        private void serve(java.net.Socket s) {
+            try (java.net.Socket socket = s) {
+                java.io.DataInputStream in = new java.io.DataInputStream(socket.getInputStream());
+                java.io.OutputStream out = socket.getOutputStream();
+                Skaidb.Reader start = new Skaidb.Reader(frame(in));
+                start.u8();
+                start.blob();
+                byte[] nonce = start.blob();
+                send(out, new Skaidb.Buf().u8(11).u32(4).raw(new byte[] { 1, 2, 3, 4 }).u32(1)
+                    .u32(nonce.length + 1).raw(nonce).u8('x').toBytes());
+                frame(in);
+                send(out, ConformanceServer.concat(new byte[] { 13, 1 }, new byte[32]));
+                frame(in);   // Hello
+                send(out, ConformanceServer.ddlResponse());
+                while (true) {
+                    frame(in);
+                    if (!silent) send(out, ConformanceServer.ddlResponse());
+                }
+            } catch (IOException e) {
+                // the client is gone
+            }
+        }
+
+        static byte[] frame(java.io.DataInputStream in) throws IOException {
+            byte[] f = new byte[in.readInt()];
+            in.readFully(f);
+            return f;
+        }
+
+        static void send(java.io.OutputStream out, byte[] payload) throws IOException {
+            out.write(new byte[] { (byte) (payload.length >>> 24), (byte) (payload.length >>> 16),
+                (byte) (payload.length >>> 8), (byte) payload.length });
+            out.write(payload);
+            out.flush();
+        }
+
+        @Override public void close() throws IOException { listener.close(); }
+    }
+
+    @Test
+    void closeNeverThrowsAndAlwaysClosesTheSocket() throws Exception {
+        // Closing a TLS socket writes the session's close_notify, and that
+        // write is refused outright — with an unchecked exception — while
+        // the channel under it is in non-blocking mode: where the look at
+        // an idle connection has it for an instant. The same state, held.
+        ConformanceServer server = ConformanceServer.tlsSessions(List.of(List.of(q(COUNT, counted(3)))));
+        Skaidb.Connection c = Skaidb.connect(tlsOptions(server));
+        assertEquals(1, c.query(COUNT).getRowCount());
+        java.lang.reflect.Field wire = Skaidb.Connection.class.getDeclaredField("wire");
+        wire.setAccessible(true);
+        ((java.nio.channels.SocketChannel) wire.get(c)).configureBlocking(false);
+        c.close();
+        assertTrue(server.awaitEnded(1, 2_000), "the socket stayed open behind a close() that could not say goodbye");
+        assertNull(server.finish());
+    }
+
+    @Test
+    void aReadThatBeginsWhileTheConnectionIsBeingClosedDoesNotHoldTheCloseUp() throws Exception {
+        // close() looks for a thread in a read or a write before it closes
+        // a TLS socket (see closeFromAnotherThreadEndsAStatementThatWaits
+        // ForTheServer). Here it has looked, found none, and is held at
+        // the door of the TLS close while a reader arrives — the order
+        // that, on JDK 11, left close() waiting for as long as the read.
+        ConformanceServer server = ConformanceServer.tlsSessions(List.of(List.of(
+            ex(ConformanceServer.streamRequest("SELECT id FROM notes", QUORUM), ConformanceServer.rowsHeaderResponse("id")))));
+        Skaidb.Connection c = Skaidb.connect(tlsOptions(server));
+        c.setReadTimeout(4_000);
+        Skaidb.RowStream rows = c.stream("SELECT id FROM notes");   // its rows never come
+        java.lang.reflect.Field socket = Skaidb.Connection.class.getDeclaredField("socket");
+        socket.setAccessible(true);
+        java.net.Socket real = (java.net.Socket) socket.get(c);
+        java.util.concurrent.CountDownLatch closing = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.CountDownLatch go = new java.util.concurrent.CountDownLatch(1);
+        socket.set(c, new java.net.Socket() {
+            @Override public void close() throws IOException {
+                closing.countDown();
+                try {
+                    go.await(10, java.util.concurrent.TimeUnit.SECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+                real.close();
+            }
+        });
+        Thread closer = new Thread(c::close, "closer");
+        closer.start();
+        assertTrue(closing.await(5, java.util.concurrent.TimeUnit.SECONDS));
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        Thread reader = new Thread(() -> {
+            try {
+                rows.next();
+            } catch (Throwable t) {
+                failure.set(t);
+            }
+        }, "late-reader");
+        reader.start();
+        reader.join(500);   // it has been refused, or it sits in the read
+        go.countDown();
+        closer.join(2_000);
+        assertFalse(closer.isAlive(), "close() waits for a read that began after it");
+        reader.join(6_000);
+        assertFalse(reader.isAlive());
+        assertInstanceOf(Skaidb.SkaidbException.class, failure.get());
+        assertTrue(server.awaitEnded(1, 2_000), "the socket stayed open");
+        assertNull(server.finish());
+    }
+
+    @Test
+    void closeFromAnotherThreadAtAnyMomentOfAStatementNeitherThrowsNorWaits() throws Exception {
+        // close() is how another thread ends a connection's work, whatever
+        // that work is doing at the instant: looking at the socket before a
+        // statement, writing it, waiting for its answer.
+        for (boolean silent : new boolean[] { true, false }) {
+            try (AnsweringTlsServer server = new AnsweringTlsServer(silent)) {
+                long worst = 0;
+                long until = System.nanoTime() + 3_000_000_000L;
+                for (int round = 0; round < 400 && System.nanoTime() < until; round++) {
+                    Skaidb.Connection c = Skaidb.connect(server.options());
+                    c.setReadTimeout(3_000);
+                    java.util.concurrent.atomic.AtomicBoolean started = new java.util.concurrent.atomic.AtomicBoolean();
+                    Thread statements = new Thread(() -> {
+                        started.set(true);
+                        try {
+                            for (;;) c.execute(COUNT);
+                        } catch (Skaidb.SkaidbException e) {
+                            // closed under it: what close() is for
+                        }
+                    }, "statements");
+                    statements.start();
+                    while (!started.get()) Thread.onSpinWait();
+                    for (int spin = 0; spin < (round % 100) * 40; spin++) Thread.onSpinWait();   // sweep the moment
+                    long before = System.nanoTime();
+                    c.close();   // must not throw
+                    worst = Math.max(worst, (System.nanoTime() - before) / 1_000_000);
+                    statements.join(10_000);
+                    assertFalse(statements.isAlive(), "the statements go on after close() (silent=" + silent + ")");
+                }
+                assertTrue(worst < 1_000, "a close() took " + worst + " ms (silent=" + silent + ")");
+            }
+        }
+    }
+
     // ---- frames of any size -----------------------------------------------------------------------
 
     static long directMemory() {
