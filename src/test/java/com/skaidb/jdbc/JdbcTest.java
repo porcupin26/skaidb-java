@@ -742,6 +742,80 @@ class JdbcTest {
         }
     }
 
+    @Test
+    void rollbackAfterTheLossSendsNothingAndTheConnectionGoesOn() throws Exception {
+        String update = "UPDATE t SET n = n + 1 WHERE id = 1";
+        String insert = "INSERT INTO t (id) VALUES (2)";
+        ConformanceServer server = ConformanceServer.sessions(List.of(
+            List.of(query("BEGIN", ConformanceServer.ddlResponse()),
+                query(update, ConformanceServer.mutationResponse(1)),
+                query(insert).thenHangUp()),
+            List.of(query("BEGIN", ConformanceServer.ddlResponse()),
+                query(insert, ConformanceServer.mutationResponse(1)),
+                query("COMMIT", ConformanceServer.ddlResponse()))));
+        try (Connection c = DriverManager.getConnection(url(server, ""), creds())) {
+            c.setAutoCommit(false);
+            Statement st = c.createStatement();
+            assertEquals(1, st.executeUpdate(update));
+            assertEquals("08006", assertThrows(SQLException.class, () -> st.executeUpdate(insert)).getSQLState());
+            // The application does what it should: it rolls back. The
+            // server discarded the transaction with the connection, so
+            // there is nothing to send and nothing to dial for.
+            c.rollback();
+            assertEquals(1, server.connections(), "rollback() re-dialled");
+            // The next transaction is a transaction: its BEGIN first, on the new session.
+            assertEquals(1, st.executeUpdate(insert));
+            c.commit();
+            assertEquals(1, c.unwrap(Skaidb.Connection.class).reconnects());
+        }
+        finish(server);
+        assertEquals(3, server.requests(1).size());
+    }
+
+    @Test
+    void aBeginSentThroughAStatementIsATransactionToo() throws Exception {
+        // autoCommit stays on: the application writes its transaction itself.
+        String row1 = "INSERT INTO t (id) VALUES (1)";
+        String row2 = "INSERT INTO t (id) VALUES (2)";
+        String row3 = "INSERT INTO t (id) VALUES (3)";
+        String count = "SELECT count(*) FROM t";
+        for (String end : new String[] { "COMMIT", "ROLLBACK" }) {
+            ConformanceServer server = ConformanceServer.sessions(List.of(
+                List.of(query("BEGIN", ConformanceServer.ddlResponse()),
+                    query(row1, ConformanceServer.mutationResponse(1)),
+                    query(row2).thenHangUp()),
+                List.of(query(count, ConformanceServer.rowsResponse(new String[] { "count" }, new Object[] { 0L })))));
+            try (Connection c = DriverManager.getConnection(url(server, ""), creds());
+                 Statement st = c.createStatement()) {
+                st.execute("BEGIN");
+                assertEquals(1, st.executeUpdate(row1));
+                assertEquals("08006", assertThrows(SQLException.class, () -> st.executeUpdate(row2)).getSQLState());
+                // Not sent on a new session, where it would be committed on its own.
+                SQLException lost = assertThrows(SQLException.class, () -> st.executeUpdate(row3), end);
+                assertEquals(SQLTransactionRollbackException.class, lost.getClass(), end + ": " + lost);
+                assertEquals("40003", lost.getSQLState(), end);
+                assertEquals(1, server.connections(), end + ": a statement of the transaction re-dialled");
+                if (end.equals("COMMIT")) {
+                    SQLException commit = assertThrows(SQLException.class, () -> st.execute("COMMIT"));
+                    assertEquals("40003", commit.getSQLState(), commit.toString());
+                    assertTrue(commit.getMessage().contains("nothing was committed"), commit.getMessage());
+                } else {
+                    st.execute("ROLLBACK");   // it is rolled back: the server discarded it
+                }
+                assertEquals(1, server.connections(), end + " was sent on a new session");
+                // Ended: the next statement is an ordinary one, on a new session.
+                try (ResultSet rs = st.executeQuery(count)) {
+                    assertTrue(rs.next());
+                    assertEquals(0, rs.getLong(1), end + ": none of the rows exists");
+                }
+                assertEquals(1, c.unwrap(Skaidb.Connection.class).reconnects(), end);
+            }
+            assertNull(server.finish(), end);
+            assertEquals(3, server.requests(0).size(), end);
+            assertEquals(1, server.requests(1).size(), end + ": nothing of the transaction reached the new session");
+        }
+    }
+
     /** A stream of {@code SELECT id FROM t}: its header and first chunk, then {@code rest}. */
     static ConformanceServer.Exchange streamOfT(byte[]... rest) {
         List<byte[]> frames = new ArrayList<>(List.of(

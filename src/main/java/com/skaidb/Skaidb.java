@@ -350,6 +350,12 @@ public final class Skaidb {
     static final String CLOSED_BY_SERVER = "the connection was closed by the server";
 
     /**
+     * What every error for a statement of a transaction starts with once
+     * the transaction's connection is gone: the statement was not sent.
+     */
+    static final String LOST_IN_TRANSACTION = "the connection was lost during the transaction";
+
+    /**
      * The exception for a server {@code Error} response: the server's
      * message, unchanged, as a {@link TransactionConflictException} when it
      * is a transaction conflict.
@@ -421,6 +427,22 @@ public final class Skaidb {
          * Guarded by the monitor, which the helper holds throughout.
          */
         private boolean inTransaction = false;
+        /**
+         * True while {@link #transaction} is at work — its begin, its body,
+         * its COMMIT or ROLLBACK. The helper's transaction is its own and
+         * is not noted a second time (see {@link #noted}). Guarded by the
+         * monitor, which the helper holds throughout.
+         */
+        private boolean helping = false;
+        /**
+         * A transaction the application opened itself is open on this
+         * session: set by the answer to a {@code BEGIN} it sent as a
+         * statement, cleared by its {@code COMMIT} or {@code ROLLBACK}
+         * (see run). It lives on this socket alone, exactly as the
+         * helper's does, so meanwhile no statement re-dials (see
+         * ensureLive). Guarded by the monitor.
+         */
+        private boolean noted = false;
         /** The I/O failure that broke the connection, if one did; see lostInTransaction(). */
         private volatile IOException lost;
         /**
@@ -644,7 +666,29 @@ public final class Skaidb {
         /** Prepare a parameterized statement (use {@code ?} placeholders). */
         public Query prepare(String sql) { return new Query(this, sql); }
 
-        /** Run a statement with no parameters; returns affected rows, or -1 for DDL. */
+        /**
+         * Run a statement with no parameters; returns affected rows, or -1
+         * for DDL.
+         *
+         * <p>A transaction written by hand is sent this way, and the
+         * connection keeps track of it: a statement whose first word is
+         * {@code BEGIN} opens it when the server accepts it, and {@code
+         * COMMIT [TRANSACTION]} or {@code ROLLBACK [TRANSACTION]} ends it,
+         * whatever the server answers. In between, the transaction stays on
+         * the socket it began on, as {@link #transaction(TransactionBody)}'s
+         * does: once that connection is lost nothing re-dials, and every
+         * statement throws {@code the connection was lost during the
+         * transaction} without being sent — on a new session it would be
+         * committed on its own. The application then ends the transaction
+         * as it would have: {@code ROLLBACK} succeeds without being sent
+         * (the server discarded the transaction with the connection) and
+         * {@code COMMIT} throws that error, saying that nothing was
+         * committed; after either the next statement re-dials. When the
+         * connection is lost under the {@code COMMIT} itself, its error
+         * says that the outcome is unknown. The same holds on every path a
+         * statement without parameters takes ({@link #query}, {@link
+         * #executeRaw}, {@link #stream(String)}).
+         */
         public long execute(String sql) { return new Query(this, sql).executeUpdate(); }
 
         /** Run a SELECT with no parameters. */
@@ -751,6 +795,19 @@ public final class Skaidb {
          */
         public synchronized <T> T transaction(TransactionBody<T> body, int attempts, String begin) {
             checkTransaction(body, attempts, begin);
+            // The helper keeps its own account of its transaction (see
+            // inTransaction): what it sends is not noted as a transaction
+            // of the application's.
+            boolean outerHelp = helping;
+            helping = true;
+            try {
+                return transact(body, attempts, begin);
+            } finally {
+                helping = outerHelp;
+            }
+        }
+
+        private <T> T transact(TransactionBody<T> body, int attempts, String begin) {
             for (int attempt = 1; ; attempt++) {
                 // Nothing is open yet, so begin re-dials a broken connection
                 // as any statement does. A refused BEGIN is thrown from
@@ -835,8 +892,50 @@ public final class Skaidb {
          * that broke the connection.
          */
         private SkaidbException lostInTransaction() {
-            return new SkaidbException(
-                "the connection was lost during the transaction; the server discarded it", lost);
+            return new SkaidbException(LOST_IN_TRANSACTION + "; the server discarded it", lost);
+        }
+
+        /**
+         * Whether {@code sql} ends the transaction the application opened
+         * itself: {@link #ENDS_COMMIT}, {@link #ENDS_ROLLBACK}, or 0 —
+         * always 0 with none noted, where {@code COMMIT} and {@code
+         * ROLLBACK} are statements like any other.
+         */
+        private int ending(String sql) {
+            return noted && !helping ? endsTransaction(sql) : 0;
+        }
+
+        /**
+         * The application ends its transaction and the transaction's
+         * connection is gone: answered here, since on a new session there
+         * is nothing to commit or to roll back. The server discarded the
+         * transaction with the connection, so a {@code ROLLBACK} has
+         * happened — its answer is the server's (no row count) — and a
+         * {@code COMMIT} has failed. Either way the transaction is over,
+         * and the next statement re-dials.
+         */
+        private long endLost(int ends) {
+            noted = false;
+            if (ends == ENDS_ROLLBACK) return -1L;
+            throw new SkaidbException(
+                LOST_IN_TRANSACTION + "; the server discarded it and nothing was committed", lost);
+        }
+
+        /**
+         * What the statement that ends the application's transaction
+         * throws when {@code e} answered it: {@code e}, and the transaction
+         * is over — a refused {@code COMMIT} has ended it too (PROTOCOL.md
+         * §6 rule 6). When the connection was lost under the {@code COMMIT}
+         * itself the server may or may not have applied it, and the error
+         * says so.
+         */
+        private RuntimeException ended(int ends, RuntimeException e) {
+            if (ends == 0) return e;
+            noted = false;
+            if (ends == ENDS_COMMIT && e.getCause() instanceof IOException)
+                return new SkaidbException(e.getMessage() + "; the connection was lost under the COMMIT, "
+                    + "so whether the transaction was committed is unknown", e.getCause());
+            return e;
         }
 
         /** One change captured by a stream. */
@@ -920,10 +1019,13 @@ public final class Skaidb {
 
         /**
          * How many times this connection has re-dialled after a transport
-         * failure. Session state (a {@code BEGIN} transaction, {@code SET}
+         * failure. Session state the driver does not restore ({@code SET}
          * variables other than the session database) does not survive a
          * re-dial, so a caller holding such state compares this before and
-         * after its statements.
+         * after its statements. A transaction is never re-dialled out of:
+         * from the answer to its {@code BEGIN} — the helper's, or one the
+         * application sent itself — to its {@code COMMIT} or {@code
+         * ROLLBACK} a lost connection is reported, not replaced.
          */
         public long reconnects() { return reconnects; }
 
@@ -974,12 +1076,15 @@ public final class Skaidb {
 
         /**
          * A statement succeeded: a USE has moved the session to another
-         * database, which a re-dial has to enter again, and a pool with
-         * read-your-writes on remembers which member took a write.
+         * database, which a re-dial has to enter again; a BEGIN of the
+         * application's has opened a transaction, which no re-dial may
+         * leave behind; and a pool with read-your-writes on remembers
+         * which member took a write.
          */
         void noteStatement(String sql) {
             String entered = usedDatabase(sql);
             if (entered != null) database = entered;
+            if (!helping && beginsTransaction(sql)) noted = true;
             Pool owner = pool;
             if (owner != null && isWrite(sql)) owner.wrote(this);
         }
@@ -1087,11 +1192,22 @@ public final class Skaidb {
 
         /** {@link #run(String, boolean)} at an explicit consistency level. */
         synchronized Object run(String sql, boolean wantRows, int level) {
+            // The COMMIT or ROLLBACK of a transaction the application
+            // opened itself ends it — whatever answers it, and here and
+            // now when its connection is already gone.
+            int ends = ending(sql);
+            if (ends != 0 && broken) return endLost(ends);
             ensureLive();
             byte[] body = sql.getBytes(StandardCharsets.UTF_8);
             Buf req = new Buf();
             req.u8(1).u8(level).u32(body.length).raw(body);
-            Object res = roundtrip(req.toBytes());
+            Object res;
+            try {
+                res = roundtrip(req.toBytes());
+            } catch (RuntimeException e) {
+                throw ended(ends, e);
+            }
+            if (ends != 0) noted = false;
             noteStatement(sql);
             return res;
         }
@@ -1154,6 +1270,10 @@ public final class Skaidb {
                 // OP_QUERY_STREAM, byte for byte what every server knows.
                 req.u8(5).u8(consistency).u32(body.length).raw(body);
             }
+            // As in run(): a COMMIT or ROLLBACK sent this way ends the
+            // application's transaction just the same.
+            int ends = bound ? 0 : ending(sql);
+            if (ends != 0 && broken) return new RowStream(this, new String[0], false, endLost(ends));
             ensureLive();
             try {
                 long started = System.nanoTime();
@@ -1161,6 +1281,7 @@ public final class Skaidb {
                 Reader r = new Reader(readFrame());
                 observeRoundTrip(System.nanoTime() - started);
                 int tag = r.u8();
+                if (ends != 0) noted = false;   // answered: over, whatever the answer
                 if (tag == 3) {
                     String msg = r.text();
                     if (msg.contains("unknown opcode")) {
@@ -1198,7 +1319,7 @@ public final class Skaidb {
                 // Half a request may be on the wire, or half a header off it.
                 markBroken(e);
                 observeFailure();
-                throw new SkaidbException("stream failed: " + e.getMessage(), e);
+                throw ended(ends, new SkaidbException("stream failed: " + e.getMessage(), e));
             }
         }
 
@@ -1427,7 +1548,9 @@ public final class Skaidb {
         /**
          * Re-dial if the transport died since the last statement, BEFORE
          * anything is prepared on it — unless the statement belongs to a
-         * {@link #transaction} whose connection that was: it is refused.
+         * transaction whose connection that was, the {@link #transaction}
+         * helper's or one the application opened with a {@code BEGIN} of
+         * its own: it is refused.
          *
          * The prepared-statement cache MUST be cleared: an id is only valid on
          * the connection that created it, so carrying one across a reconnect
@@ -1438,8 +1561,8 @@ public final class Skaidb {
             if (!broken) return;
             // A transaction lives on the connection that began it (PROTOCOL.md
             // §6 rule 7): a new session has none open, so a statement of the
-            // helper's body sent there would be committed on its own.
-            if (inTransaction) throw lostInTransaction();
+            // transaction sent there would be committed on its own.
+            if (inTransaction || noted) throw lostInTransaction();
             lost = null;
             prepared.clear();
             try {
@@ -2376,6 +2499,53 @@ public final class Skaidb {
             }
         }
         return out.toString();
+    }
+
+    /**
+     * {@code sql} as the one statement it is — its {@code --} comments
+     * gone, trimmed, without the optional {@code ;} that ends it — or null
+     * when it is none (empty) or more than one (a {@code ;} is left). What
+     * the driver reads a session statement from; anything it cannot read
+     * as exactly one statement it leaves alone.
+     */
+    static String oneStatement(String sql) {
+        String s = (sql.contains("--") ? withoutLineComments(sql) : sql).trim();
+        if (s.endsWith(";")) s = s.substring(0, s.length() - 1).trim();
+        return s.isEmpty() || s.indexOf(';') >= 0 ? null : s;
+    }
+
+    /**
+     * Whether the first word of {@code sql} is {@code BEGIN}: {@code
+     * BEGIN}, {@code BEGIN TRANSACTION}, {@code BEGIN ATOMIC ...}. Answered
+     * with success, such a statement has opened a transaction on the
+     * connection (see {@link Connection#run(String, boolean, int)}).
+     */
+    static boolean beginsTransaction(String sql) {
+        String s = sql.contains("--") ? withoutLineComments(sql) : sql;
+        int i = skipSpace(s, 0), end = i + 5;
+        if (!s.regionMatches(true, i, "BEGIN", 0, 5)) return false;
+        return end == s.length() || !(Character.isLetterOrDigit(s.charAt(end)) || s.charAt(end) == '_');
+    }
+
+    /** {@link #endsTransaction}: the statement is {@code COMMIT [TRANSACTION]}. */
+    static final int ENDS_COMMIT = 1;
+    /** {@link #endsTransaction}: the statement is {@code ROLLBACK [TRANSACTION]}. */
+    static final int ENDS_ROLLBACK = 2;
+
+    /**
+     * Whether {@code sql} is exactly the statement that ends a transaction:
+     * {@link #ENDS_COMMIT} for {@code COMMIT [TRANSACTION]}, {@link
+     * #ENDS_ROLLBACK} for {@code ROLLBACK [TRANSACTION]}, 0 for everything
+     * else.
+     */
+    static int endsTransaction(String sql) {
+        String s = oneStatement(sql);
+        if (s == null) return 0;
+        String[] words = s.split("\\s+");
+        if (words.length > 2 || (words.length == 2 && !words[1].equalsIgnoreCase("TRANSACTION"))) return 0;
+        if (words[0].equalsIgnoreCase("COMMIT")) return ENDS_COMMIT;
+        if (words[0].equalsIgnoreCase("ROLLBACK")) return ENDS_ROLLBACK;
+        return 0;
     }
 
     private static int skipSpace(String sql, int i) {

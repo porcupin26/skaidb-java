@@ -134,8 +134,26 @@ public final class SkaidbConnection implements Connection {
     private void checkTransactionAlive() throws SQLException {
         if (!(conn.isUsable() || busy()) || conn.reconnects() != txnReconnects) {
             txnOpen = false;
+            endLostTransaction();
             throw new SQLTransactionRollbackException(
                 "the connection was lost during the transaction; the server discarded it", "40003");
+        }
+    }
+
+    /**
+     * The transaction is over for this connection, and so it has to be
+     * for the core connection under it, which noted the {@code BEGIN} and
+     * holds every statement back from a new session until the transaction
+     * is ended: a {@code ROLLBACK} ends it there. Nothing is sent — the
+     * connection that had the transaction is gone, and the core
+     * connection answers for it.
+     */
+    private void endLostTransaction() {
+        if (conn.isUsable()) return;   // on a session of its own already: nothing is held back
+        try {
+            conn.executeRaw("ROLLBACK");
+        } catch (RuntimeException ignored) {
+            // nothing was open, or the connection is closed
         }
     }
 
@@ -303,7 +321,10 @@ public final class SkaidbConnection implements Connection {
         // transaction open for later statements to run in.
         if (busy()) streamed.closeQuietly();
         txnOpen = false;
-        if (!conn.isUsable() || conn.reconnects() != txnReconnects) return;   // already gone
+        if (!conn.isUsable() || conn.reconnects() != txnReconnects) {
+            endLostTransaction();   // already gone with its connection
+            return;
+        }
         runControl("ROLLBACK");
     }
 

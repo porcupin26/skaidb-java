@@ -36,6 +36,10 @@ final class Errors {
             return new SQLNonTransientConnectionException(msg, "08001", e);
         if (m.startsWith("connection is closed"))
             return new SQLNonTransientConnectionException(msg, "08003", e);
+        if (m.startsWith("the connection was lost during the transaction"))
+            // A statement of a transaction whose connection is gone: it
+            // was not sent, and the server discarded the transaction.
+            return new SQLTransactionRollbackException(msg, "40003", e);
         if (cause instanceof java.io.IOException)
             // The transport broke mid-statement: the connection re-dials on
             // its next statement, so the application can recover by retrying

@@ -566,17 +566,28 @@ why the clean-up above ignores what it returns.
 against a server: a commit, a conflict retried, a conflict thrown, a
 rollback.
 
-A re-dial after a transport failure starts a fresh session without the
-transaction — the server has discarded it. Inside the helper nothing
-re-dials between `BEGIN` and the end: it never retries a transport
-failure, and once the connection is lost every further statement of the
-body is refused with `the connection was lost during the transaction`
-instead of being sent on a new session, where it would be committed on its
-own. A body that swallows the failure gets that error instead of a commit.
-A failure under the `COMMIT` itself is thrown as it is: whether the server
-applied the transaction is then unknown. By hand, compare
-`conn.reconnects()` before and after the transaction's statements. The JDBC
-layer does that check for you.
+A transaction lives on the connection that began it: the server discards
+it with the socket, and a re-dialled session has none open. So from the
+answer to `BEGIN` to the transaction's `COMMIT` or `ROLLBACK` **nothing
+re-dials** — inside the helper, and in a transaction written by hand,
+which the connection keeps track of: a statement whose first word is
+`BEGIN` opens it once the server accepts it, and `COMMIT [TRANSACTION]` or
+`ROLLBACK [TRANSACTION]` ends it, whatever the server answers. Once the
+connection is lost, every further statement of the transaction is refused
+with `the connection was lost during the transaction` instead of being
+sent on a new session, where it would be committed on its own.
+
+- The helper never retries a transport failure, and a body that swallows
+  one gets that error instead of a commit.
+- By hand, end the transaction as you would have: `ROLLBACK` succeeds
+  without being sent — the server has rolled the transaction back — and
+  `COMMIT` fails with that error, which says that nothing was committed.
+  After either, the next statement re-dials as after any connection loss.
+- A failure under the `COMMIT` itself is another matter: whether the
+  server applied the transaction is then unknown. The helper throws the
+  failure as it is; the error of a `COMMIT` written by hand says so.
+
+The JDBC layer's `setAutoCommit(false)` transactions follow the same rule.
 
 ## Connection pooling
 
@@ -753,7 +764,7 @@ for the rest, branch on the message if you must:
 | TLS setup problem | `TLS setup failed:` | never opened |
 | The server rejected a statement | the server's own text, e.g. a syntax or constraint error | **usable** |
 | A `COMMIT` refused because another writer changed a row the transaction writes (`TransactionConflictException`) | `transaction conflict:` | **usable**, the transaction is over: run it again |
-| The connection was lost inside `transaction(body)` and the body carried on: each further statement, then the helper itself | `the connection was lost during the transaction` | **broken**: re-dials on the next statement after the helper |
+| The connection was lost inside a transaction — `transaction(body)`, or one opened with a `BEGIN` statement — and the application carried on: each further statement, then the helper itself or the `COMMIT` | `the connection was lost during the transaction` | **broken**: re-dials on the next statement after the helper, or after the `COMMIT` or `ROLLBACK` that ends a hand-written transaction |
 | Parameter misuse | `parameter index ... out of range`, `statement expects N parameters`, `cannot bind ...` | usable |
 | A `NULL` read through a typed getter | `column x is NULL` | usable |
 | Another statement while streaming | `connection is busy streaming` | usable once the stream ends |
@@ -843,8 +854,8 @@ reference, including the type mapping and the metadata sources, is
 - `conn.transaction(body)` holds the connection's monitor from `BEGIN` to
   `COMMIT` or `ROLLBACK`, so other threads' statements on a shared
   connection wait for the transaction instead of running inside it. A
-  transaction written by hand has no such guard: give it a connection of
-  its own.
+  transaction written by hand has no such guard against other threads:
+  give it a connection of its own.
 - A `RowStream` is not thread-safe: one stream, one reader. It may be
   closed from another thread.
 - `Pool` is thread-safe. Its probe and discovery refresh run on one daemon

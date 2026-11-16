@@ -215,6 +215,13 @@ the next statement, or `commit()`, throws `SQLTransactionRollbackException`
 `DatabaseMetaData` call, `getCatalog()` or `setCatalog()` made there throws
 it too: nothing re-dials until the loss has been reported.
 
+A transaction written by hand — `BEGIN` sent through a `Statement` with
+autocommit left on — is held to the same rule by the core client: once its
+connection is lost every statement throws `SQLTransactionRollbackException`
+(`40003`) without being sent, until the application ends it: `ROLLBACK`
+succeeds without being sent, `COMMIT` throws `40003` (nothing was
+committed). The next statement then runs on a new session.
+
 A streamed result set that is still open makes the connection busy, not
 lost. Another statement, or `commit()`, fails with SQLState `HY010` as it
 does outside a transaction, nothing is sent and the transaction stays

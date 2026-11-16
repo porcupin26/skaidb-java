@@ -117,7 +117,7 @@ public <T> T      transaction(TransactionBody<T> body, int attempts, String begi
 public void       subscribe(String stream, String after, EventHandler handler);
 public boolean    isUsable();                         // !closed && !broken && !streaming
 public String     database();                         // the session database; "" when none was chosen
-public long       reconnects();                       // re-dials so far (session state does not survive one)
+public long       reconnects();                       // re-dials so far (never inside a transaction)
 public void       setReadTimeout(int millis);         // bound every read; 0 = none (default)
 public int        getReadTimeout();
 public void       close();                            // idempotent
@@ -167,6 +167,19 @@ Semantics:
   `RowStream.close()` does) and the transaction is rolled back — the body's
   exception is thrown, or `connection is busy streaming` when the body
   returned.
+- A transaction written by hand is noted: a statement whose first word is
+  `BEGIN` opens it once the server accepts it, and `COMMIT [TRANSACTION]`
+  or `ROLLBACK [TRANSACTION]` ends it, whatever answers (`--` comments and
+  a trailing `;` aside; sent through `execute`, `query`, `executeRaw` or
+  `stream(sql)`). While it is open nothing re-dials: after a transport
+  failure every statement throws `the connection was lost during the
+  transaction` without being sent, until the application ends the
+  transaction — `ROLLBACK` returns as the server's would without being
+  sent, `COMMIT` throws that error (`... nothing was committed`). The next
+  statement then re-dials. A `COMMIT` under which the connection is lost
+  throws the transport error with `whether the transaction was committed
+  is unknown` appended. `transaction(...)` keeps its own account and is
+  not noted.
 - A read that exceeds `setReadTimeout` throws and marks the connection
   broken, like any transport error.
 - A transport error marks the connection broken and closes its socket at
