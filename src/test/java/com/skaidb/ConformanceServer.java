@@ -46,19 +46,23 @@ public final class ConformanceServer implements AutoCloseable {
         }
     }
 
+    /** How a scripted connection ends from the server's side, if it does. */
+    private enum End { NONE, HANG_UP, HALF_CLOSE, RESET }
+
     /** One scripted request and the frames sent back for it. */
     public static final class Exchange {
+        /** Null for {@link ConformanceServer#idle()}: nothing is asked. */
         final byte[] request;
         final List<byte[]> responses;
-        /** The server closes the socket once the responses are out. */
-        final boolean hangUp;
+        /** What the server does to the socket once the responses are out. */
+        final End end;
         public Exchange(byte[] request, List<byte[]> responses) {
-            this(request, responses, false);
+            this(request, responses, End.NONE);
         }
-        private Exchange(byte[] request, List<byte[]> responses, boolean hangUp) {
+        private Exchange(byte[] request, List<byte[]> responses, End end) {
             this.request = request;
             this.responses = responses;
-            this.hangUp = hangUp;
+            this.end = end;
         }
         /**
          * This exchange, after which the server closes the socket: the
@@ -66,8 +70,33 @@ public final class ConformanceServer implements AutoCloseable {
          * otherwise while the client sits idle after them. The last
          * exchange of its connection's script.
          */
-        public Exchange thenHangUp() { return new Exchange(request, responses, true); }
+        public Exchange thenHangUp() { return new Exchange(request, responses, End.HANG_UP); }
+        /**
+         * This exchange, after which the server shuts down only the
+         * SENDING side of the socket and goes on reading — and counting,
+         * see {@link ConformanceServer#bytesAfterHalfClose} — whatever
+         * still arrives, until the client closes its side. The client
+         * reads the end of the stream while its writes still succeed: what
+         * a connection closed while it sat idle looks like over a real
+         * network, where the reset for a write comes back too late to be
+         * seen. The last exchange of its connection's script.
+         */
+        public Exchange thenHalfClose() { return new Exchange(request, responses, End.HALF_CLOSE); }
+        /**
+         * This exchange, after which the server resets the connection
+         * (closes it with {@code SO_LINGER} 0) instead of closing it
+         * cleanly. The last exchange of its connection's script.
+         */
+        public Exchange thenReset() { return new Exchange(request, responses, End.RESET); }
     }
+
+    /**
+     * No request at all: the connection sits idle after its handshake and
+     * Hello. Followed by {@link Exchange#thenHangUp}, {@link
+     * Exchange#thenHalfClose} or {@link Exchange#thenReset}, the server
+     * ends the connection there, with nothing asked of it.
+     */
+    public static Exchange idle() { return new Exchange(null, List.of()); }
 
     private final ServerSocket listener;
     private final Thread thread;
@@ -79,6 +108,8 @@ public final class ConformanceServer implements AutoCloseable {
     private final List<List<byte[]>> received = new CopyOnWriteArrayList<>();
     /** The statement ids OP_CLOSE named. */
     private final List<Integer> closes = new CopyOnWriteArrayList<>();
+    /** The bytes each accepted connection sent after the server half-closed it. */
+    private final List<java.util.concurrent.atomic.AtomicLong> afterHalfClose = new CopyOnWriteArrayList<>();
     /** Connections that have ended; guarded by this. */
     private int ended = 0;
     private volatile String error;
@@ -99,10 +130,30 @@ public final class ConformanceServer implements AutoCloseable {
         return new ConformanceServer("ok", scripts, scripts.size());
     }
 
+    /**
+     * {@link #sessions} behind TLS: the listener presents the test server
+     * certificate of {@code src/test/resources/tls} (it carries {@code
+     * DNS:skaidb}; trust {@code ca.pem}) and asks for no client
+     * certificate. The login is the SCRAM one, inside the TLS session.
+     */
+    public static ConformanceServer tlsSessions(List<List<Exchange>> scripts) throws Exception {
+        javax.net.ssl.SSLContext ctx = javax.net.ssl.SSLContext.getInstance("TLS");
+        ctx.init(Skaidb.clientKeyManagers(tls("server.pem"), tls("server.key")), null, null);
+        return new ConformanceServer("ok", scripts, scripts.size(), ctx.getServerSocketFactory().createServerSocket());
+    }
+
+    /** A file of the throwaway test CA under {@code src/test/resources/tls}. */
+    public static String tls(String name) { return Paths.get("src", "test", "resources", "tls", name).toString(); }
+
     private ConformanceServer(String outcome, List<List<Exchange>> scripts, int backlog) throws IOException {
+        this(outcome, scripts, backlog, new ServerSocket());
+    }
+
+    private ConformanceServer(String outcome, List<List<Exchange>> scripts, int backlog, ServerSocket unbound)
+            throws IOException {
         this.outcome = outcome;
         this.scripts = new ArrayList<>(scripts);
-        listener = new ServerSocket();
+        listener = unbound;
         listener.bind(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0), backlog);
         thread = new Thread(this::run, "conformance-server");
         thread.setDaemon(true);
@@ -145,6 +196,12 @@ public final class ConformanceServer implements AutoCloseable {
     public int connections() { return received.size(); }
     /** The non-ignorable requests connection {@code n} (the first is 0) sent, in order. */
     public List<byte[]> requests(int n) { return received.get(n); }
+    /**
+     * How many bytes connection {@code n} (the first is 0) sent after the
+     * server half-closed it ({@link Exchange#thenHalfClose}): 0 when the
+     * client wrote nothing more to it.
+     */
+    public long bytesAfterHalfClose(int n) { return afterHalfClose.get(n).get(); }
 
     /**
      * Wait until {@code n} connections have ended — the client closed its
@@ -159,6 +216,22 @@ public final class ConformanceServer implements AutoCloseable {
         }
         return true;
     }
+    /**
+     * Wait until {@code c} can see that the server ended its connection —
+     * the close has arrived at the client's socket — as the driver itself
+     * finds out before its next statement. False when {@code millis} pass
+     * first. The connection is then marked broken, as that statement would
+     * have marked it; it re-dials when it is used.
+     */
+    public static boolean awaitSeenClosed(Skaidb.Connection c, long millis) throws InterruptedException {
+        long deadline = System.nanoTime() + millis * 1_000_000L;
+        while (c.stillUsable()) {
+            if (System.nanoTime() - deadline > 0) return false;
+            Thread.sleep(1);
+        }
+        return true;
+    }
+
     /** The username the client put in AuthStart. */
     public String authStartUser() { return authStartUser; }
 
@@ -182,8 +255,9 @@ public final class ConformanceServer implements AutoCloseable {
                 try (Socket s = listener.accept()) {
                     s.setTcpNoDelay(true);   // a frame is two writes: do not wait for an ACK between them
                     List<byte[]> got = new CopyOnWriteArrayList<>();
+                    afterHalfClose.add(new java.util.concurrent.atomic.AtomicLong());
                     received.add(got);
-                    serve(new DataInputStream(s.getInputStream()), s.getOutputStream(), new ArrayList<>(script), got);
+                    serve(s, new DataInputStream(s.getInputStream()), s.getOutputStream(), new ArrayList<>(script), got);
                 } catch (Exception e) {
                     if (error == null) error = e.getClass().getSimpleName() + ": " + e.getMessage();
                 }
@@ -200,7 +274,29 @@ public final class ConformanceServer implements AutoCloseable {
         }
     }
 
-    private void serve(DataInputStream in, OutputStream out, List<Exchange> pending, List<byte[]> got)
+    /**
+     * End the connection as {@code ex} says; true when it did. A
+     * half-closed connection is read to its end here, every byte counted.
+     */
+    private boolean end(Socket s, DataInputStream in, Exchange ex, List<Exchange> pending) throws IOException {
+        if (ex.end == End.NONE) return false;
+        if (!pending.isEmpty()) error = "the script goes on after the server ended the connection";
+        if (ex.end == End.RESET) {
+            s.setSoLinger(true, 0);
+        } else if (ex.end == End.HALF_CLOSE) {
+            s.shutdownOutput();
+            java.util.concurrent.atomic.AtomicLong count = afterHalfClose.get(afterHalfClose.size() - 1);
+            byte[] sink = new byte[4096];
+            try {
+                for (int n; (n = in.read(sink)) > 0; ) count.addAndGet(n);
+            } catch (IOException e) {
+                // the client reset the socket instead of closing it: nothing more arrives either way
+            }
+        }
+        return true;
+    }
+
+    private void serve(Socket s, DataInputStream in, OutputStream out, List<Exchange> pending, List<byte[]> got)
             throws Exception {
         Map<String, Object> challenge = Json.obj(auth().get("challenge"));
         byte[] start = readFrame(in);
@@ -248,15 +344,24 @@ public final class ConformanceServer implements AutoCloseable {
         }
 
         byte[] ddl = unhex((String) Json.obj(V.get("ignorable_requests")).get("ddl_payload"));
+        boolean greeted = false;
         while (true) {
+            // idle(): nothing is asked — the connection is ended as it sits
+            // there, once its Hello has been answered.
+            if (greeted && !pending.isEmpty() && pending.get(0).request == null) {
+                if (end(s, in, pending.remove(0), pending)) return;
+                continue;
+            }
             byte[] req = readFrame(in);
             if (req == null) {
-                if (!pending.isEmpty()) error = "never received request " + hex(pending.get(0).request);
+                if (!pending.isEmpty() && pending.get(0).request != null)
+                    error = "never received request " + hex(pending.get(0).request);
                 return;
             }
             if (req.length > 0 && (req[0] == 4 || req[0] == 8)) {
                 if (req[0] == 4) closes.add(new Skaidb.Reader(Arrays.copyOfRange(req, 1, req.length)).u32());
                 writeFrame(out, ddl);
+                greeted |= req[0] == 8;
                 continue;
             }
             requests.add(req);
@@ -266,15 +371,13 @@ public final class ConformanceServer implements AutoCloseable {
                 return;
             }
             Exchange ex = pending.remove(0);
-            if (!Arrays.equals(req, ex.request)) {
-                error = "request mismatch:\n  got  " + hex(req) + "\n  want " + hex(ex.request);
+            if (ex.request == null || !Arrays.equals(req, ex.request)) {
+                error = "request mismatch:\n  got  " + hex(req) + "\n  want "
+                    + (ex.request == null ? "nothing: the connection sits idle" : hex(ex.request));
                 return;
             }
             for (byte[] resp : ex.responses) writeFrame(out, resp);
-            if (ex.hangUp) {
-                if (!pending.isEmpty()) error = "the script goes on after a hang-up";
-                return;
-            }
+            if (end(s, in, ex, pending)) return;
         }
     }
 

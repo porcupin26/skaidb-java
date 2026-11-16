@@ -100,6 +100,12 @@ timeout, so no `connectionTestQuery` is needed; while a streamed result set
 is open on the connection it answers `true` without a round trip.
 `setNetworkTimeout` bounds every read on the connection.
 
+A connection the server closed while it sat idle — in the pool, or in the
+application's hands — costs no statement: the driver looks at the socket
+before it writes (no round trip), replaces the connection and runs the
+statement, or `isValid`, on the new one. Inside a transaction the
+statement throws `SQLTransactionRollbackException` (`40003`) instead.
+
 **Balancing across members.** A JDBC pool opens each physical connection
 through the driver, which dials the URL's hosts in shuffled order and keeps
 the connection on the member it reached — so a HikariCP pool's connections

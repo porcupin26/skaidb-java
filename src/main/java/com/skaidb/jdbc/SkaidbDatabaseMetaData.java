@@ -42,7 +42,7 @@ final class SkaidbDatabaseMetaData implements DatabaseMetaData {
             if (r == null) throw new SQLException(sql + " returned no rows", "HY000");
             return r;
         } catch (RuntimeException e) {
-            throw Errors.map(e);
+            throw conn.failed(e);
         }
     }
 

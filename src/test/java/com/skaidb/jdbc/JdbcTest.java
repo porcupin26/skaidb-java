@@ -816,6 +816,136 @@ class JdbcTest {
         }
     }
 
+    // ---- a connection the server closed while it sat idle ---------------------------------
+
+    /** How long the tests give the server's close to reach the client. */
+    static final long ARRIVES = 100;
+
+    @Test
+    void aConnectionClosedWhileIdleCostsNoStatement() throws Exception {
+        String insert = "INSERT INTO t (id) VALUES (2)";
+        String prepared = "INSERT INTO t (id) VALUES (?)";
+        byte[] one = ConformanceServer.rowsResponse(new String[] { "x" }, new Object[] { 1L });
+        Map<String, TransactionStep> steps = new java.util.LinkedHashMap<>();
+        Map<String, List<ConformanceServer.Exchange>> scripts = new java.util.LinkedHashMap<>();
+        steps.put("a Statement", (c, st) -> assertEquals(1, st.executeUpdate(insert)));
+        scripts.put("a Statement", List.of(query(insert, ConformanceServer.mutationResponse(1))));
+        steps.put("a query", (c, st) -> assertTrue(st.executeQuery("SELECT 1").next()));
+        scripts.put("a query", List.of(query("SELECT 1", one)));
+        steps.put("a PreparedStatement", (c, st) -> {
+            PreparedStatement ps = c.prepareStatement(prepared);
+            ps.setLong(1, 2);
+            assertEquals(1, ps.executeUpdate());
+        });
+        scripts.put("a PreparedStatement", List.of(
+            ex(ConformanceServer.prepareRequest(prepared), ConformanceServer.preparedResponse(1, 1)),
+            ex(ConformanceServer.executeRequest(1, QUORUM, 2L), ConformanceServer.mutationResponse(1))));
+        steps.put("a streamed Statement", (c, st) -> {
+            st.setFetchSize(100);
+            try (ResultSet rs = st.executeQuery("SELECT id FROM t")) {
+                assertTrue(rs.next());
+                assertFalse(rs.next());
+            }
+        });
+        scripts.put("a streamed Statement", List.of(streamOfT(ConformanceServer.rowsEndResponse())));
+        steps.put("isValid", (c, st) -> assertTrue(c.isValid(2)));
+        scripts.put("isValid", List.of(query("SELECT 1", one)));
+        steps.put("getMetaData().getCatalogs", (c, st) -> assertTrue(c.getMetaData().getCatalogs().next()));
+        scripts.put("getMetaData().getCatalogs", List.of(query("SHOW DATABASES",
+            ConformanceServer.rowsResponse(new String[] { "database", "current" }, new Object[] { "default", "*" }))));
+        steps.put("the first statement of a transaction", (c, st) -> {
+            c.setAutoCommit(false);
+            assertEquals(1, st.executeUpdate(insert));
+            c.commit();
+        });
+        scripts.put("the first statement of a transaction", List.of(query("BEGIN", ConformanceServer.ddlResponse()),
+            query(insert, ConformanceServer.mutationResponse(1)), query("COMMIT", ConformanceServer.ddlResponse())));
+        for (Map.Entry<String, TransactionStep> step : steps.entrySet()) {
+            String name = step.getKey();
+            ConformanceServer server = ConformanceServer.sessions(List.of(
+                // Handshake and Hello; then the server stops sending and reads on.
+                List.of(ConformanceServer.idle().thenHalfClose()),
+                scripts.get(name)));
+            try (Connection c = DriverManager.getConnection(url(server, ""), creds());
+                 Statement st = c.createStatement()) {
+                Thread.sleep(ARRIVES);
+                step.getValue().run(c, st);
+                assertEquals(1, c.unwrap(Skaidb.Connection.class).reconnects(), name);
+            }
+            assertNull(server.finish(), name);
+            assertEquals(0, server.bytesAfterHalfClose(0), name + ": bytes written to the connection the server had closed");
+        }
+    }
+
+    @Test
+    void insideATransactionAConnectionClosedWhileIdleIsTheTransactionLost() throws Exception {
+        String update = "UPDATE t SET n = n + 1 WHERE id = 1";
+        String insert = "INSERT INTO t (id) VALUES (2)";
+        Map<String, TransactionStep> steps = new java.util.LinkedHashMap<>();
+        steps.put("a Statement", (c, st) -> st.executeUpdate(insert));
+        steps.put("a PreparedStatement", (c, st) -> {
+            PreparedStatement ps = c.prepareStatement("INSERT INTO t (id) VALUES (?)");
+            ps.setLong(1, 2);
+            ps.executeUpdate();
+        });
+        steps.put("a streamed Statement", (c, st) -> {
+            st.setFetchSize(100);
+            st.executeQuery("SELECT id FROM t");
+        });
+        steps.put("getMetaData().getTables", (c, st) -> c.getMetaData().getTables(null, null, "%", null));
+        steps.put("commit()", (c, st) -> c.commit());
+        steps.put("setAutoCommit(true)", (c, st) -> c.setAutoCommit(true));
+        for (Map.Entry<String, TransactionStep> step : steps.entrySet()) {
+            String name = step.getKey();
+            ConformanceServer server = ConformanceServer.sessions(List.of(
+                List.of(query("BEGIN", ConformanceServer.ddlResponse()),
+                    query(update, ConformanceServer.mutationResponse(1)).thenHalfClose()),
+                List.of(query("BEGIN", ConformanceServer.ddlResponse()),
+                    query("SELECT 1", ConformanceServer.rowsResponse(new String[] { "x" }, new Object[] { 1L })),
+                    query("ROLLBACK", ConformanceServer.ddlResponse()))));
+            try (Connection c = DriverManager.getConnection(url(server, ""), creds())) {
+                c.setAutoCommit(false);
+                Statement st = c.createStatement();
+                assertEquals(1, st.executeUpdate(update));
+                Thread.sleep(ARRIVES);
+                // Found gone before anything is sent: not replaced — a new
+                // session would run this outside the transaction.
+                SQLException lost = assertThrows(SQLException.class, () -> step.getValue().run(c, st), name);
+                assertEquals(SQLTransactionRollbackException.class, lost.getClass(), name + ": " + lost);
+                assertEquals("40003", lost.getSQLState(), name);
+                assertEquals(1, server.connections(), name + " re-dialled");
+                // That was the report of the loss, with or without a rollback() after it.
+                if (!name.startsWith("a ")) c.rollback();   // nothing left to roll back: no round trip
+                assertEquals(1, server.connections(), name + ": rollback() re-dialled");
+                // The connection goes on with a new transaction, on a new session.
+                c.setAutoCommit(false);
+                assertTrue(c.createStatement().executeQuery("SELECT 1").next(), name);
+                assertEquals(1, c.unwrap(Skaidb.Connection.class).reconnects(), name);
+            }   // close() rolls the new transaction back
+            assertNull(server.finish(), name);
+            assertEquals(0, server.bytesAfterHalfClose(0), name + ": bytes written to the connection the server had closed");
+            assertEquals(3, server.requests(1).size(), name + ": the next transaction only");
+        }
+
+        // rollback() is what the server did already: it succeeds, with nothing sent.
+        ConformanceServer server = ConformanceServer.sessions(List.of(
+            List.of(query("BEGIN", ConformanceServer.ddlResponse()),
+                query(update, ConformanceServer.mutationResponse(1)).thenHalfClose()),
+            List.of(query(insert, ConformanceServer.mutationResponse(1)))));
+        try (Connection c = DriverManager.getConnection(url(server, ""), creds())) {
+            c.setAutoCommit(false);
+            Statement st = c.createStatement();
+            assertEquals(1, st.executeUpdate(update));
+            Thread.sleep(ARRIVES);
+            c.rollback();
+            assertEquals(1, server.connections());
+            c.setAutoCommit(true);
+            assertEquals(1, st.executeUpdate(insert));
+        }
+        finish(server);
+        assertEquals(0, server.bytesAfterHalfClose(0));
+    }
+
     /** A stream of {@code SELECT id FROM t}: its header and first chunk, then {@code rest}. */
     static ConformanceServer.Exchange streamOfT(byte[]... rest) {
         List<byte[]> frames = new ArrayList<>(List.of(
@@ -1000,10 +1130,8 @@ class JdbcTest {
                 entering.how.run(c, st);
                 st.execute("SELECT 1");
                 assertTrue(server.awaitEnded(1, 2_000), name);
-                // The statement that finds the connection gone is not sent twice ...
-                SQLException lost = assertThrows(SQLException.class, () -> st.execute(count), name);
-                assertEquals("08006", lost.getSQLState(), name + ": " + lost);
-                // ... and the next ones run in app, on the new session.
+                assertTrue(ConformanceServer.awaitSeenClosed(c.unwrap(Skaidb.Connection.class), 2_000), name);
+                // The next statements run in app, on the new session.
                 st.execute(count);
                 assertEquals(3, st.getUpdateCount(), name);
                 assertEquals(1, st.executeUpdate(insert), name);
@@ -1133,8 +1261,7 @@ class JdbcTest {
 
             st.execute("SELECT 1");
             assertTrue(server.awaitEnded(1, 2_000));
-            SQLException lost = assertThrows(SQLException.class, () -> st.execute("SELECT 2"));
-            assertEquals("08006", lost.getSQLState(), lost.toString());
+            assertTrue(ConformanceServer.awaitSeenClosed(c.unwrap(Skaidb.Connection.class), 2_000));
 
             // The PreparedStatements made before the loss, the DELETE first.
             assertEquals(1, del.executeUpdate());

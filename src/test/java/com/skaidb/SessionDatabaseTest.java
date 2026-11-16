@@ -2,14 +2,12 @@ package com.skaidb;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-import java.io.IOException;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -60,14 +58,13 @@ class SessionDatabaseTest {
 
     /**
      * Lose the connection while it sits idle: the server answers one last
-     * statement and goes away, and the next statement fails — it is not
-     * sent a second time. The one after that re-dials.
+     * statement and goes away. The driver finds that out before it sends
+     * its next statement, which then runs on a new connection.
      */
     static void loseWhileIdle(Skaidb.Connection c, ConformanceServer server, int connectionsSoFar) throws Exception {
         c.query("SELECT 1");
         assertTrue(server.awaitEnded(connectionsSoFar, 2_000));
-        Skaidb.SkaidbException e = assertThrows(Skaidb.SkaidbException.class, () -> c.query(COUNT));
-        assertInstanceOf(IOException.class, e.getCause(), e.getMessage());
+        assertTrue(ConformanceServer.awaitSeenClosed(c, 2_000));
         assertFalse(c.isUsable());
     }
 

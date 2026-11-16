@@ -55,7 +55,7 @@ public class SkaidbStatement implements Statement {
             if (bounded) c.setReadTimeout(queryTimeout * 1000);
             return call.get();
         } catch (RuntimeException e) {
-            throw Errors.map(e);
+            throw conn.failed(e);
         } finally {
             if (bounded) {
                 try {

@@ -1,9 +1,7 @@
 package com.skaidb;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNull;
-import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.DataInputStream;
@@ -68,8 +66,7 @@ class PreparedStatementTest {
 
             c.execute("SELECT 1");
             assertTrue(server.awaitEnded(1, 2_000));
-            Skaidb.SkaidbException lost = assertThrows(Skaidb.SkaidbException.class, () -> c.execute("SELECT 2"));
-            assertInstanceOf(IOException.class, lost.getCause());
+            assertTrue(ConformanceServer.awaitSeenClosed(c, 2_000));
 
             // Through the objects obtained before the loss: DELETE first.
             assertEquals(1, delete.executeUpdate());

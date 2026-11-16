@@ -1,13 +1,16 @@
 package com.skaidb;
 
-import java.io.DataInputStream;
+import java.io.EOFException;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.OutputStream;
 import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.net.URI;
+import java.nio.ByteBuffer;
+import java.nio.channels.SocketChannel;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -350,6 +353,22 @@ public final class Skaidb {
     static final String CLOSED_BY_SERVER = "the connection was closed by the server";
 
     /**
+     * What a transport failure says: its message — or, where the JDK gives
+     * it none, what it stands for, so that no error reads "query failed:
+     * null".
+     */
+    static String reason(Throwable e) {
+        String m = e.getMessage();
+        if (m != null && !m.isEmpty()) return m;
+        if (e instanceof java.nio.channels.ClosedByInterruptException)
+            return "the thread was interrupted while it waited for the server, and the connection was closed";
+        if (e instanceof java.net.SocketTimeoutException) return "Read timed out";
+        if (e instanceof java.nio.channels.ClosedChannelException) return "the connection was closed";
+        if (e instanceof EOFException) return CLOSED_BY_SERVER;
+        return e.getClass().getSimpleName();
+    }
+
+    /**
      * What every error for a statement of a transaction starts with once
      * the transaction's connection is gone: the statement was not sent.
      */
@@ -401,8 +420,28 @@ public final class Skaidb {
         private static int nonceCounter = 0;
         /** Volatile: markBroken() closes it from a stream's reader, outside the monitor. */
         private volatile Socket socket;
-        private DataInputStream in;
+        /**
+         * The TCP connection itself — under TLS, the one beneath the TLS
+         * session. It is what the look at an idle connection reads (see
+         * peerGone), which is why the socket is opened as a channel at all:
+         * every read and write still goes through {@link #socket}'s
+         * streams.
+         */
+        private volatile SocketChannel wire;
+        private InputStream in;
         private OutputStream out;
+        /** The one byte peerGone() reads into. Guarded by the monitor. */
+        private final ByteBuffer probe = ByteBuffer.allocate(1);
+        /** How many threads are in a read or a write on the socket right now; see closeSocket(). */
+        private final java.util.concurrent.atomic.AtomicInteger inFlight = new java.util.concurrent.atomic.AtomicInteger();
+        /**
+         * The most handed to the socket in one read or write. The JDK
+         * copies what a channel's socket reads and writes through a direct
+         * buffer it keeps with the thread, as large as the largest piece it
+         * was ever given: a frame of many megabytes handed over whole would
+         * leave that much native memory with every thread that touched one.
+         */
+        private static final int IO_PIECE = 64 * 1024;
         private int consistency;
         // isUsable() is a pool's health check and must answer while another
         // thread holds this connection's monitor for a running statement, so
@@ -525,14 +564,23 @@ public final class Skaidb {
                 String h = c > 0 ? ep.substring(0, c) : ep;
                 int p = c > 0 ? Integer.parseInt(ep.substring(c + 1)) : 7000;
                 Socket s = null;
+                SocketChannel ch = null;
+                // As in writeFrame: an interrupt status the thread arrived
+                // with must not close the socket it is about to open.
+                boolean interrupted = Thread.interrupted();
                 try {
-                    s = new Socket();
-                    s.connect(new InetSocketAddress(h, p), 10_000);
+                    InetSocketAddress address = new InetSocketAddress(h, p);
+                    // A channel refuses an unresolved address without saying which host it was.
+                    if (address.isUnresolved()) throw new java.net.UnknownHostException(h);
+                    ch = SocketChannel.open();
+                    s = ch.socket();
+                    s.connect(address, 10_000);
                     s.setTcpNoDelay(true);
                     if (opts.tls) s = tlsWrap(s, p, opts);
                     s.setSoTimeout(readTimeoutMs);
                     socket = s;
-                    in = new DataInputStream(s.getInputStream());
+                    wire = ch;
+                    in = s.getInputStream();
                     out = s.getOutputStream();
                     if (opts.authMechanism.equals(AUTH_CERTIFICATE)) handshakeCertificate(opts.user);
                     else handshake(opts.user, opts.password);
@@ -541,14 +589,21 @@ public final class Skaidb {
                     if (s != null) {
                         try { s.close(); } catch (IOException ignored) {}
                     }
+                    if (ch != null) {
+                        try { ch.close(); } catch (IOException ignored) {}
+                    }
+                    if (interrupted) Thread.currentThread().interrupt();
+                    interrupted = false;
                     if (!memberFault(e)) {
                         if (e instanceof SkaidbException) throw (SkaidbException) e;
-                        throw new SkaidbException("connect failed: " + e.getMessage(), e);
+                        throw new SkaidbException("connect failed: " + reason(e), e);
                     }
                     Pool owner = pool;
                     if (owner != null) owner.failed(ep);
                     last = e;
                     continue;
+                } finally {
+                    if (interrupted) Thread.currentThread().interrupt();
                 }
                 connectedEp = ep;
                 sendHello();
@@ -561,7 +616,7 @@ public final class Skaidb {
                 String db = database;
                 if (!db.isEmpty()) {
                     try {
-                        execute("USE \"" + db.replace("\"", "\"\"") + "\"");
+                        restore("USE \"" + db.replace("\"", "\"\"") + "\"");
                     } catch (RuntimeException e) {
                         // No connection comes of this dial, so nothing would
                         // close its socket later: the session the server
@@ -573,7 +628,19 @@ public final class Skaidb {
                 return;
             }
             throw new SkaidbException("no reachable endpoint in " + String.join(", ", order)
-                    + (last == null ? "" : ": " + last.getMessage()), last);
+                    + (last == null ? "" : ": " + reason(last)), last);
+        }
+
+        /**
+         * A statement of the dial itself, which puts the new session where
+         * the old one was: sent on the socket just opened, as it is. If
+         * that socket is gone already the dial has failed — it is not
+         * replaced from in here, by a dial inside the dial.
+         */
+        private void restore(String sql) {
+            byte[] body = sql.getBytes(StandardCharsets.UTF_8);
+            roundtrip(new Buf().u8(1).u8(consistency).u32(body.length).raw(body).toBytes());
+            noteStatement(sql);
         }
 
         /**
@@ -1052,7 +1119,7 @@ public final class Skaidb {
         @Override public void close() {
             if (closed) return;
             closed = true;
-            try { socket.close(); } catch (IOException ignored) {}
+            closeSocket();
             // Closed while checked out instead of returned: the pool stops
             // counting it against its member.
             Pool owner = pool;
@@ -1096,26 +1163,134 @@ public final class Skaidb {
         boolean inDatabase(String db) { return db.isEmpty() || db.equals(database); }
 
         // -- framing --
+        //
+        // The socket is a channel's (see wire), and a channel's blocking
+        // read or write ends when its thread is interrupted — by closing
+        // the channel. A thread that merely arrives with its interrupt
+        // status set (it was interrupted earlier and goes on, to clean up,
+        // say) must not lose its statement and its connection for that, so
+        // the status is taken off for the I/O and put back after it. An
+        // interrupt that arrives while the thread waits in the read does
+        // end the wait: the statement fails with a transport error.
         private void writeFrame(byte[] payload) throws IOException {
-            out.write(new byte[]{
-                (byte) (payload.length >>> 24), (byte) (payload.length >>> 16),
-                (byte) (payload.length >>> 8), (byte) payload.length});
-            out.write(payload);
-            out.flush();
+            boolean interrupted = Thread.interrupted();
+            inFlight.incrementAndGet();
+            try {
+                out.write(new byte[]{
+                    (byte) (payload.length >>> 24), (byte) (payload.length >>> 16),
+                    (byte) (payload.length >>> 8), (byte) payload.length});
+                for (int off = 0; off < payload.length; off += IO_PIECE) {
+                    out.write(payload, off, Math.min(payload.length - off, IO_PIECE));
+                }
+                out.flush();
+            } finally {
+                inFlight.decrementAndGet();
+                if (interrupted) Thread.currentThread().interrupt();
+            }
         }
 
         private byte[] readFrame() throws IOException {
+            boolean interrupted = Thread.interrupted();
+            inFlight.incrementAndGet();
             try {
-                int len = in.readInt(); // big-endian
+                byte[] head = new byte[4];
+                readFully(head);
+                int len = ((head[0] & 0xff) << 24) | ((head[1] & 0xff) << 16)
+                        | ((head[2] & 0xff) << 8) | (head[3] & 0xff);   // big-endian
                 byte[] buf = new byte[len];
-                in.readFully(buf);
+                readFully(buf);
                 return buf;
-            } catch (java.io.EOFException e) {
-                // The socket ended where a frame was due: the server hung up.
-                // The JDK's exception for that carries no message at all, and
-                // the caller's error would read "query failed: null".
-                throw new java.io.EOFException(CLOSED_BY_SERVER);
+            } finally {
+                inFlight.decrementAndGet();
+                if (interrupted) Thread.currentThread().interrupt();
             }
+        }
+
+        private void readFully(byte[] buf) throws IOException {
+            for (int off = 0; off < buf.length; ) {
+                int n = in.read(buf, off, Math.min(buf.length - off, IO_PIECE));
+                // The socket ended where a frame was due: the server hung up.
+                // The JDK reports that without any message, and the caller's
+                // error would read "query failed: null".
+                if (n < 0) throw new EOFException(CLOSED_BY_SERVER);
+                off += n;
+            }
+        }
+
+        /**
+         * Close the socket, whoever may be using it. Closing a TLS socket
+         * first sends the session's close_notify — and where another thread
+         * is in a read or a write on the socket, that would wait for it (on
+         * JDK 11 for as long as the read lasts). So then the TCP connection
+         * under the session is closed first: the other thread's read ends
+         * at once, and nobody is left to notify.
+         */
+        private void closeSocket() {
+            Socket s = socket;
+            SocketChannel ch = wire;
+            if (ch != null && inFlight.get() > 0) {
+                try { ch.close(); } catch (IOException ignored) {}
+            }
+            if (s != null) {
+                try { s.close(); } catch (IOException ignored) {}
+            }
+        }
+
+        /**
+         * The look at an idle connection, before a request is written to
+         * it: what has ended it, or null. Between statements the server
+         * sends nothing, so anything there is to read — the end of the
+         * stream, a reset, bytes nobody asked for — means the connection
+         * is gone; a restart, a failover or an idle timeout has closed it.
+         * Without the look the request would be WRITTEN first, which over
+         * a real network still succeeds on such a socket, and only the
+         * read would fail — when the statement can no longer be sent again
+         * (it may have run).
+         *
+         * <p>It costs no round trip: one read of the TCP connection that
+         * does not wait. Under TLS that is the socket beneath the session,
+         * not the decrypted stream — and a byte it takes from there is a
+         * byte of a TLS record, which is why whatever it reads condemns
+         * the connection: nothing is ever read from it again. Callers hold
+         * the monitor and have made sure no stream owns the wire.
+         */
+        private IOException peerGone() {
+            SocketChannel ch = wire;
+            try {
+                probe.clear();
+                ch.configureBlocking(false);
+                int n;
+                try {
+                    n = ch.read(probe);
+                } finally {
+                    ch.configureBlocking(true);
+                }
+                if (n == 0) return null;
+                return new EOFException(n < 0 ? CLOSED_BY_SERVER : "the server sent data nobody asked for");
+            } catch (IOException e) {
+                return e;   // a reset
+            }
+        }
+
+        /**
+         * Look at the connection if it is idle (see peerGone) and mark it
+         * broken — its socket closed — if the server has ended it. Called
+         * under the monitor before a request is written.
+         */
+        private void look() {
+            if (closed || broken || streaming) return;
+            IOException gone = peerGone();
+            if (gone != null) markBroken(gone);
+        }
+
+        /**
+         * {@link #isUsable} after a look at the socket: false too for a
+         * connection the server closed while it sat idle. What a pool asks
+         * of an idle connection before it hands it out.
+         */
+        synchronized boolean stillUsable() {
+            look();
+            return isUsable();
         }
 
         // -- handshake --
@@ -1196,6 +1371,7 @@ public final class Skaidb {
             // opened itself ends it — whatever answers it, and here and
             // now when its connection is already gone.
             int ends = ending(sql);
+            if (ends != 0) look();   // lost while idle is lost before the COMMIT, not under it
             if (ends != 0 && broken) return endLost(ends);
             ensureLive();
             byte[] body = sql.getBytes(StandardCharsets.UTF_8);
@@ -1273,6 +1449,7 @@ public final class Skaidb {
             // As in run(): a COMMIT or ROLLBACK sent this way ends the
             // application's transaction just the same.
             int ends = bound ? 0 : ending(sql);
+            if (ends != 0) look();
             if (ends != 0 && broken) return new RowStream(this, new String[0], false, endLost(ends));
             ensureLive();
             try {
@@ -1319,7 +1496,7 @@ public final class Skaidb {
                 // Half a request may be on the wire, or half a header off it.
                 markBroken(e);
                 observeFailure();
-                throw ended(ends, new SkaidbException("stream failed: " + e.getMessage(), e));
+                throw ended(ends, new SkaidbException("stream failed: " + reason(e), e));
             }
         }
 
@@ -1338,7 +1515,7 @@ public final class Skaidb {
             } catch (IOException e) {
                 markBroken(e);   // socket gone; the next statement re-dials
                 observeFailure();
-                throw new SkaidbException("stream read failed: " + e.getMessage(), e);
+                throw new SkaidbException("stream read failed: " + reason(e), e);
             }
         }
 
@@ -1359,13 +1536,7 @@ public final class Skaidb {
          */
         void markBroken() {
             broken = true;
-            Socket s = socket;
-            if (s == null) return;
-            try {
-                s.close();
-            } catch (IOException ignored) {
-                // already gone
-            }
+            closeSocket();
         }
 
         /** {@link #markBroken()} for an I/O failure; the one that broke the connection is kept. */
@@ -1439,7 +1610,7 @@ public final class Skaidb {
                 // statement re-dials instead of reusing this socket.
                 markBroken(e);
                 observeFailure();
-                throw new SkaidbException("prepare failed: " + e.getMessage(), e);
+                throw new SkaidbException("prepare failed: " + reason(e), e);
             }
         }
 
@@ -1509,7 +1680,7 @@ public final class Skaidb {
                 // statement re-dials through ensureLive.
                 markBroken(e);
                 observeFailure();
-                throw new SkaidbException("query failed: " + e.getMessage(), e);
+                throw new SkaidbException("query failed: " + reason(e), e);
             }
         }
 
@@ -1558,6 +1729,10 @@ public final class Skaidb {
          */
         private synchronized void ensureLive() {
             if (closed) throw new SkaidbException("connection is closed");
+            // A connection the server closed while it sat idle is replaced
+            // here, before anything is written to it, exactly as one a
+            // failed write has broken — or, inside a transaction, reported.
+            look();
             if (!broken) return;
             // A transaction lives on the connection that began it (PROTOCOL.md
             // §6 rule 7): a new session has none open, so a statement of the
@@ -1565,11 +1740,7 @@ public final class Skaidb {
             if (inTransaction || noted) throw lostInTransaction();
             lost = null;
             prepared.clear();
-            try {
-                if (socket != null) socket.close();
-            } catch (IOException ignored) {
-                // already gone
-            }
+            closeSocket();   // already closed when it was marked broken
             // Cleared BEFORE dialling: dial() issues USE, which runs a
             // statement, which would otherwise re-enter this method forever.
             broken = false;
@@ -2823,7 +2994,9 @@ public final class Skaidb {
      * Pooled connections are dialed with the pool's connect options, so they
      * inherit TLS, credentials, consistency and the session database; one
      * that loses its socket re-dials in the pool's order (usable members
-     * first, the one it lost last).
+     * first, the one it lost last). An idle connection the server has
+     * closed meanwhile is not handed out: a checkout looks at the socket
+     * first, as a statement does.
      *
      * <p>This matters more in Java than elsewhere: a {@code Connection}
      * serializes every statement through one socket, so threads sharing one
@@ -3079,8 +3252,9 @@ public final class Skaidb {
                         c.close();
                         continue;
                     }
-                } else if (!c.isUsable()) {
-                    // A connection that broke while it sat idle: drop it, try again.
+                } else if (!c.stillUsable()) {
+                    // A connection that broke, or that the server closed,
+                    // while it sat idle: drop it, try again.
                     c.close();
                     continue;
                 }

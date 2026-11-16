@@ -593,20 +593,17 @@ class TransactionTest {
     }
 
     @Test
-    void afterAServerRestartBeginFailsAndRecoversAsAnOrdinaryStatementDoes() throws Exception {
+    void afterAServerRestartBeginReDialsAsAnOrdinaryStatementDoes() throws Exception {
         // The server goes away while the connection sits idle. The driver
-        // learns of it from the next statement, which it does not send a
-        // second time (it may have run); the one after re-dials.
+        // finds that out before it sends the next statement, which runs on
+        // a new connection: the loss costs no statement.
         ConformanceServer plain = ConformanceServer.sessions(List.of(
             List.of(q("SELECT 1", oneRow("x", 1L)).thenHangUp()),
             List.of(q(UPDATE, changed(1)))));
         try (Skaidb.Connection c = connect(plain)) {
             c.query("SELECT 1");
             assertTrue(plain.awaitEnded(1, SOON));
-            assertTrue(c.isUsable(), "nothing has told the driver yet");
-            Skaidb.SkaidbException e = assertThrows(Skaidb.SkaidbException.class, () -> c.execute(UPDATE));
-            assertTransport(e);
-            assertTrue(e.getMessage().startsWith("query failed"), e.getMessage());
+            assertTrue(ConformanceServer.awaitSeenClosed(c, SOON));
             assertEquals(1L, c.execute(UPDATE));
             assertEquals(1, c.reconnects());
         }
@@ -624,31 +621,29 @@ class TransactionTest {
         try (Skaidb.Connection c = connect(server)) {
             c.query("SELECT 1");
             assertTrue(server.awaitEnded(1, SOON));
-            assertTrue(c.isUsable());
-            Skaidb.SkaidbException e = assertThrows(Skaidb.SkaidbException.class, () -> c.transaction(body));
-            assertTransport(e);
-            assertTrue(e.getMessage().startsWith("query failed"), e.getMessage());
-            assertEquals(0, runs.get(), "the body does not run after a failed BEGIN");
-            assertEquals(1, server.connections(), "and nothing follows it on a new session");
+            assertTrue(ConformanceServer.awaitSeenClosed(c, SOON));
             assertEquals(1L, (long) c.transaction(body));
             assertEquals(1, runs.get());
-            assertEquals(1, c.reconnects());
+            assertEquals(1, c.reconnects(), "one re-dial, for the BEGIN");
         }
         assertNull(server.finish());
         assertEquals(List.of("SELECT 1"), sent(server, 0));
-        assertEquals(runs(1), sent(server, 1));
+        assertEquals(runs(1), sent(server, 1), "the transaction, whole, on the new session");
     }
 
     @Test
-    void afterAServerRestartAPoolsTransactionFailsAndRecoversAsItsOrdinaryStatementDoes() throws Exception {
+    void afterAServerRestartAPoolsTransactionRunsAsItsOrdinaryStatementDoes() throws Exception {
         ConformanceServer plain = ConformanceServer.sessions(List.of(
             List.of(q("SELECT 1", oneRow("x", 1L)).thenHangUp()),
             List.of(q(UPDATE, changed(1)))));
         try (Skaidb.Pool pool = new Skaidb.Pool(options(plain))) {
-            pool.withConnection(conn -> conn.query("SELECT 1"));
+            Skaidb.Connection idle = pool.withConnection(conn -> {
+                conn.query("SELECT 1");
+                return conn;
+            });
             assertTrue(plain.awaitEnded(1, SOON));
-            // The idle connection looks usable, so it is the one checked out.
-            assertTransport(assertThrows(Skaidb.SkaidbException.class, () -> pool.withConnection(conn -> conn.execute(UPDATE))));
+            assertTrue(ConformanceServer.awaitSeenClosed(idle, SOON));
+            // The idle connection is gone, so it is not the one checked out.
             assertEquals(1L, (long) pool.withConnection(conn -> conn.execute(UPDATE)));
         }
         assertNull(plain.finish());
@@ -662,12 +657,12 @@ class TransactionTest {
             return conn.execute(UPDATE);
         };
         try (Skaidb.Pool pool = new Skaidb.Pool(options(server))) {
-            pool.withConnection(conn -> conn.query("SELECT 1"));
+            Skaidb.Connection idle = pool.withConnection(conn -> {
+                conn.query("SELECT 1");
+                return conn;
+            });
             assertTrue(server.awaitEnded(1, SOON));
-            assertTransport(assertThrows(Skaidb.SkaidbException.class, () -> pool.transaction(body)));
-            assertEquals(0, runs.get());
-            assertEquals(1, server.connections());
-            // The dead connection was dropped at its return; the next transaction dials.
+            assertTrue(ConformanceServer.awaitSeenClosed(idle, SOON));
             assertEquals(1L, (long) pool.transaction(body));
             assertEquals(1, runs.get());
         }

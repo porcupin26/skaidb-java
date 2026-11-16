@@ -616,8 +616,11 @@ try (Skaidb.Pool pool = new Skaidb.Pool("skaidb://u:p@h1:7000,h2:7000/app", 8)) 
   settings, so they inherit TLS, credentials, consistency and the session
   database. One that loses its socket re-dials in the pool's order: usable
   members first, the one it lost last.
-- `acquire()` returns only connections that pass `isUsable()`; `release()`
-  closes a broken or still-streaming connection instead of parking it.
+- `acquire()` returns only connections that pass `isUsable()` and that the
+  server has not closed while they sat idle (the same look at the socket
+  a statement takes, see [Errors and reconnection](#errors-and-reconnection));
+  `release()` closes a broken or still-streaming connection instead of
+  parking it.
 - A borrower's `USE` does not reach the next borrower of a pool that has a
   session database: `release()` closes a connection that a `USE` left in
   another database. A pool without one keeps the connection, in whatever
@@ -785,6 +788,21 @@ silently. Retry at the call site where you know whether that is safe.
 `isUsable()` tells a pool (or you) whether a connection is closed, broken
 or mid-stream.
 
+**A connection the server closed while it sat idle costs no statement.** A
+restart, a failover or an idle timeout closes idle connections, and over a
+network the next write to such a socket still succeeds — only the read
+after it fails, when the statement can no longer be sent again. So before
+it writes a request the driver looks at the socket: one read that does not
+wait, no round trip. Between statements the server sends nothing, so
+anything there is to read — the end of the stream, a reset, stray bytes —
+means the connection is gone. It is then replaced as after a transport
+error, before anything was sent on it, and the statement runs on the new
+connection: a read and a write alike. Under TLS the look reads the TCP
+connection beneath the session, never the decrypted stream; a connection
+that is streaming is not idle and is not looked at; and inside a
+transaction a connection found gone is the transaction lost, not a
+re-dial (see [Transactions](#transactions)).
+
 The session database a re-dial enters is the one the connection was last
 in: the DSN's, or the one a later `USE` statement entered
 (`conn.database()` returns it). The driver
@@ -858,6 +876,15 @@ reference, including the type mapping and the metadata sources, is
   give it a connection of its own.
 - A `RowStream` is not thread-safe: one stream, one reader. It may be
   closed from another thread.
+- A thread that is interrupted while it waits for the server stops
+  waiting: the statement throws a transport error (`query failed: the
+  thread was interrupted while it waited for the server, and the
+  connection was closed`), the statement may or may not have run, and the
+  connection re-dials on its next statement. The interrupt status stays
+  set. A thread that arrives with its interrupt status already set runs
+  its statements as any other.
+- `close()` may be called from another thread: it ends a statement that
+  is waiting for the server.
 - `Pool` is thread-safe. Its probe and discovery refresh run on one daemon
   thread per pool (`skaidb-pool`), started on first need and stopped by
   `close()`; it never keeps the JVM alive.

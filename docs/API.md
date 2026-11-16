@@ -182,6 +182,19 @@ Semantics:
   not noted.
 - A read that exceeds `setReadTimeout` throws and marks the connection
   broken, like any transport error.
+- Before a request is written the connection looks at its socket (one
+  read that does not wait; under TLS, of the TCP connection beneath the
+  session): on an idle connection anything readable — the end of the
+  stream, a reset, stray bytes — means the server has closed it. It is
+  then marked broken and replaced before anything was sent on it, so the
+  statement succeeds on the new connection; inside a transaction it is
+  the transaction lost instead. A connection that is streaming is not
+  looked at. `Pool.acquire` looks at an idle connection before handing it
+  out and drops one the server has closed.
+- An interrupt that arrives while a thread waits for the server closes
+  the connection and fails the statement with a transport error; the
+  interrupt status stays set. An interrupt status set before the call
+  changes nothing.
 - A transport error marks the connection broken and closes its socket at
   once, so the server drops the session (and a transaction open on it)
   without waiting for the connection's next use; so does a stream that
@@ -321,7 +334,7 @@ public Pool(ConnectOptions connect);
 public Pool(ConnectOptions connect, PoolOptions options);
 
 public Connection acquire();                              // under the pool-wide affinity key
-public Connection acquire(Object affinity);               // idle to the picked member, else a fresh dial
+public Connection acquire(Object affinity);               // idle (and not closed by the server) to the picked member, else a fresh dial
 public void       release(Connection c);                  // parks it if usable, its member usable and room remains; else closes it
 public <T> T      withConnection(Work<T> work);
 public <T> T      withConnection(Object affinity, Work<T> work);

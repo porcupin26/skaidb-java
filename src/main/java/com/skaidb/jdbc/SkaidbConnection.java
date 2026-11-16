@@ -175,8 +175,24 @@ public final class SkaidbConnection implements Connection {
         try {
             conn.executeRaw(sql);
         } catch (RuntimeException e) {
-            throw Errors.map(e);
+            throw failed(e);
         }
+    }
+
+    /**
+     * The SQLException for a failure of the core connection. One that
+     * reports the transaction's connection lost (SQLState 40003) — the
+     * core connection found it gone before it sent the statement — is the
+     * report {@link #checkTransactionAlive} would have made: the
+     * transaction is over, here and for the core connection.
+     */
+    SQLException failed(RuntimeException e) {
+        SQLException mapped = Errors.map(e);
+        if (txnOpen && "40003".equals(mapped.getSQLState())) {
+            txnOpen = false;
+            endLostTransaction();
+        }
+        return mapped;
     }
 
     Skaidb.Connection nativeConnection() { return conn; }
@@ -454,7 +470,7 @@ public final class SkaidbConnection implements Connection {
                 if ("*".equals(rs.getString("current"))) return rs.getString("database");
             }
         } catch (RuntimeException e) {
-            throw Errors.map(e);
+            throw failed(e);
         }
         return null;
     }
